@@ -111,3 +111,43 @@ def test_generate_batch_skips_already_seen():
 
     overlap = names1 & names2
     assert len(overlap) == 0, f"Second batch overlaps with first: {overlap}"
+
+
+def test_end_to_end_pipeline():
+    """Full pipeline: generate -> filter -> mock score -> rank."""
+    from elite_miner.searcher import CombinatorialSearcher
+    from elite_miner.filters import ValidityFilter
+    from elite_miner.scorer import ProxyScorer
+    from rdkit import Chem
+    import random
+
+    searcher = CombinatorialSearcher(DB_PATH)
+    searcher.load_rxn5_building_blocks()
+
+    vfilter = ValidityFilter(min_heavy_atoms=10, min_rotatable_bonds=1,
+                             max_rotatable_bonds=10, banned_atoms=["Se"])
+
+    # Generate
+    raw = searcher.generate_batch(batch_size=50)
+    assert len(raw) > 0
+
+    # Filter
+    valid = vfilter.filter_batch(raw)
+    assert len(valid) > 0
+
+    # Mock scoring (PSICHIC needs GPU)
+    scored = []
+    for name, smiles in valid:
+        mol = Chem.MolFromSmiles(smiles)
+        ha = mol.GetNumHeavyAtoms() if mol else 0
+        scored.append((name, smiles, random.uniform(0.3, 0.9), random.uniform(0.1, 0.5), ha))
+
+    # Rank
+    ranked = ProxyScorer.rank_with_antitarget(scored, antitarget_weight=0.9)
+    assert len(ranked) == len(scored)
+
+    # Verify descending proxy score
+    for i in range(len(ranked) - 1):
+        assert ranked[i][5] >= ranked[i+1][5]
+
+    assert ranked[0][0].startswith("rxn:5:")
