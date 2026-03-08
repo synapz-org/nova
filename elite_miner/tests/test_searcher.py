@@ -64,3 +64,50 @@ def test_prioritized_scaffolds():
                 f"Priority scaffold {pid} at index {idx} is after "
                 f"non-priority scaffold at index {first_non_priority_idx}"
             )
+
+
+def _make_searcher():
+    """Helper to create and initialize a CombinatorialSearcher."""
+    from elite_miner.searcher import CombinatorialSearcher
+
+    searcher = CombinatorialSearcher(DB_PATH)
+    searcher.load_rxn5_building_blocks()
+    return searcher
+
+
+def test_generate_batch():
+    """Verify batch returns correct format (rxn:5:... names, non-empty SMILES)."""
+    searcher = _make_searcher()
+    batch = searcher.generate_batch(batch_size=10)
+
+    assert len(batch) > 0, "Batch should not be empty"
+    for mol_name, smiles in batch:
+        assert mol_name.startswith("rxn:5:"), f"Unexpected mol_name format: {mol_name}"
+        parts = mol_name.split(":")
+        assert len(parts) == 5, f"mol_name should have 5 colon-separated parts: {mol_name}"
+        # All ID parts should be integers
+        for p in parts[1:]:
+            int(p)  # raises ValueError if not an int
+        assert isinstance(smiles, str) and len(smiles) > 0, f"SMILES should be a non-empty string: {smiles}"
+
+
+def test_generate_batch_no_duplicates():
+    """Verify no duplicate mol_names within a single batch."""
+    searcher = _make_searcher()
+    batch = searcher.generate_batch(batch_size=50)
+
+    names = [mol_name for mol_name, _ in batch]
+    assert len(names) == len(set(names)), "Batch contains duplicate mol_names"
+
+
+def test_generate_batch_skips_already_seen():
+    """Verify second batch has no overlap with first batch."""
+    searcher = _make_searcher()
+    batch1 = searcher.generate_batch(batch_size=10)
+    batch2 = searcher.generate_batch(batch_size=10)
+
+    names1 = {mol_name for mol_name, _ in batch1}
+    names2 = {mol_name for mol_name, _ in batch2}
+
+    overlap = names1 & names2
+    assert len(overlap) == 0, f"Second batch overlaps with first: {overlap}"
