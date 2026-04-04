@@ -4,10 +4,10 @@
 
 The NOVA subnet (SN68) incentive mechanism splits rewards as follows:
 
-| Model | Weight | Miner implementation (stock) |
-|-------|--------|-------------------------------|
-| Boltz-2 | **100%** (`boltz_weight: 1.0`) | Previously 0% — now partially implemented |
-| PSICHIC | 0% (weight unused) | 100% |
+| Model | Weight | Miner implementation |
+|-------|--------|----------------------|
+| Boltz-2 | **100%** (`boltz_weight: 1.0`) | Implemented — see below |
+| PSICHIC | 0% (weight unused) | Used as cheap pre-filter only |
 
 The validator already runs full Boltz-2 scoring (`boltz/wrapper.py`). The stock miner was
 optimising exclusively for PSICHIC, which was never rewarded. This document describes what
@@ -30,9 +30,9 @@ Where:
 
 Winner is the UID with the **maximum** `boltz_score`.
 
-Key insight: because `affinity_pred_value` is negative, subtracting it is additive.  
+Key insight: because `affinity_pred_value` is negative, subtracting it is additive.
 A molecule with `affinity_probability_binary=0.9` and `affinity_pred_value=-9.0` over 25
-heavy atoms gives `(0.9 − (−9.0)) / 25 = 0.396`.  This is a **ligand-efficiency metric**:
+heavy atoms gives `(0.9 − (−9.0)) / 25 = 0.396`. This is a **ligand-efficiency metric**:
 smaller, more potent binders score higher per atom.
 
 **Optimal molecule properties:**
@@ -46,7 +46,7 @@ The validator picks the **first** molecule in a miner's submission
 
 ---
 
-## What Was Implemented (this PR)
+## Implemented
 
 ### 1. Boltz-safe filter in the PSICHIC loop (`neurons/miner.py`)
 
@@ -64,22 +64,51 @@ an unscorable molecule.
 When the miner is ≤ 50 blocks from epoch end and has found a candidate, it:
 
 1. Takes the top-5 PSICHIC-ranked molecules
-2. Runs `BoltzWrapper.score_molecules_target()` on them (same code the validator uses)
-3. Sorts by `boltz_score` descending
-4. Puts the highest-scoring Boltz-2 molecule **first** in `candidate_product`
+2. Checks the in-memory Boltz score cache for each (see §3)
+3. Runs `BoltzWrapper.score_molecules_target()` only on uncached molecules
+4. Stores new scores in the cache
+5. Sorts by `boltz_score` descending
+6. Puts the highest-scoring Boltz-2 molecule **first** in `candidate_product`
 
 The blocking Boltz inference runs via `asyncio.to_thread()` so the event loop stays live.
 
-### 3. `candidate_molecules` state tracking
+### 3. Boltz score cache (`neurons/miner.py`)
+
+```python
+state['boltz_score_cache'] = {}  # {(canonical_smiles, protein_code): float}
+```
+
+Key properties:
+- Keyed by `(get_canonical_smiles(smiles), protein_code)` — canonical SMILES ensures
+  equivalent molecules match regardless of input representation.
+- Persists across epoch boundaries within a single miner session. If the weekly target
+  changes, the new protein code makes old entries inert (different key → cache miss).
+- Molecules already scored in a previous Boltz call are returned instantly without any
+  GPU work, saving 45–150 s per cache hit.
+- Reset on process restart (purely in-memory). For persistent caching see §Future Work.
+
+**Benefit:** When a new PSICHIC best is found mid-epoch and `boltz_prescored` resets,
+the second Boltz call only re-runs on genuinely new molecules. The previously top-ranked
+molecules are served from cache in microseconds.
+
+### 4. `candidate_molecules` state tracking
 
 The full PSICHIC top-10 DataFrame is kept in `state['candidate_molecules']` so
 `run_boltz_prescoring` can access SMILES without re-querying the dataset.
 
-### 4. `boltz_prescored` flag
+### 5. `boltz_prescored` flag
 
-Set to `True` once Boltz pre-scoring completes for a given candidate.  Reset to `False`
-whenever a new best PSICHIC candidate is found or the epoch rolls over.  This prevents
-repeated expensive Boltz calls within the same epoch.
+Set to `True` once Boltz pre-scoring completes for a given candidate. Reset to `False`
+whenever a new best PSICHIC candidate is found or the epoch rolls over. Combined with the
+cache, this prevents redundant GPU calls without losing the ability to re-evaluate new
+candidates.
+
+### 6. `get_canonical_smiles` utility (`utils/molecules.py`)
+
+```python
+def get_canonical_smiles(smiles: str) -> str:
+    """RDKit canonical form for consistent cache keying. Falls back to input on failure."""
+```
 
 ---
 
@@ -92,17 +121,18 @@ Epoch start
 stream SAVI-2020 chunks (128 mols each)
     │
     ├─ filter: min_heavy_atoms ≥ 10
-    ├─ filter: is_boltz_safe_smiles()          ← NEW
+    ├─ filter: is_boltz_safe_smiles()
     │
     ▼
 PSICHIC scoring (target - antitarget_weight × antitarget)
     │
     ▼
-top-10 molecules → candidate_molecules         ← NEW (stored)
+top-10 molecules → candidate_molecules (stored in state)
     │
     ▼  (when blocks_until_epoch ≤ 50)
-Boltz-2 pre-scoring on top-5 candidates        ← NEW
-    │  (asyncio.to_thread → BoltzWrapper)
+Boltz-2 pre-scoring on top-5 candidates
+    │  ├─ cache hit  → score returned instantly
+    │  └─ cache miss → asyncio.to_thread(BoltzWrapper) → score stored in cache
     ▼
 reorder: best Boltz mol → position 0 in submission
     │
@@ -132,7 +162,7 @@ Current files available:
 - `boltz/msa_files/P31652.a3m`
 
 **Action required when the weekly target rotates:** generate and commit the new `.a3m` file
-before the epoch begins.  Without it, Boltz-2 will run without evolutionary context and
+before the epoch begins. Without it, Boltz-2 will run without evolutionary context and
 predictions will be weaker.
 
 To generate an MSA for a new target (UniProt ID `P12345`):
@@ -163,14 +193,14 @@ With the default `boltz_config.yaml` settings (`sampling_steps: 100`,
 | RTX 4090 | ~90 s |
 | RTX 3090 | ~150 s |
 
-Scoring 5 candidates ≈ 4–12 minutes on typical mining hardware.  Epochs are ~72 minutes
+Scoring 5 candidates ≈ 4–12 minutes on typical mining hardware. Epochs are ~72 minutes
 (360 blocks × 12 s), so this fits comfortably within the 50-block window (~10 minutes).
 
 **Tuning options** (edit `boltz/boltz_config.yaml`):
 
 ```yaml
 # Faster but lower-quality — suitable for early-epoch filtering
-sampling_steps: 50           # default: 100
+sampling_steps: 50             # default: 100
 diffusion_samples_affinity: 1  # default: 3
 ```
 
@@ -183,56 +213,83 @@ is tight.
 
 ### A. SALSA (Stochastic Approximate Ligand Scoring and Optimisation)
 
-SALSA is an iterative perturbation approach: start from a good seed molecule, apply small
-SMILES perturbations (atom substitutions, ring variations, functional-group swaps), score
-each variant with a fast surrogate, keep winners.
+Iterative perturbation from a seed molecule, using PSICHIC as a cheap filter and Boltz-2
+as the validation oracle. Unlike dataset streaming, SALSA can find molecules not in
+SAVI-2020 for the specific weekly target.
 
-Relevance for this miner:
-- Run a SALSA loop using the Boltz-2 affinity score as the objective
-- Initialise from the top PSICHIC molecule each epoch
-- 5–10 perturbation rounds × 20 variants = 100–200 fast PSICHIC evaluations + final Boltz
-  validation of the top-5
-
-This could generate novel molecules that score better than anything in SAVI-2020 for the
-specific weekly target.
+**Constraints:** The miner submits `product_name` values that must be resolvable to SMILES
+by the validator (via the AWS API or `rxn:` format). Raw novel SMILES cannot be submitted
+directly. SALSA therefore works as a **pre-filter** to identify promising chemical space,
+with the final submitted molecule still being a SAVI-2020 or rxn: product.
 
 Implementation sketch:
+
 ```python
 from rdkit import Chem
-from rdkit.Chem import AllChem
+from rdkit.Chem import AllChem, rdMolDescriptors
 
-def perturb_smiles(smiles: str) -> list[str]:
-    """Atom-substitution and ring-opening perturbations."""
-    ...
+# Substituents for atom-level perturbation
+_SUBSTITUENTS = ['F', 'Cl', 'Br', 'OH', 'NH2', 'CH3', 'CF3', 'OCH3', 'CN']
 
-async def run_salsa_loop(seed_smiles: str, state, rounds=5, variants=20) -> str:
-    best = seed_smiles
+def perturb_molecule(mol: Chem.Mol) -> list[Chem.Mol]:
+    """Generate atom-substitution and functional-group perturbations."""
+    variants = []
+    for atom in mol.GetAtoms():
+        if atom.GetAtomicNum() == 1:
+            continue  # skip explicit H
+        for sub in _SUBSTITUENTS:
+            edit = Chem.RWMol(mol)
+            try:
+                edit.GetAtomWithIdx(atom.GetIdx()).SetAtomicNum(
+                    Chem.GetPeriodicTable().GetAtomicNumber(sub.rstrip('H'))
+                )
+                candidate = edit.GetMol()
+                Chem.SanitizeMol(candidate)
+                variants.append(candidate)
+            except Exception:
+                pass
+    return variants
+
+async def run_salsa_loop(seed_smiles: str, state, rounds: int = 3) -> str:
+    """
+    SALSA: 3 rounds of perturbation → PSICHIC filter → Boltz validation.
+    Returns the SMILES of the best molecule found (for lookup in SAVI-2020 or rxn: DB).
+    """
+    best_smiles = seed_smiles
     for _ in range(rounds):
-        candidates = [perturb_smiles(best) for _ in range(variants)]
-        # quick PSICHIC filter
-        # Boltz-2 validation of top-3
-        best = top_boltz_candidate(candidates)
-    return best
+        seed_mol = Chem.MolFromSmiles(best_smiles)
+        if seed_mol is None:
+            break
+        variants = perturb_molecule(seed_mol)
+        variant_smiles = [Chem.MolToSmiles(v) for v in variants]
+        # PSICHIC filter (fast) — score with existing models
+        # ... score variant_smiles with state['psichic_models'] ...
+        # Boltz validation of top-3 (uses cache)
+        # ... call run_boltz_prescoring on top-3 variants ...
+        # Update best_smiles from Boltz winner
+    return best_smiles
 ```
+
+**Roadblock to resolve:** map the SALSA winner back to a SAVI-2020 `product_name` or
+generate a valid `rxn:` product string so it can be submitted.
 
 ### B. GradientGA (Gradient-Guided Genetic Algorithm)
 
 Maintain a population of ~50 molecules per epoch. Use PSICHIC as the cheap fitness
 function for selection/crossover/mutation, and promote only the top-N to Boltz-2 evaluation.
 
-Key advantage: explores chemical space much more broadly than streaming random chunks from
-SAVI-2020.
-
 Population operations:
 - **Crossover**: SMILES substring exchange (fragmentation at rotatable bonds)
 - **Mutation**: atom substitution, functional-group addition/removal
-- **Selection**: tournament selection on PSICHIC score
+- **Selection**: tournament selection on PSICHIC combined score
 - **Elitism**: always keep the top-1 Boltz-2 scored molecule
+
+Same submission constraint as SALSA: winners must map to a submittable product name.
 
 ### C. Multi-molecule entropy bonus
 
 When the validator increases `num_molecules_boltz > 1`, the entropy bonus activates
-(`ranking.py` lines 109–118).  The miner should respond by submitting a set of molecules
+(`ranking.py` lines 109–118). The miner should respond by submitting a set of molecules
 with high MACCS fingerprint diversity, not just the single best binder.
 
 Implementation: after Boltz pre-scoring, fill remaining submission slots greedily with
@@ -240,17 +297,37 @@ molecules that maximise `compute_maccs_entropy()` relative to the already-select
 
 ### D. Binding-pocket guidance
 
-`config.yaml` exposes `binding_pocket`, `max_distance`, and `force`.  When the validator
+`config.yaml` exposes `binding_pocket`, `max_distance`, and `force`. When the validator
 sets a pocket constraint, Boltz-2 adds a soft or hard guidance term to steer the diffusion
-towards specific residues.  Miners could pre-filter for molecules whose docked pose (from
-a fast docking tool like Vina or Gnina) is predicted to sit inside the specified pocket,
-avoiding molecules that Boltz-2 will penalise for wrong pose.
+towards specific residues. Miners could pre-filter for molecules whose docked pose (from
+a fast docking tool like Vina or Gnina) is predicted to sit inside the specified pocket.
 
-### E. Caching Boltz scores across epochs
+### E. Persistent Boltz score cache (disk)
 
-If the weekly target doesn't change between epochs, previously scored molecules can be
-cached (keyed by `SMILES + protein_sequence`).  This allows the miner to accumulate a
-lookup table of Boltz scores and skip re-scoring known molecules.
+The current in-memory cache resets on process restart. A simple JSON or SQLite cache
+keyed by `(canonical_smiles, protein_code)` would accumulate scores across restarts and
+across miners sharing a machine.
+
+```python
+import sqlite3, json
+
+CACHE_PATH = os.path.join(BASE_DIR, 'boltz_score_cache.db')
+
+def cache_get(smiles: str, protein: str) -> Optional[float]:
+    with sqlite3.connect(CACHE_PATH) as conn:
+        row = conn.execute(
+            'SELECT score FROM boltz_cache WHERE smiles=? AND protein=?',
+            (smiles, protein)
+        ).fetchone()
+    return row[0] if row else None
+
+def cache_put(smiles: str, protein: str, score: float) -> None:
+    with sqlite3.connect(CACHE_PATH) as conn:
+        conn.execute(
+            'INSERT OR REPLACE INTO boltz_cache VALUES (?,?,?)',
+            (smiles, protein, score)
+        )
+```
 
 ---
 
@@ -275,5 +352,7 @@ These parameters in `config/config.yaml` directly affect what the miner should o
 
 | File | Change |
 |------|--------|
-| `neurons/miner.py` | Added `is_boltz_safe_smiles` filter, `run_boltz_prescoring()`, Boltz trigger logic, state fields |
+| `neurons/miner.py` | Added `is_boltz_safe_smiles` filter, `run_boltz_prescoring()` with cache, Boltz trigger logic, `boltz_score_cache` state field |
+| `utils/molecules.py` | Added `get_canonical_smiles()` |
+| `utils/__init__.py` | Exported `get_canonical_smiles` |
 | `BOLTZ2_INTEGRATION.md` | This file |

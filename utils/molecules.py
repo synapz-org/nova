@@ -224,6 +224,20 @@ def find_chemically_identical(smiles_list: list[str]) -> dict:
     
     return duplicates
 
+def get_canonical_smiles(smiles: str) -> str:
+    """
+    Return the canonical RDKit SMILES for a molecule. Falls back to the
+    original string if parsing fails, so callers always get a usable key.
+    """
+    try:
+        mol = Chem.MolFromSmiles(smiles)
+        if mol is not None:
+            return Chem.MolToSmiles(mol)
+    except Exception:
+        pass
+    return smiles
+
+
 def contains_atom_type(mol: Chem.Mol, atom_types: list[str]) -> bool:
     """
     Check if a molecule contains a specific atom type.
