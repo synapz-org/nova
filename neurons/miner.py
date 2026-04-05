@@ -9,6 +9,7 @@ import tempfile
 import traceback
 import base64
 import hashlib
+import sqlite3
 
 from typing import Any, Dict, List, Optional, Tuple, cast
 from types import SimpleNamespace
@@ -25,6 +26,8 @@ import pandas as pd
 BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 sys.path.append(BASE_DIR)
 
+BOLTZ_CACHE_DB = os.path.join(BASE_DIR, "boltz_score_cache.db")
+
 from config.config_loader import load_config
 from utils import (
     get_sequence_from_protein_code,
@@ -37,6 +40,49 @@ from utils.molecules import is_boltz_safe_smiles, get_canonical_smiles
 from PSICHIC.wrapper import PsichicWrapper
 from boltz.wrapper import BoltzWrapper
 from btdr import QuicknetBittensorDrandTimelock
+
+# ----------------------------------------------------------------------------
+# 0. PERSISTENT BOLTZ SCORE CACHE (SQLite)
+# ----------------------------------------------------------------------------
+
+def _init_boltz_cache_db(db_path: str) -> None:
+    """Create the boltz_cache table if it doesn't exist."""
+    with sqlite3.connect(db_path) as conn:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS boltz_cache (
+                smiles  TEXT NOT NULL,
+                protein TEXT NOT NULL,
+                score   REAL NOT NULL,
+                ts      INTEGER DEFAULT (strftime('%s','now')),
+                PRIMARY KEY (smiles, protein)
+            )
+        """)
+
+
+def _disk_cache_get(db_path: str, smiles: str, protein: str) -> Optional[float]:
+    """Return cached Boltz score for (smiles, protein), or None on miss/error."""
+    try:
+        with sqlite3.connect(db_path) as conn:
+            row = conn.execute(
+                "SELECT score FROM boltz_cache WHERE smiles=? AND protein=?",
+                (smiles, protein),
+            ).fetchone()
+        return float(row[0]) if row else None
+    except Exception:
+        return None
+
+
+def _disk_cache_put(db_path: str, smiles: str, protein: str, score: float) -> None:
+    """Upsert a Boltz score into the persistent cache (silently ignores errors)."""
+    try:
+        with sqlite3.connect(db_path) as conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO boltz_cache (smiles, protein, score) VALUES (?,?,?)",
+                (smiles, protein, score),
+            )
+    except Exception:
+        pass
+
 
 # ----------------------------------------------------------------------------
 # 1. CONFIG & ARGUMENT PARSING
@@ -460,21 +506,29 @@ async def run_boltz_prescoring(state: Dict[str, Any], max_candidates: int = 5) -
         bt.logging.warning("Boltz-2 pre-scoring: no Boltz-safe candidates, keeping PSICHIC ranking.")
         return
 
-    # --- Cache lookup ---
+    # --- Cache lookup (in-memory first, then disk) ---
     protein = state['config'].weekly_target
     boltz_cache: Dict[Tuple[str, str], float] = state.setdefault('boltz_score_cache', {})
+    db_path: str = state.get('boltz_cache_db', BOLTZ_CACHE_DB)
 
     cached_scores: Dict[str, float] = {}
     uncached_rows = []
 
     for _, row in candidates.iterrows():
         smiles = row['product_smiles']
-        key = (get_canonical_smiles(smiles), protein)
+        canon = get_canonical_smiles(smiles)
+        key = (canon, protein)
         if key in boltz_cache:
             cached_scores[smiles] = boltz_cache[key]
-            bt.logging.debug(f"Boltz cache hit: {smiles} → {boltz_cache[key]:.4f}")
+            bt.logging.debug(f"Boltz in-memory cache hit: {smiles} → {boltz_cache[key]:.4f}")
         else:
-            uncached_rows.append(row)
+            disk_score = _disk_cache_get(db_path, canon, protein)
+            if disk_score is not None:
+                boltz_cache[key] = disk_score  # warm in-memory cache
+                cached_scores[smiles] = disk_score
+                bt.logging.debug(f"Boltz disk cache hit: {smiles} → {disk_score:.4f}")
+            else:
+                uncached_rows.append(row)
 
     uncached_candidates = pd.DataFrame(uncached_rows).reset_index(drop=True) if uncached_rows else pd.DataFrame()
 
@@ -523,10 +577,15 @@ async def run_boltz_prescoring(state: Dict[str, Any], max_candidates: int = 5) -
 
             new_scores = wrapper.per_molecule_metric.get(uid, {})
 
-            # Store new scores in cache
+            # Store new scores in both in-memory and persistent cache
             for smiles, score in new_scores.items():
-                boltz_cache[(get_canonical_smiles(smiles), protein)] = score
-            bt.logging.info(f"Boltz cache updated: {len(boltz_cache)} entries total.")
+                canon = get_canonical_smiles(smiles)
+                boltz_cache[(canon, protein)] = score
+                _disk_cache_put(db_path, canon, protein, score)
+            bt.logging.info(
+                f"Boltz cache updated: {len(boltz_cache)} in-memory entries; "
+                f"new scores persisted to {db_path}"
+            )
 
         except Exception as e:
             bt.logging.error(f"Boltz-2 pre-scoring failed: {e}")
@@ -611,8 +670,10 @@ async def run_miner(config: argparse.Namespace) -> None:
         'shutdown_event': asyncio.Event(),
 
         # Boltz score cache: {(canonical_smiles, protein_code): float}
-        # Persists across epochs so re-encountered molecules skip inference.
+        # In-memory layer — persists across epochs within a session.
         'boltz_score_cache': {},
+        # Path to persistent SQLite cache (survives process restarts).
+        'boltz_cache_db': BOLTZ_CACHE_DB,
 
         # Challenges
         'current_challenge_targets': [],
@@ -620,6 +681,10 @@ async def run_miner(config: argparse.Namespace) -> None:
         'current_challenge_antitargets': [],
         'last_challenge_antitargets': [],
     }
+
+    # Ensure persistent Boltz cache DB exists
+    _init_boltz_cache_db(state['boltz_cache_db'])
+    bt.logging.info(f"Boltz persistent cache initialised: {state['boltz_cache_db']}")
 
     bt.logging.info("Entering main miner loop...")
 

@@ -302,32 +302,28 @@ sets a pocket constraint, Boltz-2 adds a soft or hard guidance term to steer the
 towards specific residues. Miners could pre-filter for molecules whose docked pose (from
 a fast docking tool like Vina or Gnina) is predicted to sit inside the specified pocket.
 
-### E. Persistent Boltz score cache (disk)
+### E. Persistent Boltz score cache (disk) ✅ Implemented
 
-The current in-memory cache resets on process restart. A simple JSON or SQLite cache
-keyed by `(canonical_smiles, protein_code)` would accumulate scores across restarts and
-across miners sharing a machine.
+~~The current in-memory cache resets on process restart.~~ A SQLite cache keyed by
+`(canonical_smiles, protein_code)` now accumulates scores across restarts and across
+miners sharing a machine.
 
-```python
-import sqlite3, json
+**Implementation** (`neurons/miner.py`):
 
-CACHE_PATH = os.path.join(BASE_DIR, 'boltz_score_cache.db')
-
-def cache_get(smiles: str, protein: str) -> Optional[float]:
-    with sqlite3.connect(CACHE_PATH) as conn:
-        row = conn.execute(
-            'SELECT score FROM boltz_cache WHERE smiles=? AND protein=?',
-            (smiles, protein)
-        ).fetchone()
-    return row[0] if row else None
-
-def cache_put(smiles: str, protein: str, score: float) -> None:
-    with sqlite3.connect(CACHE_PATH) as conn:
-        conn.execute(
-            'INSERT OR REPLACE INTO boltz_cache VALUES (?,?,?)',
-            (smiles, protein, score)
-        )
 ```
+BOLTZ_CACHE_DB = <repo_root>/boltz_score_cache.db
+```
+
+- `_init_boltz_cache_db(db_path)` — creates the `boltz_cache` table on first run.
+- `_disk_cache_get(db_path, smiles, protein)` — returns cached score or `None`.
+- `_disk_cache_put(db_path, smiles, protein, score)` — upserts score (silently ignores errors).
+
+Cache lookup order in `run_boltz_prescoring`:
+1. In-memory dict `state['boltz_score_cache']` (microseconds)
+2. Disk SQLite `boltz_score_cache.db` (microseconds, warms in-memory on hit)
+3. GPU inference via `BoltzWrapper` (45–150 s) → stored in both layers
+
+Result: a molecule scored in a previous session is never re-run on GPU.
 
 ---
 
@@ -352,7 +348,7 @@ These parameters in `config/config.yaml` directly affect what the miner should o
 
 | File | Change |
 |------|--------|
-| `neurons/miner.py` | Added `is_boltz_safe_smiles` filter, `run_boltz_prescoring()` with cache, Boltz trigger logic, `boltz_score_cache` state field |
+| `neurons/miner.py` | Added `is_boltz_safe_smiles` filter, `run_boltz_prescoring()` with two-tier cache, Boltz trigger logic, `boltz_score_cache` + `boltz_cache_db` state fields; `_init_boltz_cache_db`, `_disk_cache_get`, `_disk_cache_put` helpers |
 | `utils/molecules.py` | Added `get_canonical_smiles()` |
 | `utils/__init__.py` | Exported `get_canonical_smiles` |
 | `BOLTZ2_INTEGRATION.md` | This file |
