@@ -9,6 +9,7 @@ import tempfile
 import traceback
 import base64
 import hashlib
+import sqlite3
 
 from typing import Any, Dict, List, Optional, Tuple, cast
 from types import SimpleNamespace
@@ -25,6 +26,8 @@ import pandas as pd
 BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 sys.path.append(BASE_DIR)
 
+BOLTZ_CACHE_DB = os.path.join(BASE_DIR, "boltz_score_cache.db")
+
 from config.config_loader import load_config
 from utils import (
     get_sequence_from_protein_code,
@@ -33,8 +36,53 @@ from utils import (
     get_heavy_atom_count,
     compute_maccs_entropy,
 )
+from utils.molecules import is_boltz_safe_smiles, get_canonical_smiles
 from PSICHIC.wrapper import PsichicWrapper
+from boltz.wrapper import BoltzWrapper
 from btdr import QuicknetBittensorDrandTimelock
+
+# ----------------------------------------------------------------------------
+# 0. PERSISTENT BOLTZ SCORE CACHE (SQLite)
+# ----------------------------------------------------------------------------
+
+def _init_boltz_cache_db(db_path: str) -> None:
+    """Create the boltz_cache table if it doesn't exist."""
+    with sqlite3.connect(db_path) as conn:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS boltz_cache (
+                smiles  TEXT NOT NULL,
+                protein TEXT NOT NULL,
+                score   REAL NOT NULL,
+                ts      INTEGER DEFAULT (strftime('%s','now')),
+                PRIMARY KEY (smiles, protein)
+            )
+        """)
+
+
+def _disk_cache_get(db_path: str, smiles: str, protein: str) -> Optional[float]:
+    """Return cached Boltz score for (smiles, protein), or None on miss/error."""
+    try:
+        with sqlite3.connect(db_path) as conn:
+            row = conn.execute(
+                "SELECT score FROM boltz_cache WHERE smiles=? AND protein=?",
+                (smiles, protein),
+            ).fetchone()
+        return float(row[0]) if row else None
+    except Exception:
+        return None
+
+
+def _disk_cache_put(db_path: str, smiles: str, protein: str, score: float) -> None:
+    """Upsert a Boltz score into the persistent cache (silently ignores errors)."""
+    try:
+        with sqlite3.connect(db_path) as conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO boltz_cache (smiles, protein, score) VALUES (?,?,?)",
+                (smiles, protein, score),
+            )
+    except Exception:
+        pass
+
 
 # ----------------------------------------------------------------------------
 # 1. CONFIG & ARGUMENT PARSING
@@ -242,6 +290,11 @@ async def run_psichic_model_loop(state: Dict[str, Any]) -> None:
                 if df.empty or len(df) < state['config'].num_molecules:
                     continue
 
+                # Filter for Boltz-2 compatibility (validator scores with Boltz-2)
+                df = df[df['product_smiles'].apply(lambda x: is_boltz_safe_smiles(x)[0])]
+                if df.empty or len(df) < state['config'].num_molecules:
+                    continue
+
                 # Run inference for all targets and antitargets
                 target_scores = []
                 antitarget_scores = []
@@ -300,7 +353,9 @@ async def run_psichic_model_loop(state: Dict[str, Any]) -> None:
 
                     if final_score > state['best_score']:
                         state['best_score'] = final_score
+                        state['candidate_molecules'] = top_molecules.copy()
                         state['candidate_product'] = ','.join(top_molecules['product_name'].tolist())
+                        state['boltz_prescored'] = False  # Re-run Boltz for new best candidate
                         bt.logging.info(f"New best score: {state['best_score']}, Candidates: {state['candidate_product']}")
 
                     # Only submit if we're close to epoch end (20 blocks away)
@@ -308,9 +363,28 @@ async def run_psichic_model_loop(state: Dict[str, Any]) -> None:
                     current_block = await state['subtensor'].get_current_block()
                     next_epoch_block = ((current_block // state['epoch_length']) + 1) * state['epoch_length']
                     blocks_until_epoch = next_epoch_block - current_block
-                    
+
                     bt.logging.debug(f"Current block: {current_block}, Epoch length: {state['epoch_length']}, Next epoch block: {next_epoch_block}, Blocks until epoch: {blocks_until_epoch}")
-                    
+
+                    # Trigger Boltz-2 pre-scoring when approaching epoch end.
+                    # Reorders candidate_product so the best Boltz-2 molecule is first
+                    # (validator uses sample_selection="first", so position matters).
+                    if (
+                        state['candidate_product']
+                        and blocks_until_epoch <= 50
+                        and not state.get('boltz_prescored', False)
+                    ):
+                        bt.logging.info(
+                            f"Triggering Boltz-2 pre-scoring "
+                            f"({blocks_until_epoch} blocks until epoch end)..."
+                        )
+                        state['boltz_prescored'] = True
+                        try:
+                            await run_boltz_prescoring(state)
+                        except Exception as e:
+                            bt.logging.error(f"Boltz-2 pre-scoring error: {e}")
+                            traceback.print_exc()
+
                     if state['candidate_product'] and blocks_until_epoch <= 20:
                         bt.logging.info(f"Close to epoch end ({blocks_until_epoch} blocks remaining), attempting submission...")
                         if state['candidate_product'] != state['last_submitted_product']:
@@ -398,6 +472,152 @@ async def submit_response(state: Dict[str, Any]) -> None:
 
 
 # ----------------------------------------------------------------------------
+# 6. BOLTZ-2 PRE-SCORING
+# ----------------------------------------------------------------------------
+
+async def run_boltz_prescoring(state: Dict[str, Any], max_candidates: int = 5) -> None:
+    """
+    Runs Boltz-2 affinity predictions on the top PSICHIC candidates and reorders
+    state['candidate_product'] so the highest-scoring Boltz-2 molecule comes first.
+
+    Results are cached in state['boltz_score_cache'] keyed by
+    (canonical_smiles, protein_code) so molecules already scored in this session
+    skip inference entirely — saving 45-150 s of GPU time per cache hit.
+
+    The validator uses sample_selection="first" with num_molecules_boltz=1, so the
+    molecule placed first in the submission is the one that determines our Boltz score.
+    Boltz scoring formula: (affinity_probability_binary - affinity_pred_value) / heavy_atom_count
+
+    Args:
+        state: Shared miner state dict.
+        max_candidates: Maximum number of PSICHIC top-molecules to score with Boltz-2.
+    """
+    candidates = state.get('candidate_molecules')
+    if candidates is None or candidates.empty:
+        bt.logging.warning("Boltz-2 pre-scoring: no candidate molecules available.")
+        return
+
+    # Take at most max_candidates and keep only Boltz-safe SMILES
+    candidates = candidates.head(max_candidates).copy()
+    safe_mask = candidates['product_smiles'].apply(lambda s: is_boltz_safe_smiles(s)[0])
+    candidates = candidates[safe_mask].reset_index(drop=True)
+
+    if candidates.empty:
+        bt.logging.warning("Boltz-2 pre-scoring: no Boltz-safe candidates, keeping PSICHIC ranking.")
+        return
+
+    # --- Cache lookup (in-memory first, then disk) ---
+    protein = state['config'].weekly_target
+    boltz_cache: Dict[Tuple[str, str], float] = state.setdefault('boltz_score_cache', {})
+    db_path: str = state.get('boltz_cache_db', BOLTZ_CACHE_DB)
+
+    cached_scores: Dict[str, float] = {}
+    uncached_rows = []
+
+    for _, row in candidates.iterrows():
+        smiles = row['product_smiles']
+        canon = get_canonical_smiles(smiles)
+        key = (canon, protein)
+        if key in boltz_cache:
+            cached_scores[smiles] = boltz_cache[key]
+            bt.logging.debug(f"Boltz in-memory cache hit: {smiles} → {boltz_cache[key]:.4f}")
+        else:
+            disk_score = _disk_cache_get(db_path, canon, protein)
+            if disk_score is not None:
+                boltz_cache[key] = disk_score  # warm in-memory cache
+                cached_scores[smiles] = disk_score
+                bt.logging.debug(f"Boltz disk cache hit: {smiles} → {disk_score:.4f}")
+            else:
+                uncached_rows.append(row)
+
+    uncached_candidates = pd.DataFrame(uncached_rows).reset_index(drop=True) if uncached_rows else pd.DataFrame()
+
+    # --- Run Boltz only for uncached molecules ---
+    new_scores: Dict[str, float] = {}
+    if uncached_candidates.empty:
+        bt.logging.info(
+            f"Boltz-2 pre-scoring: all {len(candidates)} candidates in cache — skipping inference."
+        )
+    else:
+        bt.logging.info(
+            f"Boltz-2 pre-scoring {len(uncached_candidates)}/{len(candidates)} candidates "
+            f"({len(cached_scores)} cached) for target {protein}..."
+        )
+
+        uid = 0
+        valid_molecules_by_uid = {
+            uid: {
+                "smiles": uncached_candidates['product_smiles'].tolist(),
+                "names": uncached_candidates['product_name'].tolist(),
+            }
+        }
+        score_dict: Dict[str, Any] = {uid: {}}
+
+        subnet_config = {
+            'weekly_target': protein,
+            'binding_pocket': state['config'].binding_pocket,
+            'max_distance': state['config'].max_distance,
+            'force': state['config'].force,
+            'num_molecules_boltz': len(uncached_candidates),
+            'sample_selection': 'first',
+            'boltz_metric': state['config'].boltz_metric,
+            'combination_strategy': state['config'].combination_strategy,
+        }
+
+        try:
+            wrapper = BoltzWrapper()
+            # Run blocking Boltz inference in a thread so the event loop stays responsive
+            await asyncio.to_thread(
+                wrapper.score_molecules_target,
+                valid_molecules_by_uid,
+                score_dict,
+                subnet_config,
+                '0x' + '0' * 64,  # dummy block hash (not used for sample_selection='first')
+            )
+
+            new_scores = wrapper.per_molecule_metric.get(uid, {})
+
+            # Store new scores in both in-memory and persistent cache
+            for smiles, score in new_scores.items():
+                canon = get_canonical_smiles(smiles)
+                boltz_cache[(canon, protein)] = score
+                _disk_cache_put(db_path, canon, protein, score)
+            bt.logging.info(
+                f"Boltz cache updated: {len(boltz_cache)} in-memory entries; "
+                f"new scores persisted to {db_path}"
+            )
+
+        except Exception as e:
+            bt.logging.error(f"Boltz-2 pre-scoring failed: {e}")
+            traceback.print_exc()
+            # Safe fallback: keep original PSICHIC-ranked order
+            return
+
+    # --- Merge cached + new scores and reorder submission ---
+    all_scores = {**cached_scores, **new_scores}
+    if not all_scores:
+        bt.logging.warning("Boltz-2 pre-scoring returned no scores; keeping PSICHIC ranking.")
+        return
+
+    candidates['boltz_score'] = candidates['product_smiles'].map(all_scores).fillna(-math.inf)
+    candidates.sort_values('boltz_score', ascending=False, inplace=True)
+    candidates.reset_index(drop=True, inplace=True)
+
+    best_name = candidates.iloc[0]['product_name']
+    best_boltz = candidates.iloc[0]['boltz_score']
+
+    # Reorder submission: best Boltz molecule first, remaining in original PSICHIC order
+    original_names = state['candidate_product'].split(',')
+    reordered = [best_name] + [n for n in original_names if n != best_name]
+    state['candidate_product'] = ','.join(reordered)
+
+    bt.logging.info(
+        f"Boltz-2 pre-scoring complete. Best molecule: {best_name} "
+        f"(boltz_score={best_boltz:.4f}). Submission reordered."
+    )
+
+
+# ----------------------------------------------------------------------------
 # 6. MAIN MINING LOOP
 # ----------------------------------------------------------------------------
 
@@ -442,10 +662,18 @@ async def run_miner(config: argparse.Namespace) -> None:
 
         # Inference state
         'candidate_product': None,
+        'candidate_molecules': None,
         'best_score': float('-inf'),
+        'boltz_prescored': False,
         'last_submitted_product': None,
         'last_submission_time': None,
         'shutdown_event': asyncio.Event(),
+
+        # Boltz score cache: {(canonical_smiles, protein_code): float}
+        # In-memory layer — persists across epochs within a session.
+        'boltz_score_cache': {},
+        # Path to persistent SQLite cache (survives process restarts).
+        'boltz_cache_db': BOLTZ_CACHE_DB,
 
         # Challenges
         'current_challenge_targets': [],
@@ -453,6 +681,10 @@ async def run_miner(config: argparse.Namespace) -> None:
         'current_challenge_antitargets': [],
         'last_challenge_antitargets': [],
     }
+
+    # Ensure persistent Boltz cache DB exists
+    _init_boltz_cache_db(state['boltz_cache_db'])
+    bt.logging.info(f"Boltz persistent cache initialised: {state['boltz_cache_db']}")
 
     bt.logging.info("Entering main miner loop...")
 
@@ -565,7 +797,9 @@ async def run_miner(config: argparse.Namespace) -> None:
 
                 # Reset best score and candidate
                 state['candidate_product'] = None
+                state['candidate_molecules'] = None
                 state['best_score'] = float('-inf')
+                state['boltz_prescored'] = False
                 state['last_submitted_product'] = None
                 state['shutdown_event'] = asyncio.Event()
 
