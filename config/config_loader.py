@@ -21,6 +21,7 @@ def load_config(path: str = "config/config.yaml"):
     validation_config = config["molecule_validation"]
     antitarget_weight = validation_config["antitarget_weight"]
     min_heavy_atoms = validation_config["min_heavy_atoms"]
+    max_heavy_atoms = validation_config.get("max_heavy_atoms", None)
     min_rotatable_bonds = validation_config["min_rotatable_bonds"]
     max_rotatable_bonds = validation_config["max_rotatable_bonds"]
     banned_atom_types = validation_config["banned_atom_types"]
@@ -54,6 +55,7 @@ def load_config(path: str = "config/config.yaml"):
         'no_submission_blocks': no_submission_blocks,
         'antitarget_weight': antitarget_weight,
         'min_heavy_atoms': min_heavy_atoms,
+        'max_heavy_atoms': max_heavy_atoms,
         'min_rotatable_bonds': min_rotatable_bonds,
         'max_rotatable_bonds': max_rotatable_bonds,
         'banned_atom_types': banned_atom_types,

@@ -284,9 +284,12 @@ async def run_psichic_model_loop(state: Dict[str, Any]) -> None:
                 df['product_name'] = df['product_name'].apply(lambda x: x.replace('"', ''))
                 df['product_smiles'] = df['product_smiles'].apply(lambda x: x.replace('"', ''))
 
-                # Filter by min_heavy_atoms
+                # Filter by heavy atom count (min and optional max for Boltz efficiency)
                 df['heavy_atoms'] = df['product_smiles'].apply(lambda x: get_heavy_atom_count(x))
                 df = df[df['heavy_atoms'] >= state['config'].min_heavy_atoms]
+                max_ha = getattr(state['config'], 'max_heavy_atoms', None)
+                if max_ha:
+                    df = df[df['heavy_atoms'] <= max_ha]
                 if df.empty or len(df) < state['config'].num_molecules:
                     continue
 
@@ -347,7 +350,7 @@ async def run_psichic_model_loop(state: Dict[str, Any]) -> None:
                     scores_sum = top_molecules['combined_score'].sum()
                     
                     if scores_sum > state['config'].entropy_bonus_threshold:
-                        final_score = scores_sum * (state['config'].entropy_weight + entropy)
+                        final_score = scores_sum * (state['config'].entropy_start_weight + entropy)
                     else:
                         final_score = scores_sum
 
@@ -371,12 +374,12 @@ async def run_psichic_model_loop(state: Dict[str, Any]) -> None:
                     # (validator uses sample_selection="first", so position matters).
                     if (
                         state['candidate_product']
-                        and blocks_until_epoch <= 50
+                        and blocks_until_epoch <= 100
                         and not state.get('boltz_prescored', False)
                     ):
                         bt.logging.info(
-                            f"Triggering Boltz-2 pre-scoring "
-                            f"({blocks_until_epoch} blocks until epoch end)..."
+                            f"Triggering Boltz-2 pre-scoring with "
+                            f"{blocks_until_epoch} blocks until epoch end..."
                         )
                         state['boltz_prescored'] = True
                         try:

@@ -24,6 +24,7 @@ molecule_validation:
   molecule_repetition_threshold: 0
   # Molecular property requirements
   min_heavy_atoms: 10
+  max_heavy_atoms: 35   # Boltz ligand-efficiency metric penalises large molecules; 35 HA ~ 500 Da
   min_rotatable_bonds: 1
   max_rotatable_bonds: 10
   banned_atom_types: ["Se"]

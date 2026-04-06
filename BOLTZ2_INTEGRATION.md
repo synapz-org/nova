@@ -48,7 +48,20 @@ The validator picks the **first** molecule in a miner's submission
 
 ## Implemented
 
-### 1. Boltz-safe filter in the PSICHIC loop (`neurons/miner.py`)
+### 1. Ligand-efficiency pre-filter (`neurons/miner.py`, `config/config.yaml`)
+
+`max_heavy_atoms: 35` in `config.yaml` drops molecules larger than ~500 Da before PSICHIC
+scoring. The Boltz-2 scoring formula divides by `heavy_atom_count`, so a 50-HA molecule
+with the same binding as a 25-HA molecule scores half as well. 35 HA is a conservative
+cutoff that eliminates clear non-starters while keeping typical drug-like candidates.
+
+```python
+max_ha = getattr(state['config'], 'max_heavy_atoms', None)
+if max_ha:
+    df = df[df['heavy_atoms'] <= max_ha]
+```
+
+### 2. Boltz-safe filter in the PSICHIC loop (`neurons/miner.py`)
 
 ```python
 # Filter for Boltz-2 compatibility (validator scores with Boltz-2)
@@ -59,9 +72,15 @@ Molecules that fail `is_boltz_safe_smiles` (e.g., atom names > 4 characters) wou
 `-inf` from the validator. Filtering them out early ensures we never waste a submission on
 an unscorable molecule.
 
-### 2. `run_boltz_prescoring` function (`neurons/miner.py`)
+### 3. `run_boltz_prescoring` function (`neurons/miner.py`)
 
-When the miner is ≤ 50 blocks from epoch end and has found a candidate, it:
+When the miner is ≤ 100 blocks from epoch end and has found a candidate, it:
+
+> **Why 100 blocks?** The original 50-block window (~10 min) is tight for slow hardware.
+> 5 candidates × 150 s/mol (RTX 3090) = 12.5 min > 10 min available.
+> Triggering at 100 blocks (~20 min) ensures Boltz completes before the submission
+> deadline on all hardware. The `boltz_prescored` flag resets automatically when a
+> new best candidate is found, so a second pass still fires for any new molecules.
 
 1. Takes the top-5 PSICHIC-ranked molecules
 2. Checks the in-memory Boltz score cache for each (see §3)
@@ -72,7 +91,7 @@ When the miner is ≤ 50 blocks from epoch end and has found a candidate, it:
 
 The blocking Boltz inference runs via `asyncio.to_thread()` so the event loop stays live.
 
-### 3. Boltz score cache (`neurons/miner.py`)
+### 4. Boltz score cache (`neurons/miner.py`)
 
 ```python
 state['boltz_score_cache'] = {}  # {(canonical_smiles, protein_code): float}
@@ -91,19 +110,19 @@ Key properties:
 the second Boltz call only re-runs on genuinely new molecules. The previously top-ranked
 molecules are served from cache in microseconds.
 
-### 4. `candidate_molecules` state tracking
+### 5. `candidate_molecules` state tracking
 
 The full PSICHIC top-10 DataFrame is kept in `state['candidate_molecules']` so
 `run_boltz_prescoring` can access SMILES without re-querying the dataset.
 
-### 5. `boltz_prescored` flag
+### 6. `boltz_prescored` flag
 
 Set to `True` once Boltz pre-scoring completes for a given candidate. Reset to `False`
 whenever a new best PSICHIC candidate is found or the epoch rolls over. Combined with the
 cache, this prevents redundant GPU calls without losing the ability to re-evaluate new
 candidates.
 
-### 6. `get_canonical_smiles` utility (`utils/molecules.py`)
+### 7. `get_canonical_smiles` utility (`utils/molecules.py`)
 
 ```python
 def get_canonical_smiles(smiles: str) -> str:
@@ -121,6 +140,7 @@ Epoch start
 stream SAVI-2020 chunks (128 mols each)
     │
     ├─ filter: min_heavy_atoms ≥ 10
+    ├─ filter: max_heavy_atoms ≤ 35   ← new: drops ligand-efficiency non-starters
     ├─ filter: is_boltz_safe_smiles()
     │
     ▼
@@ -129,7 +149,7 @@ PSICHIC scoring (target - antitarget_weight × antitarget)
     ▼
 top-10 molecules → candidate_molecules (stored in state)
     │
-    ▼  (when blocks_until_epoch ≤ 50)
+    ▼  (when blocks_until_epoch ≤ 100)  ← was 50; 20-min window fits slow hardware
 Boltz-2 pre-scoring on top-5 candidates
     │  ├─ cache hit  → score returned instantly
     │  └─ cache miss → asyncio.to_thread(BoltzWrapper) → score stored in cache
@@ -348,7 +368,9 @@ These parameters in `config/config.yaml` directly affect what the miner should o
 
 | File | Change |
 |------|--------|
-| `neurons/miner.py` | Added `is_boltz_safe_smiles` filter, `run_boltz_prescoring()` with two-tier cache, Boltz trigger logic, `boltz_score_cache` + `boltz_cache_db` state fields; `_init_boltz_cache_db`, `_disk_cache_get`, `_disk_cache_put` helpers |
+| `neurons/miner.py` | Added `is_boltz_safe_smiles` + `max_heavy_atoms` filters; `run_boltz_prescoring()` with two-tier cache; Boltz trigger at 100 blocks (was 50); `boltz_score_cache` + `boltz_cache_db` state fields; `_init_boltz_cache_db`, `_disk_cache_get`, `_disk_cache_put` helpers; fixed `entropy_weight` → `entropy_start_weight` AttributeError |
+| `config/config.yaml` | Added `max_heavy_atoms: 35` |
+| `config/config_loader.py` | Loads and exposes `max_heavy_atoms` |
 | `utils/molecules.py` | Added `get_canonical_smiles()` |
 | `utils/__init__.py` | Exported `get_canonical_smiles` |
 | `BOLTZ2_INTEGRATION.md` | This file |
