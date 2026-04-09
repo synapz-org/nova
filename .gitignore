@@ -5,3 +5,5 @@ venv/
 *.log
 *.log.*
 combinatorial_db/molecules.sqlite
+boltz_score_cache.db
+boltz_tmp_files/

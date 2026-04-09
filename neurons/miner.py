@@ -84,6 +84,30 @@ def _disk_cache_put(db_path: str, smiles: str, protein: str, score: float) -> No
         pass
 
 
+def _cleanup_boltz_cache(db_path: str, keep_protein: str, max_age_days: int = 14) -> None:
+    """
+    Prune stale entries from the persistent Boltz cache.
+
+    Removes rows where:
+    - The protein does not match the current weekly target (old target entries).
+    - The entry is older than max_age_days (catches any leftover same-protein entries
+      from weeks when the target happened to recur).
+
+    Called once at miner startup. Silently ignores errors.
+    """
+    try:
+        cutoff_ts = int(__import__('time').time()) - max_age_days * 86400
+        with sqlite3.connect(db_path) as conn:
+            deleted = conn.execute(
+                "DELETE FROM boltz_cache WHERE protein != ? OR ts < ?",
+                (keep_protein, cutoff_ts),
+            ).rowcount
+        if deleted:
+            bt.logging.info(f"Boltz cache cleanup: removed {deleted} stale entries (non-{keep_protein} or >{max_age_days}d old).")
+    except Exception:
+        pass
+
+
 # ----------------------------------------------------------------------------
 # 1. CONFIG & ARGUMENT PARSING
 # ----------------------------------------------------------------------------
@@ -687,6 +711,7 @@ async def run_miner(config: argparse.Namespace) -> None:
 
     # Ensure persistent Boltz cache DB exists
     _init_boltz_cache_db(state['boltz_cache_db'])
+    _cleanup_boltz_cache(state['boltz_cache_db'], keep_protein=config.weekly_target)
     bt.logging.info(f"Boltz persistent cache initialised: {state['boltz_cache_db']}")
 
     bt.logging.info("Entering main miner loop...")
