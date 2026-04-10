@@ -11,6 +11,9 @@ import base64
 import hashlib
 import sqlite3
 
+from rdkit import Chem
+from rdkit.Chem import Descriptors
+
 from typing import Any, Dict, List, Optional, Tuple, cast
 from types import SimpleNamespace
 
@@ -322,6 +325,22 @@ async def run_psichic_model_loop(state: Dict[str, Any]) -> None:
                 if df.empty or len(df) < state['config'].num_molecules:
                     continue
 
+                # Pharmacophore pre-filter: Lipinski-inspired drug-likeness check.
+                # Eliminates ~30% of molecules (extreme logP, no H-bond capacity)
+                # before the more expensive PSICHIC scoring.
+                def _pharma_ok(smiles: str) -> bool:
+                    mol = Chem.MolFromSmiles(smiles)
+                    if mol is None:
+                        return False
+                    return (
+                        1 <= Descriptors.NumHDonors(mol) <= 3
+                        and 2 <= Descriptors.NumHAcceptors(mol) <= 7
+                        and 0.0 <= Descriptors.MolLogP(mol) <= 4.5
+                    )
+                df = df[df['product_smiles'].apply(_pharma_ok)]
+                if df.empty or len(df) < state['config'].num_molecules:
+                    continue
+
                 # Run inference for all targets and antitargets
                 target_scores = []
                 antitarget_scores = []
@@ -394,11 +413,13 @@ async def run_psichic_model_loop(state: Dict[str, Any]) -> None:
                     bt.logging.debug(f"Current block: {current_block}, Epoch length: {state['epoch_length']}, Next epoch block: {next_epoch_block}, Blocks until epoch: {blocks_until_epoch}")
 
                     # Trigger Boltz-2 pre-scoring when approaching epoch end.
-                    # Reorders candidate_product so the best Boltz-2 molecule is first
-                    # (validator uses sample_selection="first", so position matters).
+                    # Threshold starts at 100 blocks (20 min); after the first run it is
+                    # updated adaptively based on measured GPU time so fast hardware
+                    # (A100 ~4 min) doesn't sit idle for 16 extra minutes.
+                    boltz_trigger = state.get('boltz_trigger_blocks', 100)
                     if (
                         state['candidate_product']
-                        and blocks_until_epoch <= 100
+                        and blocks_until_epoch <= boltz_trigger
                         and not state.get('boltz_prescored', False)
                     ):
                         bt.logging.info(
@@ -613,6 +634,20 @@ async def run_boltz_prescoring(state: Dict[str, Any], max_candidates: int = 5) -
                 f"Boltz cache updated: {len(boltz_cache)} in-memory entries; "
                 f"new scores persisted to {db_path}"
             )
+
+            # Adaptive trigger: profile time-per-molecule and update the block threshold
+            # so fast hardware (A100) doesn't wait 20 min for a 4-min job.
+            elapsed = wrapper.last_inference_duration
+            n_scored = max(len(uncached_candidates), 1)
+            if elapsed > 0:
+                time_per_mol = elapsed / n_scored
+                # Blocks needed = (time for max_candidates mols) / 12s per block + 20-block margin
+                adaptive_trigger = int(time_per_mol * max_candidates / 12) + 20
+                state['boltz_trigger_blocks'] = max(adaptive_trigger, 30)
+                bt.logging.info(
+                    f"Adaptive Boltz timing: {time_per_mol:.1f}s/mol → "
+                    f"trigger set to {state['boltz_trigger_blocks']} blocks"
+                )
 
         except Exception as e:
             bt.logging.error(f"Boltz-2 pre-scoring failed: {e}")

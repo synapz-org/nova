@@ -1,4 +1,5 @@
 import os
+import time
 import yaml
 import sys
 import traceback
@@ -47,6 +48,8 @@ class BoltzWrapper:
         bt.logging.debug(f"BoltzWrapper initialized")
         self.per_molecule_metric = {}
         self.per_molecule_components = {}
+        # Populated after each successful inference; used for adaptive trigger timing.
+        self.last_inference_duration: float = 0.0
         
         self.base_seed = 68
         random.seed(self.base_seed)
@@ -147,6 +150,7 @@ properties:
 
         # Run Boltz2 for unique molecules
         bt.logging.info("Running Boltz2")
+        _t0 = time.time()
         try:
             predict(
                 data = self.input_dir,
@@ -161,7 +165,8 @@ properties:
                 affinity_mw_correction = self.config['affinity_mw_correction'],
                 override = self.config['override'],
             )
-            bt.logging.info(f"Boltz2 predictions complete")
+            self.last_inference_duration = time.time() - _t0
+            bt.logging.info(f"Boltz2 predictions complete in {self.last_inference_duration:.1f}s")
 
         except Exception as e:
             bt.logging.error(f"Error running Boltz2: {e}")
