@@ -272,6 +272,38 @@ On A100, this gives **12 extra minutes of PSICHIC streaming** (to find a better 
 before Boltz kicks in. On RTX 3090 it barely changes (hardware is the bottleneck anyway).
 The first epoch always uses the conservative 100-block default.
 
+### H. Anytime incremental Boltz scoring (`neurons/miner.py`)
+
+**Problem with old one-shot batch:** `run_boltz_prescoring` previously gathered all N
+uncached candidates into a single batch, ran one `BoltzWrapper.score_molecules_target()`
+call, and only reordered the submission **after** all N molecules were scored. If the epoch
+ended mid-run (e.g., 3 of 5 molecules complete), the submission still reflected the raw
+PSICHIC ranking for position 0.
+
+**New anytime approach:** candidates are now scored **one molecule at a time** in descending
+PSICHIC-score order. After each molecule is scored (whether from cache or GPU inference),
+`state['candidate_product']` is reordered immediately to put the best Boltz result first.
+
+```
+for each candidate in PSICHIC-rank order:
+    score = cache_lookup(candidate)     # μs
+    if cache miss:
+        score = boltz_inference(candidate)  # 45–150 s
+    update_submission_with_best_so_far()   # immediate reorder
+```
+
+**Guarantee:** Even if the epoch timer fires after molecule 1 of 5, the submission has
+already been reordered to put the best Boltz score (of the 1 scored so far) at position 0.
+With all-cached runs the full reorder is nearly instantaneous.
+
+**No efficiency loss:** Each Boltz call takes the same GPU time regardless of batch size
+(the protein–ligand forward pass is per-pair). The one extra Python overhead per molecule
+is negligible vs. 45–150 s inference.
+
+**Adaptive timing accuracy improves:** The trigger update now uses the actual time for one
+molecule (not total batch time ÷ N), which is more accurate because Boltz's per-molecule
+time is constant and independent of batch composition.
+
 ---
 
 ## Future Optimisation Opportunities
@@ -413,7 +445,7 @@ These parameters in `config/config.yaml` directly affect what the miner should o
 
 | File | Change |
 |------|--------|
-| `neurons/miner.py` | Added `is_boltz_safe_smiles` + `max_heavy_atoms` filters; `run_boltz_prescoring()` with two-tier cache; Boltz trigger at 100 blocks (was 50); `boltz_score_cache` + `boltz_cache_db` state fields; `_init_boltz_cache_db`, `_disk_cache_get`, `_disk_cache_put` helpers; fixed `entropy_weight` → `entropy_start_weight` AttributeError; pharmacophore pre-filter (§F); adaptive trigger using `boltz_trigger_blocks` state field (§G) |
+| `neurons/miner.py` | Added `is_boltz_safe_smiles` + `max_heavy_atoms` filters; `run_boltz_prescoring()` with two-tier cache; Boltz trigger at 100 blocks (was 50); `boltz_score_cache` + `boltz_cache_db` state fields; `_init_boltz_cache_db`, `_disk_cache_get`, `_disk_cache_put` helpers; fixed `entropy_weight` → `entropy_start_weight` AttributeError; pharmacophore pre-filter (§F); adaptive trigger using `boltz_trigger_blocks` state field (§G); anytime incremental scoring — one molecule at a time with immediate reorder (§H) |
 | `boltz/wrapper.py` | Added `last_inference_duration` field populated after each `predict()` call (§G) |
 | `config/config.yaml` | Added `max_heavy_atoms: 35` |
 | `config/config_loader.py` | Loads and exposes `max_heavy_atoms` |
