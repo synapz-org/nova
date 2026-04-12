@@ -306,6 +306,62 @@ time is constant and independent of batch composition.
 
 ---
 
+## Implemented Optimisations (continued)
+
+### I. PSICHIC Ligand-Efficiency Scoring (`neurons/miner.py`)
+
+The Boltz-2 scoring formula is:
+```
+boltz_score = (affinity_probability_binary - affinity_pred_value) / heavy_atom_count
+```
+
+Previously, PSICHIC pre-filtering ranked candidates by raw binding affinity:
+```python
+combined_score = target_affinity - antitarget_weight × antitarget_affinity
+```
+
+This could promote large molecules (30–35 HA) with good absolute affinity over small
+molecules (15–20 HA) with equally strong per-atom binding — the opposite of what Boltz
+actually rewards.
+
+**New formula:**
+```python
+combined_score = (target_affinity - antitarget_weight × antitarget_affinity) / heavy_atoms
+```
+
+Effect: the top-N candidates passed to Boltz-2 are now the **most ligand-efficient**
+molecules by PSICHIC score — directly aligned with the Boltz denominator.  On hardware
+where only 3–5 Boltz calls fit in the trigger window, this maximises the chance that the
+molecule at position 0 is the epoch winner.
+
+### J. Global Candidate Pool (`neurons/miner.py`)
+
+**Problem with batch-replacement approach:** When PSICHIC finds a new best batch (higher
+entropy-weighted score-sum), `candidate_molecules` is replaced entirely with that batch's
+top-10.  A molecule that ranked #1 in an early chunk could be lost if a later chunk's
+*aggregate* score is higher, even if no individual molecule in the later chunk beats it.
+
+**Fix:** `state['global_candidate_pool']` accumulates the top-20 molecules (by per-atom
+PSICHIC score) across **all chunks streamed this epoch**.  After each chunk:
+
+```python
+combined_pool = pd.concat([global_candidate_pool, top_molecules])
+combined_pool.drop_duplicates(subset=['product_name'])
+combined_pool.sort_values(by=['combined_score'], ascending=False)
+global_candidate_pool = combined_pool.head(20)
+```
+
+`run_boltz_prescoring` now draws candidates from `global_candidate_pool` (falling back to
+`candidate_molecules` if the pool is empty).  This ensures Boltz always evaluates the 5
+highest-efficiency molecules found across the whole epoch, regardless of when they appeared.
+
+**Zero submission-format risk:** the global pool only contains `product_name` values from
+SAVI-2020 streaming (rxn:3 / rxn:5 format), so all candidates remain valid for submission.
+
+**Memory cost:** 20 rows × ~5 columns ≈ negligible.
+
+---
+
 ## Future Optimisation Opportunities
 
 ### A. SALSA (Stochastic Approximate Ligand Scoring and Optimisation)
@@ -445,7 +501,7 @@ These parameters in `config/config.yaml` directly affect what the miner should o
 
 | File | Change |
 |------|--------|
-| `neurons/miner.py` | Added `is_boltz_safe_smiles` + `max_heavy_atoms` filters; `run_boltz_prescoring()` with two-tier cache; Boltz trigger at 100 blocks (was 50); `boltz_score_cache` + `boltz_cache_db` state fields; `_init_boltz_cache_db`, `_disk_cache_get`, `_disk_cache_put` helpers; fixed `entropy_weight` → `entropy_start_weight` AttributeError; pharmacophore pre-filter (§F); adaptive trigger using `boltz_trigger_blocks` state field (§G); anytime incremental scoring — one molecule at a time with immediate reorder (§H) |
+| `neurons/miner.py` | Added `is_boltz_safe_smiles` + `max_heavy_atoms` filters; `run_boltz_prescoring()` with two-tier cache; Boltz trigger at 100 blocks (was 50); `boltz_score_cache` + `boltz_cache_db` state fields; `_init_boltz_cache_db`, `_disk_cache_get`, `_disk_cache_put` helpers; fixed `entropy_weight` → `entropy_start_weight` AttributeError; pharmacophore pre-filter (§F); adaptive trigger using `boltz_trigger_blocks` state field (§G); anytime incremental scoring — one molecule at a time with immediate reorder (§H); PSICHIC ligand-efficiency scoring — divide combined_score by heavy_atoms (§I); global candidate pool — top-20 across all epoch chunks for Boltz (§J) |
 | `boltz/wrapper.py` | Added `last_inference_duration` field populated after each `predict()` call (§G) |
 | `config/config.yaml` | Added `max_heavy_atoms: 35` |
 | `config/config_loader.py` | Loads and exposes `max_heavy_atoms` |

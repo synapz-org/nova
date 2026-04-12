@@ -380,7 +380,13 @@ async def run_psichic_model_loop(state: Dict[str, Any]) -> None:
                 # Calculate average scores
                 df['target_affinity'] = pd.DataFrame(target_scores).mean(axis=0)
                 df['antitarget_affinity'] = pd.DataFrame(antitarget_scores).mean(axis=0)
-                df['combined_score'] = df['target_affinity'] - state['config'].antitarget_weight * df['antitarget_affinity']
+                # Ligand-efficiency scoring: divide by heavy atom count so the PSICHIC
+                # pre-filter uses the same per-atom normalisation as the Boltz-2 scoring
+                # formula (affinity_probability_binary - affinity_pred_value) / heavy_atoms.
+                # This makes the top-N candidates sent to Boltz more likely to win.
+                df['combined_score'] = (
+                    df['target_affinity'] - state['config'].antitarget_weight * df['antitarget_affinity']
+                ) / df['heavy_atoms']
 
                 # Sort by combined score
                 df.sort_values(by=['combined_score'], ascending=[False], inplace=True)
@@ -388,6 +394,24 @@ async def run_psichic_model_loop(state: Dict[str, Any]) -> None:
 
                 # Select top 10 molecules
                 top_molecules = df.iloc[:10]
+
+                # ---------------------------------------------------------------
+                # Global candidate pool: accumulate the best molecules seen
+                # across ALL chunks this epoch (not just the latest best batch).
+                # Capped at 20 entries, sorted by ligand-efficiency combined_score.
+                # Boltz pre-scoring draws from this pool, ensuring it always sees
+                # the highest-quality candidates regardless of when they appeared.
+                # ---------------------------------------------------------------
+                if state.get('global_candidate_pool') is None or state['global_candidate_pool'].empty:
+                    state['global_candidate_pool'] = top_molecules.copy()
+                else:
+                    combined_pool = pd.concat(
+                        [state['global_candidate_pool'], top_molecules], ignore_index=True
+                    )
+                    combined_pool.drop_duplicates(subset=['product_name'], inplace=True)
+                    combined_pool.sort_values(by=['combined_score'], ascending=False, inplace=True)
+                    state['global_candidate_pool'] = combined_pool.head(20).reset_index(drop=True)
+
                 if not top_molecules.empty:
                     entropy = compute_maccs_entropy(top_molecules['product_smiles'].tolist())
                     scores_sum = top_molecules['combined_score'].sum()
@@ -546,7 +570,12 @@ async def run_boltz_prescoring(state: Dict[str, Any], max_candidates: int = 5) -
         state: Shared miner state dict.
         max_candidates: Maximum number of PSICHIC top-molecules to score with Boltz-2.
     """
-    candidates = state.get('candidate_molecules')
+    # Prefer global candidate pool (spans entire epoch, sorted by ligand efficiency)
+    # so Boltz always evaluates the best molecules seen so far, not just those from
+    # the most recent best-batch.  Fall back to current-batch candidates if needed.
+    candidates = state.get('global_candidate_pool')
+    if candidates is None or candidates.empty:
+        candidates = state.get('candidate_molecules')
     if candidates is None or candidates.empty:
         bt.logging.warning("Boltz-2 pre-scoring: no candidate molecules available.")
         return
@@ -719,6 +748,7 @@ async def run_miner(config: argparse.Namespace) -> None:
         # Inference state
         'candidate_product': None,
         'candidate_molecules': None,
+        'global_candidate_pool': None,   # top-20 molecules across all chunks, by ligand efficiency
         'best_score': float('-inf'),
         'boltz_prescored': False,
         'last_submitted_product': None,
@@ -855,6 +885,7 @@ async def run_miner(config: argparse.Namespace) -> None:
                 # Reset best score and candidate
                 state['candidate_product'] = None
                 state['candidate_molecules'] = None
+                state['global_candidate_pool'] = None
                 state['best_score'] = float('-inf')
                 state['boltz_prescored'] = False
                 state['last_submitted_product'] = None
