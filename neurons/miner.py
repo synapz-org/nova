@@ -452,7 +452,18 @@ async def run_psichic_model_loop(state: Dict[str, Any]) -> None:
                         )
                         state['boltz_prescored'] = True
                         try:
-                            await run_boltz_prescoring(state)
+                            # Dynamic candidate budget: fill the available epoch
+                            # window rather than always scoring a fixed 5 molecules.
+                            # Default to 150 s/mol (RTX 3090 worst-case) until the
+                            # first real measurement is stored in state.
+                            _t_per_mol = state.get('boltz_time_per_mol', 150.0)
+                            _avail_secs = max(0.0, blocks_until_epoch * 12 - 240)
+                            _dyn_max = max(3, min(20, int(_avail_secs / _t_per_mol)))
+                            bt.logging.info(
+                                f"Dynamic Boltz budget: {_dyn_max} candidates "
+                                f"({_avail_secs:.0f}s available, ~{_t_per_mol:.0f}s/mol)"
+                            )
+                            await run_boltz_prescoring(state, max_candidates=_dyn_max)
                         except Exception as e:
                             bt.logging.error(f"Boltz-2 pre-scoring error: {e}")
                             traceback.print_exc()
@@ -652,6 +663,21 @@ async def run_boltz_prescoring(state: Dict[str, Any], max_candidates: int = 5) -
                 score = disk_score
                 bt.logging.debug(f"[{i+1}/{len(candidates)}] disk cache hit: {score:.4f}")
             else:
+                # Before launching GPU inference, confirm the epoch hasn't ended.
+                # The anytime guarantee means whatever we've already scored is at
+                # position 0, so there's no value running Boltz past the boundary.
+                try:
+                    _curr_blk = await state['subtensor'].get_current_block()
+                    _next_ep = ((_curr_blk // state['epoch_length']) + 1) * state['epoch_length']
+                    if _next_ep - _curr_blk < 5:
+                        bt.logging.info(
+                            f"[{i+1}/{len(candidates)}] epoch ends in <5 blocks — "
+                            f"stopping Boltz after {len(all_scores)}/{len(candidates)} scored."
+                        )
+                        break
+                except Exception:
+                    pass  # subtensor unavailable; proceed
+
                 # Cache miss: run Boltz for this single molecule
                 bt.logging.info(f"[{i+1}/{len(candidates)}] running Boltz-2 inference...")
                 uid = 0
@@ -677,10 +703,11 @@ async def run_boltz_prescoring(state: Dict[str, Any], max_candidates: int = 5) -
                     # Adaptive trigger: one molecule gives the most accurate per-mol timing
                     elapsed = wrapper.last_inference_duration
                     if elapsed > 0:
+                        state['boltz_time_per_mol'] = elapsed  # persist for dynamic budget calc
                         adaptive_trigger = int(elapsed * max_candidates / 12) + 20
                         state['boltz_trigger_blocks'] = max(adaptive_trigger, 30)
                         bt.logging.info(
-                            f"  adaptive timing: {elapsed:.1f}s → "
+                            f"  adaptive timing: {elapsed:.1f}s/mol → "
                             f"trigger={state['boltz_trigger_blocks']} blocks"
                         )
                 except Exception as e:

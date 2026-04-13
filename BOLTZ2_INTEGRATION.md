@@ -478,6 +478,86 @@ Cache lookup order in `run_boltz_prescoring`:
 
 Result: a molecule scored in a previous session is never re-run on GPU.
 
+### K. Dynamic Boltz candidate budget (`neurons/miner.py`)
+
+**Problem with fixed `max_candidates=5`:** At the default 100-block trigger, an A100 can score
+~21 molecules (960 s available ÷ 45 s/mol), but the hard-coded ceiling of 5 left 16 slots
+unused. On the first epoch (before GPU speed is known) this was a significant missed opportunity.
+
+**Fix:** the Boltz trigger now computes `_dyn_max` from available epoch time and a measured (or
+estimated) per-molecule inference time:
+
+```python
+_t_per_mol = state.get('boltz_time_per_mol', 150.0)  # conservative RTX 3090 default
+_avail_secs = max(0.0, blocks_until_epoch * 12 - 240)  # 4-min safety margin
+_dyn_max = max(3, min(20, int(_avail_secs / _t_per_mol)))
+await run_boltz_prescoring(state, max_candidates=_dyn_max)
+```
+
+Effect on first epoch (100-block trigger, `boltz_time_per_mol` not yet measured):
+
+| Hardware | Estimated t/mol | _avail_secs | _dyn_max |
+|----------|-----------------|-------------|----------|
+| A100 (actual 45 s) | 150 s (default) | 960 s | **6** (+1 vs old 5) |
+| RTX 4090 (actual 90 s) | 150 s | 960 s | **6** |
+| RTX 3090 (actual 150 s) | 150 s | 960 s | **6** |
+
+After the first real run (say, A100 → `boltz_time_per_mol = 45 s`) the trigger adapts:
+
+| Hardware | Measured t/mol | Trigger (blocks) | _avail_secs | _dyn_max |
+|----------|----------------|------------------|-------------|----------|
+| A100 | 45 s | 39 | 228 s | **5** |
+| RTX 4090 | 90 s | 58 | 456 s | **5** |
+| RTX 3090 | 150 s | 83 | 756 s | **5** |
+
+The dynamic formula converges to ~5 after calibration (the adaptive trigger is sized to hold
+exactly N candidates). Its real benefit is **first-epoch conservative over-scoring** (+1 molecule
+for free) and **correct handling of abnormally wide windows** (e.g., miner restarts when trigger
+is already 100 but GPU is fast).
+
+### L. Epoch-end guard inside the Boltz loop (`neurons/miner.py`)
+
+**Problem:** `run_boltz_prescoring` had no check on remaining epoch time inside its per-molecule
+loop. If the epoch ended mid-loop (e.g., the 4th of 6 molecules is scoring and the epoch fires),
+the 5th and 6th Boltz calls would start pointlessly — burning 90–300 s of GPU time on a molecule
+that would never affect this epoch's submission.
+
+**Fix:** before each cache-miss GPU inference, a lightweight subtensor block query confirms
+that at least 5 blocks remain:
+
+```python
+try:
+    _curr_blk = await state['subtensor'].get_current_block()
+    _next_ep = ((_curr_blk // state['epoch_length']) + 1) * state['epoch_length']
+    if _next_ep - _curr_blk < 5:
+        bt.logging.info("epoch ends in <5 blocks — stopping Boltz early")
+        break
+except Exception:
+    pass  # subtensor unavailable; proceed anyway
+```
+
+Cache hits (microseconds) are never interrupted. Only cache-miss GPU inference calls are gated.
+The `except` clause ensures a network hiccup on the block query doesn't abort Boltz incorrectly.
+
+The anytime guarantee (§H) means the best score found so far is already at position 0 when the
+loop exits early — zero regression in submission quality.
+
+### M. `boltz_time_per_mol` state field (`neurons/miner.py`)
+
+The adaptive trigger (§G) recalculated the trigger threshold in blocks each run but did not store
+the raw per-molecule GPU time anywhere accessible to the trigger call site. Dynamic max_candidates
+(§K) requires this value at the point where `_dyn_max` is computed — before the wrapper is even
+instantiated.
+
+**Fix:** after every successful single-molecule Boltz inference, the measured time is stored:
+
+```python
+state['boltz_time_per_mol'] = elapsed  # seconds per molecule, persists across epochs
+```
+
+This value survives epoch rollovers and process restarts are handled gracefully via the
+`state.get('boltz_time_per_mol', 150.0)` default at the call site.
+
 ---
 
 ## Validator Config Reference
@@ -501,7 +581,7 @@ These parameters in `config/config.yaml` directly affect what the miner should o
 
 | File | Change |
 |------|--------|
-| `neurons/miner.py` | Added `is_boltz_safe_smiles` + `max_heavy_atoms` filters; `run_boltz_prescoring()` with two-tier cache; Boltz trigger at 100 blocks (was 50); `boltz_score_cache` + `boltz_cache_db` state fields; `_init_boltz_cache_db`, `_disk_cache_get`, `_disk_cache_put` helpers; fixed `entropy_weight` → `entropy_start_weight` AttributeError; pharmacophore pre-filter (§F); adaptive trigger using `boltz_trigger_blocks` state field (§G); anytime incremental scoring — one molecule at a time with immediate reorder (§H); PSICHIC ligand-efficiency scoring — divide combined_score by heavy_atoms (§I); global candidate pool — top-20 across all epoch chunks for Boltz (§J) |
+| `neurons/miner.py` | Added `is_boltz_safe_smiles` + `max_heavy_atoms` filters; `run_boltz_prescoring()` with two-tier cache; Boltz trigger at 100 blocks (was 50); `boltz_score_cache` + `boltz_cache_db` state fields; `_init_boltz_cache_db`, `_disk_cache_get`, `_disk_cache_put` helpers; fixed `entropy_weight` → `entropy_start_weight` AttributeError; pharmacophore pre-filter (§F); adaptive trigger using `boltz_trigger_blocks` state field (§G); anytime incremental scoring — one molecule at a time with immediate reorder (§H); PSICHIC ligand-efficiency scoring — divide combined_score by heavy_atoms (§I); global candidate pool — top-20 across all epoch chunks for Boltz (§J); dynamic max_candidates from available epoch time + `boltz_time_per_mol` state (§K); epoch-end guard before each cache-miss Boltz inference (§L); `boltz_time_per_mol` persisted in state (§M) |
 | `boltz/wrapper.py` | Added `last_inference_duration` field populated after each `predict()` call (§G) |
 | `config/config.yaml` | Added `max_heavy_atoms: 35` |
 | `config/config_loader.py` | Loads and exposes `max_heavy_atoms` |
