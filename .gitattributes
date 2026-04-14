@@ -2,3 +2,15 @@
 
 # Treat all text files as text and ensure LF
 * text eol=lf
+
+# Binary files — no line-ending normalization
+*.pt binary
+*.pth binary
+*.bin binary
+*.pkl binary
+*.npz binary
+*.npy binary
+*.h5 binary
+*.hdf5 binary
+*.ckpt binary
+*.safetensors binary
