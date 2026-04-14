@@ -12,3 +12,4 @@ from .proteins import get_sequence_from_protein_code, get_challenge_params_from_
 from .github import upload_file_to_github
 from .scoring import calculate_dynamic_entropy
 from .reactions import get_total_reactions, is_reaction_allowed
+from .salsa import run_salsa_search, generate_perturbations, nearest_pool_molecules

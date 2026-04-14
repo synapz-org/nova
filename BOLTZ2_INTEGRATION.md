@@ -362,71 +362,60 @@ SAVI-2020 streaming (rxn:3 / rxn:5 format), so all candidates remain valid for s
 
 ---
 
-## Future Optimisation Opportunities
+## Implemented Optimisations (continued)
 
-### A. SALSA (Stochastic Approximate Ligand Scoring and Optimisation)
+### N. SALSA — Stochastic Approximate Ligand Scoring and Optimisation ✅ Implemented
 
-Iterative perturbation from a seed molecule, using PSICHIC as a cheap filter and Boltz-2
-as the validation oracle. Unlike dataset streaming, SALSA can find molecules not in
-SAVI-2020 for the specific weekly target.
+Iterative hill-climbing over chemical space using bioisosteric atom substitution.
+Starting from the best PSICHIC-scored seed, SALSA perturbs its atoms (C↔N, O↔S,
+Cl↔F, etc.) and maps each perturbation back to the nearest molecule in the
+`savi_stream_pool` via Tanimoto similarity (Morgan r=2).  All returned hits are
+valid SAVI-2020 product names from the current epoch's streamed pool — they can be
+added directly to `global_candidate_pool` and validated with Boltz-2.
 
-**Constraints:** The miner submits `product_name` values that must be resolvable to SMILES
-by the validator (via the AWS API or `rxn:` format). Raw novel SMILES cannot be submitted
-directly. SALSA therefore works as a **pre-filter** to identify promising chemical space,
-with the final submitted molecule still being a SAVI-2020 or rxn: product.
+**Files changed:**
+- `utils/salsa.py` — new module (`generate_perturbations`, `nearest_pool_molecules`,
+  `run_salsa_search`)
+- `neurons/miner.py` — imports `run_salsa_search`; adds `savi_stream_pool` and
+  `salsa_run_this_epoch` state fields; SALSA trigger in PSICHIC loop; epoch reset
 
-Implementation sketch:
+**State fields added:**
 
-```python
-from rdkit import Chem
-from rdkit.Chem import AllChem, rdMolDescriptors
+| Field | Type | Purpose |
+|-------|------|---------|
+| `savi_stream_pool` | DataFrame | All PSICHIC-scored molecules this epoch, up to 5000 rows |
+| `salsa_run_this_epoch` | bool | Prevents duplicate SALSA runs per epoch |
 
-# Substituents for atom-level perturbation
-_SUBSTITUENTS = ['F', 'Cl', 'Br', 'OH', 'NH2', 'CH3', 'CF3', 'OCH3', 'CN']
+**Trigger conditions:**
+- `savi_stream_pool` ≥ 500 molecules
+- `blocks_until_epoch` > `boltz_trigger_blocks × 1.5` (SALSA fires before Boltz window)
+- `salsa_run_this_epoch == False`
 
-def perturb_molecule(mol: Chem.Mol) -> list[Chem.Mol]:
-    """Generate atom-substitution and functional-group perturbations."""
-    variants = []
-    for atom in mol.GetAtoms():
-        if atom.GetAtomicNum() == 1:
-            continue  # skip explicit H
-        for sub in _SUBSTITUENTS:
-            edit = Chem.RWMol(mol)
-            try:
-                edit.GetAtomWithIdx(atom.GetIdx()).SetAtomicNum(
-                    Chem.GetPeriodicTable().GetAtomicNumber(sub.rstrip('H'))
-                )
-                candidate = edit.GetMol()
-                Chem.SanitizeMol(candidate)
-                variants.append(candidate)
-            except Exception:
-                pass
-    return variants
+**Algorithm (3 rounds, 60 perturbations/round):**
 
-async def run_salsa_loop(seed_smiles: str, state, rounds: int = 3) -> str:
-    """
-    SALSA: 3 rounds of perturbation → PSICHIC filter → Boltz validation.
-    Returns the SMILES of the best molecule found (for lookup in SAVI-2020 or rxn: DB).
-    """
-    best_smiles = seed_smiles
-    for _ in range(rounds):
-        seed_mol = Chem.MolFromSmiles(best_smiles)
-        if seed_mol is None:
-            break
-        variants = perturb_molecule(seed_mol)
-        variant_smiles = [Chem.MolToSmiles(v) for v in variants]
-        # PSICHIC filter (fast) — score with existing models
-        # ... score variant_smiles with state['psichic_models'] ...
-        # Boltz validation of top-3 (uses cache)
-        # ... call run_boltz_prescoring on top-3 variants ...
-        # Update best_smiles from Boltz winner
-    return best_smiles
+```
+seed ← global_candidate_pool.iloc[0]['product_smiles']
+for round in 1..3:
+    perturbations ← generate_perturbations(seed, n_max=60)
+    for each perturbation:
+        hit ← nearest_pool_molecules(perturbation, savi_stream_pool, top_k=1)
+        collect unique hits
+    best_hit ← max(hits, key=combined_score)
+    seed ← best_hit['product_smiles']
+return top-5 hits by combined_score
 ```
 
-**Roadblock to resolve:** map the SALSA winner back to a SAVI-2020 `product_name` or
-generate a valid `rxn:` product string so it can be submitted.
+**Typical timing:** 3 rounds × 60 variants × ~1 ms each = ~180 ms (CPU, RDKit + Morgan FP)
+→ negligible compared to Boltz-2 inference.
 
-### B. GradientGA (Gradient-Guided Genetic Algorithm)
+**Expected benefit:** by directing the nearest-neighbour search toward bioisosterically
+optimised scaffolds rather than random SAVI-2020 streaming, SALSA can surface molecules
+that score higher per atom under the Boltz-2 formula — especially later in an epoch when
+the pool has grown large (1000–5000 molecules).
+
+## Future Optimisation Opportunities
+
+### A. GradientGA (Gradient-Guided Genetic Algorithm)
 
 Maintain a population of ~50 molecules per epoch. Use PSICHIC as the cheap fitness
 function for selection/crossover/mutation, and promote only the top-N to Boltz-2 evaluation.
@@ -581,10 +570,11 @@ These parameters in `config/config.yaml` directly affect what the miner should o
 
 | File | Change |
 |------|--------|
-| `neurons/miner.py` | Added `is_boltz_safe_smiles` + `max_heavy_atoms` filters; `run_boltz_prescoring()` with two-tier cache; Boltz trigger at 100 blocks (was 50); `boltz_score_cache` + `boltz_cache_db` state fields; `_init_boltz_cache_db`, `_disk_cache_get`, `_disk_cache_put` helpers; fixed `entropy_weight` → `entropy_start_weight` AttributeError; pharmacophore pre-filter (§F); adaptive trigger using `boltz_trigger_blocks` state field (§G); anytime incremental scoring — one molecule at a time with immediate reorder (§H); PSICHIC ligand-efficiency scoring — divide combined_score by heavy_atoms (§I); global candidate pool — top-20 across all epoch chunks for Boltz (§J); dynamic max_candidates from available epoch time + `boltz_time_per_mol` state (§K); epoch-end guard before each cache-miss Boltz inference (§L); `boltz_time_per_mol` persisted in state (§M) |
+| `neurons/miner.py` | Added `is_boltz_safe_smiles` + `max_heavy_atoms` filters; `run_boltz_prescoring()` with two-tier cache; Boltz trigger at 100 blocks (was 50); `boltz_score_cache` + `boltz_cache_db` state fields; `_init_boltz_cache_db`, `_disk_cache_get`, `_disk_cache_put` helpers; fixed `entropy_weight` → `entropy_start_weight` AttributeError; pharmacophore pre-filter (§F); adaptive trigger using `boltz_trigger_blocks` state field (§G); anytime incremental scoring — one molecule at a time with immediate reorder (§H); PSICHIC ligand-efficiency scoring — divide combined_score by heavy_atoms (§I); global candidate pool — top-20 across all epoch chunks for Boltz (§J); dynamic max_candidates from available epoch time + `boltz_time_per_mol` state (§K); epoch-end guard before each cache-miss Boltz inference (§L); `boltz_time_per_mol` persisted in state (§M); SALSA stream pool + trigger + epoch reset (§N) |
 | `boltz/wrapper.py` | Added `last_inference_duration` field populated after each `predict()` call (§G) |
 | `config/config.yaml` | Added `max_heavy_atoms: 35` |
 | `config/config_loader.py` | Loads and exposes `max_heavy_atoms` |
 | `utils/molecules.py` | Added `get_canonical_smiles()` |
-| `utils/__init__.py` | Exported `get_canonical_smiles` |
+| `utils/__init__.py` | Exported `get_canonical_smiles`; exported SALSA functions (§N) |
+| `utils/salsa.py` | New: SALSA algorithm — `generate_perturbations`, `nearest_pool_molecules`, `run_salsa_search` (§N) |
 | `BOLTZ2_INTEGRATION.md` | This file |

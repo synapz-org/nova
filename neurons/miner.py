@@ -40,6 +40,7 @@ from utils import (
     compute_maccs_entropy,
 )
 from utils.molecules import is_boltz_safe_smiles, get_canonical_smiles
+from utils.salsa import run_salsa_search
 from PSICHIC.wrapper import PsichicWrapper
 from boltz.wrapper import BoltzWrapper
 from btdr import QuicknetBittensorDrandTimelock
@@ -412,6 +413,20 @@ async def run_psichic_model_loop(state: Dict[str, Any]) -> None:
                     combined_pool.sort_values(by=['combined_score'], ascending=False, inplace=True)
                     state['global_candidate_pool'] = combined_pool.head(20).reset_index(drop=True)
 
+                # ---------------------------------------------------------------
+                # SAVI stream pool: accumulates ALL PSICHIC-scored molecules seen
+                # this epoch (capped at 5000).  Used by SALSA as the nearest-
+                # neighbour search space so its hits are guaranteed valid product
+                # names.  The full df (post-filter, post-score) is appended so
+                # every entry has a valid combined_score for ranking.
+                # ---------------------------------------------------------------
+                if state.get('savi_stream_pool') is None or state['savi_stream_pool'].empty:
+                    state['savi_stream_pool'] = df.copy()
+                else:
+                    state['savi_stream_pool'] = pd.concat(
+                        [state['savi_stream_pool'], df], ignore_index=True
+                    ).drop_duplicates(subset=['product_name']).head(5000)
+
                 if not top_molecules.empty:
                     entropy = compute_maccs_entropy(top_molecules['product_smiles'].tolist())
                     scores_sum = top_molecules['combined_score'].sum()
@@ -435,6 +450,62 @@ async def run_psichic_model_loop(state: Dict[str, Any]) -> None:
                     blocks_until_epoch = next_epoch_block - current_block
 
                     bt.logging.debug(f"Current block: {current_block}, Epoch length: {state['epoch_length']}, Next epoch block: {next_epoch_block}, Blocks until epoch: {blocks_until_epoch}")
+
+                    # ---------------------------------------------------------------
+                    # SALSA trigger: run once per epoch when the stream pool is
+                    # large enough to support meaningful NN search and we still have
+                    # time before Boltz kicks in.
+                    #   - Requires ≥500 molecules in the stream pool (enough for NN).
+                    #   - Fires only when > boltz_trigger * 1.5 blocks remain, so
+                    #     SALSA hits are in global_candidate_pool before Boltz starts.
+                    #   - One-shot per epoch (salsa_run_this_epoch flag).
+                    # ---------------------------------------------------------------
+                    salsa_pool = state.get('savi_stream_pool')
+                    salsa_pool_size = 0 if salsa_pool is None else len(salsa_pool)
+                    boltz_trigger = state.get('boltz_trigger_blocks', 100)
+                    salsa_threshold = int(boltz_trigger * 1.5)
+                    if (
+                        not state.get('salsa_run_this_epoch', False)
+                        and salsa_pool_size >= 500
+                        and blocks_until_epoch > salsa_threshold
+                        and state.get('global_candidate_pool') is not None
+                        and not state['global_candidate_pool'].empty
+                    ):
+                        state['salsa_run_this_epoch'] = True
+                        seed = state['global_candidate_pool'].iloc[0]['product_smiles']
+                        bt.logging.info(
+                            f"SALSA: triggering with {salsa_pool_size}-molecule pool, "
+                            f"{blocks_until_epoch} blocks remaining (threshold={salsa_threshold})..."
+                        )
+                        try:
+                            salsa_hits = await asyncio.to_thread(
+                                run_salsa_search,
+                                seed,
+                                salsa_pool,
+                                3,   # rounds
+                                60,  # n_perturb
+                                5,   # top_k
+                            )
+                            if not salsa_hits.empty:
+                                bt.logging.info(
+                                    f"SALSA: {len(salsa_hits)} hits found; "
+                                    f"merging into global_candidate_pool."
+                                )
+                                combined_gcp = pd.concat(
+                                    [state['global_candidate_pool'], salsa_hits],
+                                    ignore_index=True
+                                )
+                                combined_gcp.drop_duplicates(subset=['product_name'], inplace=True)
+                                combined_gcp.sort_values('combined_score', ascending=False, inplace=True)
+                                state['global_candidate_pool'] = combined_gcp.head(20).reset_index(drop=True)
+                                bt.logging.info(
+                                    f"SALSA: global_candidate_pool now has "
+                                    f"{len(state['global_candidate_pool'])} entries."
+                                )
+                            else:
+                                bt.logging.info("SALSA: no hits found.")
+                        except Exception as _salsa_err:
+                            bt.logging.error(f"SALSA error: {_salsa_err}")
 
                     # Trigger Boltz-2 pre-scoring when approaching epoch end.
                     # Threshold starts at 100 blocks (20 min); after the first run it is
@@ -776,6 +847,8 @@ async def run_miner(config: argparse.Namespace) -> None:
         'candidate_product': None,
         'candidate_molecules': None,
         'global_candidate_pool': None,   # top-20 molecules across all chunks, by ligand efficiency
+        'savi_stream_pool': None,        # all PSICHIC-scored molecules this epoch (capped at 5000)
+        'salsa_run_this_epoch': False,   # prevent duplicate SALSA runs per epoch
         'best_score': float('-inf'),
         'boltz_prescored': False,
         'last_submitted_product': None,
@@ -913,6 +986,8 @@ async def run_miner(config: argparse.Namespace) -> None:
                 state['candidate_product'] = None
                 state['candidate_molecules'] = None
                 state['global_candidate_pool'] = None
+                state['savi_stream_pool'] = None
+                state['salsa_run_this_epoch'] = False
                 state['best_score'] = float('-inf')
                 state['boltz_prescored'] = False
                 state['last_submitted_product'] = None
