@@ -225,8 +225,9 @@ def run_salsa_search(
     combined.drop_duplicates(subset=[name_col], inplace=True)
     combined.sort_values(score_col, ascending=False, inplace=True)
     result = combined.head(top_k).reset_index(drop=True)
+    _best = f"{result.iloc[0][score_col]:.4f}" if not result.empty else 'n/a'
     logger.info(
         f"SALSA complete: {len(result)} hits from {len(savi_pool_df)}-molecule pool "
-        f"(best score={result.iloc[0][score_col]:.4f} if not result.empty else 'n/a')"
+        f"(best score={_best})"
     )
     return result

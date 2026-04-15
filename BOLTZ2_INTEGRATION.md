@@ -413,20 +413,60 @@ optimised scaffolds rather than random SAVI-2020 streaming, SALSA can surface mo
 that score higher per atom under the Boltz-2 formula — especially later in an epoch when
 the pool has grown large (1000–5000 molecules).
 
+## Implemented Optimisations (continued)
+
+### O. GradientGA — Gradient-Guided Genetic Algorithm ✅ Implemented
+
+Population-based search that complements SALSA's single-point hill-climbing.
+Maintains a pool of ~50 SAVI-2020 molecules across 5 generations per epoch.
+
+**Files changed:**
+- `utils/genetic.py` — new module (`brics_crossover`, `tournament_select`,
+  `run_gradient_ga`)
+- `neurons/miner.py` — imports `run_gradient_ga`; adds `ga_run_this_epoch` state
+  field; GA trigger fires after SALSA and before Boltz window
+
+**Algorithm (5 generations, population=50):**
+
+```
+seed population ← global_candidate_pool + random sample from savi_stream_pool
+for gen in 1..5:
+    pairs ← tournament_select(population, n_pairs=25, k=3)
+    for parent_a, parent_b in pairs:
+        offspring ← brics_crossover(parent_a, parent_b, max_offspring=3)
+        mutants   ← generate_perturbations(parent_a, n_max=5)   # from salsa.py
+        for each candidate in offspring + mutants:
+            hit ← nearest_pool_molecule(candidate, savi_pool_df)  # Tanimoto r=2
+            if hit not already seen: add to new_hits
+    population ← top-50(population ∪ new_hits)  # elitism via sort
+return top-5 molecules from all generations
+```
+
+**State fields added:**
+
+| Field | Type | Purpose |
+|-------|------|---------|
+| `ga_run_this_epoch` | bool | Prevents duplicate GA runs per epoch |
+
+**Trigger conditions:**
+- `savi_stream_pool` ≥ 500 molecules
+- `salsa_run_this_epoch == True` (GA runs after SALSA so it seeds from SALSA hits)
+- `blocks_until_epoch` > `boltz_trigger_blocks + 20`
+- `ga_run_this_epoch == False`
+
+**Expected benefit:** BRICS crossover recombines functional fragments from the
+best PSICHIC-scored molecules found across all streaming chunks.  Unlike SALSA
+(which hill-climbs from a single seed), the GA maintains diversity and can
+escape local optima by mixing fragments from structurally different parents.
+The nearest-SAVI-2020 mapping keeps every candidate valid for submission.
+
+**Typical timing:** ~1–3 s (CPU) for 5 generations — negligible vs Boltz inference.
+
+---
+
 ## Future Optimisation Opportunities
 
-### A. GradientGA (Gradient-Guided Genetic Algorithm)
-
-Maintain a population of ~50 molecules per epoch. Use PSICHIC as the cheap fitness
-function for selection/crossover/mutation, and promote only the top-N to Boltz-2 evaluation.
-
-Population operations:
-- **Crossover**: SMILES substring exchange (fragmentation at rotatable bonds)
-- **Mutation**: atom substitution, functional-group addition/removal
-- **Selection**: tournament selection on PSICHIC combined score
-- **Elitism**: always keep the top-1 Boltz-2 scored molecule
-
-Same submission constraint as SALSA: winners must map to a submittable product name.
+### A. (Implemented — see §O above)
 
 ### C. Multi-molecule entropy bonus
 

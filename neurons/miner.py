@@ -41,6 +41,7 @@ from utils import (
 )
 from utils.molecules import is_boltz_safe_smiles, get_canonical_smiles
 from utils.salsa import run_salsa_search
+from utils.genetic import run_gradient_ga
 from PSICHIC.wrapper import PsichicWrapper
 from boltz.wrapper import BoltzWrapper
 from btdr import QuicknetBittensorDrandTimelock
@@ -506,6 +507,68 @@ async def run_psichic_model_loop(state: Dict[str, Any]) -> None:
                                 bt.logging.info("SALSA: no hits found.")
                         except Exception as _salsa_err:
                             bt.logging.error(f"SALSA error: {_salsa_err}")
+
+                    # ---------------------------------------------------------------
+                    # GradientGA trigger: run once per epoch after SALSA has had a
+                    # chance to populate the stream pool further.  Fires when:
+                    #   - pool >= 500 molecules (same gate as SALSA)
+                    #   - blocks_until_epoch > boltz_trigger + 20 (runs before Boltz)
+                    #   - salsa_run_this_epoch (SALSA must have run first so its hits
+                    #     are already in global_candidate_pool)
+                    #   - ga_run_this_epoch == False (one-shot per epoch)
+                    # Runtime: ~1-3 s CPU for 5 generations — negligible vs Boltz.
+                    # ---------------------------------------------------------------
+                    ga_pool = state.get('savi_stream_pool')
+                    ga_pool_size = 0 if ga_pool is None else len(ga_pool)
+                    boltz_trigger_ga = state.get('boltz_trigger_blocks', 100)
+                    if (
+                        not state.get('ga_run_this_epoch', False)
+                        and state.get('salsa_run_this_epoch', False)
+                        and ga_pool_size >= 500
+                        and blocks_until_epoch > boltz_trigger_ga + 20
+                        and state.get('global_candidate_pool') is not None
+                        and not state['global_candidate_pool'].empty
+                    ):
+                        state['ga_run_this_epoch'] = True
+                        bt.logging.info(
+                            f"GradientGA: triggering with {ga_pool_size}-molecule pool, "
+                            f"{blocks_until_epoch} blocks remaining..."
+                        )
+                        try:
+                            ga_hits = await asyncio.to_thread(
+                                run_gradient_ga,
+                                state['global_candidate_pool'],
+                                ga_pool,
+                                5,   # n_generations
+                                50,  # pop_size
+                                5,   # top_k
+                            )
+                            if not ga_hits.empty:
+                                bt.logging.info(
+                                    f"GradientGA: {len(ga_hits)} hits found; "
+                                    f"merging into global_candidate_pool."
+                                )
+                                combined_gcp = pd.concat(
+                                    [state['global_candidate_pool'], ga_hits],
+                                    ignore_index=True,
+                                )
+                                combined_gcp.drop_duplicates(
+                                    subset=['product_name'], inplace=True
+                                )
+                                combined_gcp.sort_values(
+                                    'combined_score', ascending=False, inplace=True
+                                )
+                                state['global_candidate_pool'] = (
+                                    combined_gcp.head(20).reset_index(drop=True)
+                                )
+                                bt.logging.info(
+                                    f"GradientGA: global_candidate_pool now has "
+                                    f"{len(state['global_candidate_pool'])} entries."
+                                )
+                            else:
+                                bt.logging.info("GradientGA: no hits found.")
+                        except Exception as _ga_err:
+                            bt.logging.error(f"GradientGA error: {_ga_err}")
 
                     # Trigger Boltz-2 pre-scoring when approaching epoch end.
                     # Threshold starts at 100 blocks (20 min); after the first run it is
@@ -988,6 +1051,7 @@ async def run_miner(config: argparse.Namespace) -> None:
                 state['global_candidate_pool'] = None
                 state['savi_stream_pool'] = None
                 state['salsa_run_this_epoch'] = False
+                state['ga_run_this_epoch'] = False
                 state['best_score'] = float('-inf')
                 state['boltz_prescored'] = False
                 state['last_submitted_product'] = None
