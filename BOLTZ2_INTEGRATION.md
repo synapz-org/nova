@@ -464,6 +464,78 @@ The nearest-SAVI-2020 mapping keeps every candidate valid for submission.
 
 ---
 
+## Implemented Optimisations (continued)
+
+### P. Validator Constraint Filters in Pre-filter (`neurons/miner.py`)
+
+**Problem:** The `_pharma_ok` function previously applied only the Lipinski-inspired drug-likeness
+check (H-bond donors/acceptors, logP). Molecules containing banned atom types (e.g., Se) or
+with rotatable bond counts outside `[min_rotatable_bonds, max_rotatable_bonds]` would pass
+through PSICHIC scoring, be added to `global_candidate_pool`, and potentially be submitted —
+only to be rejected or penalised by the validator.
+
+**Fix:** Extended `_pharma_ok` to enforce all three constraint classes in a single RDKit parse:
+
+```python
+def _pharma_ok(smiles: str) -> bool:
+    mol = Chem.MolFromSmiles(smiles)
+    if mol is None:
+        return False
+    # Validator-enforced: banned atom types (e.g. Se)
+    _banned = getattr(state['config'], 'banned_atom_types', [])
+    if _banned and any(a.GetSymbol() in _banned for a in mol.GetAtoms()):
+        return False
+    # Validator-enforced: rotatable bond bounds
+    _rot = Descriptors.NumRotatableBonds(mol)
+    _min_rb = getattr(state['config'], 'min_rotatable_bonds', 1)
+    _max_rb = getattr(state['config'], 'max_rotatable_bonds', None)
+    if _rot < _min_rb or (_max_rb is not None and _rot > _max_rb):
+        return False
+    # Lipinski-inspired drug-likeness
+    return (
+        1 <= Descriptors.NumHDonors(mol) <= 3
+        and 2 <= Descriptors.NumHAcceptors(mol) <= 7
+        and 0.0 <= Descriptors.MolLogP(mol) <= 4.5
+    )
+```
+
+All three checks share a single `Chem.MolFromSmiles` call — no extra parsing overhead.
+
+**Config values enforced:**
+- `banned_atom_types: ["Se"]` — drops molecules containing selenium
+- `min_rotatable_bonds: 1` — requires at least one rotatable bond
+- `max_rotatable_bonds: 10` — drops overly flexible molecules that the validator rejects
+
+### Q. Multi-seed SALSA (`neurons/miner.py`)
+
+**Problem:** SALSA hill-climbed from a single seed (the highest-scoring molecule in
+`global_candidate_pool`). If that seed is a local optimum in PSICHIC space, SALSA's
+bioisosteric perturbations would all explore the same chemical neighbourhood, missing better
+molecules in other scaffolds.
+
+**Fix:** SALSA now runs from up to the top-3 molecules in `global_candidate_pool` as independent
+seeds, merges all hits, deduplicates, and keeps the top-`5 × n_seeds` results:
+
+```python
+_n_seeds = min(3, len(state['global_candidate_pool']))
+_seeds = state['global_candidate_pool'].head(_n_seeds)['product_smiles'].tolist()
+_all_salsa = []
+for _seed_smiles in _seeds:
+    _hits = await asyncio.to_thread(run_salsa_search, _seed_smiles, salsa_pool, 3, 60, 5)
+    if not _hits.empty:
+        _all_salsa.append(_hits)
+salsa_hits = pd.concat(_all_salsa, ...).drop_duplicates(...).sort_values(...)
+```
+
+**Runtime cost:** ~3 × 180 ms = ~540 ms CPU — still negligible relative to Boltz-2 inference.
+
+**Benefit:** Three concurrent hill-climbing trajectories starting from chemically distinct
+seeds can reach different basins of the PSICHIC landscape, surfacing up to 3× more candidate
+molecules before Boltz scoring. Early epochs (only 1 molecule in the pool) gracefully fall
+back to single-seed behaviour.
+
+---
+
 ## Future Optimisation Opportunities
 
 ### A. (Implemented — see §O above)
@@ -610,7 +682,7 @@ These parameters in `config/config.yaml` directly affect what the miner should o
 
 | File | Change |
 |------|--------|
-| `neurons/miner.py` | Added `is_boltz_safe_smiles` + `max_heavy_atoms` filters; `run_boltz_prescoring()` with two-tier cache; Boltz trigger at 100 blocks (was 50); `boltz_score_cache` + `boltz_cache_db` state fields; `_init_boltz_cache_db`, `_disk_cache_get`, `_disk_cache_put` helpers; fixed `entropy_weight` → `entropy_start_weight` AttributeError; pharmacophore pre-filter (§F); adaptive trigger using `boltz_trigger_blocks` state field (§G); anytime incremental scoring — one molecule at a time with immediate reorder (§H); PSICHIC ligand-efficiency scoring — divide combined_score by heavy_atoms (§I); global candidate pool — top-20 across all epoch chunks for Boltz (§J); dynamic max_candidates from available epoch time + `boltz_time_per_mol` state (§K); epoch-end guard before each cache-miss Boltz inference (§L); `boltz_time_per_mol` persisted in state (§M); SALSA stream pool + trigger + epoch reset (§N) |
+| `neurons/miner.py` | Added `is_boltz_safe_smiles` + `max_heavy_atoms` filters; `run_boltz_prescoring()` with two-tier cache; Boltz trigger at 100 blocks (was 50); `boltz_score_cache` + `boltz_cache_db` state fields; `_init_boltz_cache_db`, `_disk_cache_get`, `_disk_cache_put` helpers; fixed `entropy_weight` → `entropy_start_weight` AttributeError; pharmacophore pre-filter (§F); adaptive trigger using `boltz_trigger_blocks` state field (§G); anytime incremental scoring — one molecule at a time with immediate reorder (§H); PSICHIC ligand-efficiency scoring — divide combined_score by heavy_atoms (§I); global candidate pool — top-20 across all epoch chunks for Boltz (§J); dynamic max_candidates from available epoch time + `boltz_time_per_mol` state (§K); epoch-end guard before each cache-miss Boltz inference (§L); `boltz_time_per_mol` persisted in state (§M); SALSA stream pool + trigger + epoch reset (§N); `ga_run_this_epoch` added to initial state dict; validator constraint filters (banned atoms, rotatable bonds) added to `_pharma_ok` (§P); multi-seed SALSA — top-3 seeds for broader chemical space coverage (§Q) |
 | `boltz/wrapper.py` | Added `last_inference_duration` field populated after each `predict()` call (§G) |
 | `config/config.yaml` | Added `max_heavy_atoms: 35` |
 | `config/config_loader.py` | Loads and exposes `max_heavy_atoms` |

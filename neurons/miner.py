@@ -327,13 +327,26 @@ async def run_psichic_model_loop(state: Dict[str, Any]) -> None:
                 if df.empty or len(df) < state['config'].num_molecules:
                     continue
 
-                # Pharmacophore pre-filter: Lipinski-inspired drug-likeness check.
-                # Eliminates ~30% of molecules (extreme logP, no H-bond capacity)
-                # before the more expensive PSICHIC scoring.
+                # Combined pre-filter: validator constraints + Lipinski drug-likeness.
+                # Applied before PSICHIC to skip molecules the validator would reject
+                # (banned atoms, rotatable bond bounds) and molecules unlikely to bind
+                # (extreme logP, insufficient H-bond capacity).
+                # All checks share a single RDKit mol parse per SMILES.
                 def _pharma_ok(smiles: str) -> bool:
                     mol = Chem.MolFromSmiles(smiles)
                     if mol is None:
                         return False
+                    # Validator-enforced: banned atom types (e.g. Se)
+                    _banned = getattr(state['config'], 'banned_atom_types', [])
+                    if _banned and any(a.GetSymbol() in _banned for a in mol.GetAtoms()):
+                        return False
+                    # Validator-enforced: rotatable bond bounds
+                    _rot = Descriptors.NumRotatableBonds(mol)
+                    _min_rb = getattr(state['config'], 'min_rotatable_bonds', 1)
+                    _max_rb = getattr(state['config'], 'max_rotatable_bonds', None)
+                    if _rot < _min_rb or (_max_rb is not None and _rot > _max_rb):
+                        return False
+                    # Lipinski-inspired drug-likeness (fast heuristic filter)
                     return (
                         1 <= Descriptors.NumHDonors(mol) <= 3
                         and 2 <= Descriptors.NumHAcceptors(mol) <= 7
@@ -473,23 +486,41 @@ async def run_psichic_model_loop(state: Dict[str, Any]) -> None:
                         and not state['global_candidate_pool'].empty
                     ):
                         state['salsa_run_this_epoch'] = True
-                        seed = state['global_candidate_pool'].iloc[0]['product_smiles']
+                        # Multi-seed SALSA: run from up to top-3 candidates so we
+                        # explore three distinct chemical neighbourhoods in one pass.
+                        # Runtime: ~3 × 180 ms = ~540 ms CPU — negligible vs Boltz.
+                        _n_seeds = min(3, len(state['global_candidate_pool']))
+                        _seeds = state['global_candidate_pool'].head(_n_seeds)['product_smiles'].tolist()
                         bt.logging.info(
                             f"SALSA: triggering with {salsa_pool_size}-molecule pool, "
-                            f"{blocks_until_epoch} blocks remaining (threshold={salsa_threshold})..."
+                            f"{blocks_until_epoch} blocks remaining (threshold={salsa_threshold}), "
+                            f"{_n_seeds} seed(s)..."
                         )
                         try:
-                            salsa_hits = await asyncio.to_thread(
-                                run_salsa_search,
-                                seed,
-                                salsa_pool,
-                                3,   # rounds
-                                60,  # n_perturb
-                                5,   # top_k
-                            )
+                            _all_salsa = []
+                            for _seed_smiles in _seeds:
+                                _hits = await asyncio.to_thread(
+                                    run_salsa_search,
+                                    _seed_smiles,
+                                    salsa_pool,
+                                    3,   # rounds
+                                    60,  # n_perturb
+                                    5,   # top_k
+                                )
+                                if not _hits.empty:
+                                    _all_salsa.append(_hits)
+
+                            if _all_salsa:
+                                salsa_hits = pd.concat(_all_salsa, ignore_index=True)
+                                salsa_hits.drop_duplicates(subset=['product_name'], inplace=True)
+                                salsa_hits.sort_values('combined_score', ascending=False, inplace=True)
+                                salsa_hits = salsa_hits.head(5 * _n_seeds).reset_index(drop=True)
+                            else:
+                                salsa_hits = pd.DataFrame()
+
                             if not salsa_hits.empty:
                                 bt.logging.info(
-                                    f"SALSA: {len(salsa_hits)} hits found; "
+                                    f"SALSA: {len(salsa_hits)} hits found across {_n_seeds} seed(s); "
                                     f"merging into global_candidate_pool."
                                 )
                                 combined_gcp = pd.concat(
@@ -912,6 +943,7 @@ async def run_miner(config: argparse.Namespace) -> None:
         'global_candidate_pool': None,   # top-20 molecules across all chunks, by ligand efficiency
         'savi_stream_pool': None,        # all PSICHIC-scored molecules this epoch (capped at 5000)
         'salsa_run_this_epoch': False,   # prevent duplicate SALSA runs per epoch
+        'ga_run_this_epoch': False,      # prevent duplicate GradientGA runs per epoch
         'best_score': float('-inf'),
         'boltz_prescored': False,
         'last_submitted_product': None,
