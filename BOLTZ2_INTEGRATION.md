@@ -678,6 +678,49 @@ These parameters in `config/config.yaml` directly affect what the miner should o
 
 ---
 
+---
+
+## Implemented Optimisations (continued)
+
+### R. Pre-computed Pool Fingerprints + BulkTanimotoSimilarity (`utils/salsa.py`, `utils/genetic.py`)
+
+**Problem:** `nearest_pool_molecules` previously recomputed Morgan fingerprints for every
+molecule in the pool on every query.  A SALSA run with 3 rounds × 60 perturbations × 5000-molecule
+pool = **900,000 redundant FP computations** per epoch (each FP computed ~180 times instead of once).
+GradientGA with 5 generations × ~150 offspring × 5000-molecule pool has similar overhead.
+
+**Fix:** Added `precompute_pool_fps(pool_df, smiles_col)` to `utils/salsa.py`:
+
+```python
+def precompute_pool_fps(pool_df, smiles_col='product_smiles') -> Tuple[pd.DataFrame, List]:
+    """Pre-compute Morgan FPs once; returns (valid_df, fps_list)."""
+```
+
+`run_salsa_search` and `run_gradient_ga` now call this once before their main loops and pass
+the resulting `(valid_pool, pool_fps)` to `nearest_pool_molecules` via its new optional
+`pool_fps` argument.  When `pool_fps` is supplied, the function uses the vectorised C++
+`DataStructs.BulkTanimotoSimilarity(target_fp, pool_fps)` instead of a per-molecule Python loop.
+
+**Complexity reduction:**
+
+| Metric | Before | After |
+|--------|--------|-------|
+| FP computations (SALSA, 5000-mol pool) | 900,000 | 5,000 (1×) |
+| FP computations (GA, 5000-mol pool) | ~750,000 | 5,000 (1×) |
+| Similarity loop | Python (scalar) | C++ (vectorised) |
+| Expected SALSA wall-clock (CPU) | ~500–900 ms | ~20–40 ms |
+| Expected GA wall-clock (CPU) | ~1–3 s | ~50–150 ms |
+
+SALSA and GA are still negligible vs. Boltz-2 inference, but the speedup means:
+- Less CPU contention during the Boltz window (Boltz uses GPU, but Python GIL and OS scheduler
+  still benefit from shorter CPU bursts).
+- Multi-seed SALSA (3 seeds) completes faster, leaving more headroom for other tasks.
+
+**API change:** `nearest_pool_molecules` gains an optional `pool_fps` keyword argument (default
+`None`, backward-compatible).  Direct callers outside SALSA/GA are unaffected.
+
+---
+
 ## Files Changed
 
 | File | Change |
@@ -687,6 +730,7 @@ These parameters in `config/config.yaml` directly affect what the miner should o
 | `config/config.yaml` | Added `max_heavy_atoms: 35` |
 | `config/config_loader.py` | Loads and exposes `max_heavy_atoms` |
 | `utils/molecules.py` | Added `get_canonical_smiles()` |
-| `utils/__init__.py` | Exported `get_canonical_smiles`; exported SALSA functions (§N) |
-| `utils/salsa.py` | New: SALSA algorithm — `generate_perturbations`, `nearest_pool_molecules`, `run_salsa_search` (§N) |
+| `utils/__init__.py` | Exported `get_canonical_smiles`; exported SALSA functions (§N); exported `precompute_pool_fps` (§R) |
+| `utils/salsa.py` | New: SALSA algorithm — `generate_perturbations`, `nearest_pool_molecules`, `run_salsa_search` (§N); added `precompute_pool_fps` + optional `pool_fps` arg to `nearest_pool_molecules` (§R) |
+| `utils/genetic.py` | New: GradientGA — `brics_crossover`, `tournament_select`, `run_gradient_ga` (§O); pre-compute pool FPs + pass to `nearest_pool_molecules` (§R) |
 | `BOLTZ2_INTEGRATION.md` | This file |

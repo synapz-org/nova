@@ -22,7 +22,7 @@ Typical call from miner.py:
 from __future__ import annotations
 
 import logging
-from typing import List
+from typing import List, Optional, Tuple
 
 import pandas as pd
 from rdkit import Chem
@@ -44,7 +44,7 @@ _BIOISOSTERES: dict[int, list[int]] = {
 
 
 # ---------------------------------------------------------------------------
-# Fingerprint helper
+# Fingerprint helpers
 # ---------------------------------------------------------------------------
 def _morgan_fp(mol: Chem.Mol, radius: int = 2, n_bits: int = 2048):
     """Return Morgan fingerprint or None on failure."""
@@ -52,6 +52,36 @@ def _morgan_fp(mol: Chem.Mol, radius: int = 2, n_bits: int = 2048):
         return AllChem.GetMorganFingerprintAsBitVect(mol, radius, nBits=n_bits)
     except Exception:
         return None
+
+
+def precompute_pool_fps(
+    pool_df: pd.DataFrame,
+    smiles_col: str = 'product_smiles',
+) -> Tuple[pd.DataFrame, List]:
+    """
+    Pre-compute Morgan fingerprints for every molecule in *pool_df*.
+
+    Returns a (valid_df, fps_list) tuple where:
+    - valid_df  — rows of pool_df whose SMILES parsed successfully (same order as fps_list)
+    - fps_list  — list of ExplicitBitVect fingerprints, one per valid_df row
+
+    Call this once before a SALSA/GA run and pass the results to
+    nearest_pool_molecules() via the pool_fps argument to avoid recomputing
+    fingerprints on every query (typically 180+ queries per SALSA run over a
+    5000-molecule pool — ~900k redundant FP computations without caching).
+    """
+    fps: List = []
+    valid_indices: List[int] = []
+
+    for idx, smiles in enumerate(pool_df[smiles_col]):
+        mol = Chem.MolFromSmiles(smiles)
+        fp = _morgan_fp(mol) if mol is not None else None
+        if fp is not None:
+            fps.append(fp)
+            valid_indices.append(idx)
+
+    valid_df = pool_df.iloc[valid_indices].reset_index(drop=True)
+    return valid_df, fps
 
 
 # ---------------------------------------------------------------------------
@@ -98,10 +128,16 @@ def nearest_pool_molecules(
     pool_df: pd.DataFrame,
     top_k: int = 1,
     smiles_col: str = 'product_smiles',
+    pool_fps: Optional[List] = None,
 ) -> pd.DataFrame:
     """
     Return the *top_k* rows from *pool_df* most similar to *target_smiles*
     by Tanimoto coefficient on Morgan fingerprints (radius=2, 2048 bits).
+
+    When *pool_fps* is provided (a pre-computed list of ExplicitBitVect objects
+    aligned with *pool_df*'s rows, as returned by precompute_pool_fps()), the
+    function skips per-call FP computation and uses BulkTanimotoSimilarity for
+    a vectorised C++ similarity sweep — dramatically faster for large pools.
 
     Returns an empty DataFrame if *target_smiles* is invalid or pool is empty.
     """
@@ -115,14 +151,21 @@ def nearest_pool_molecules(
     if target_fp is None:
         return pd.DataFrame()
 
-    sims: List[float] = []
-    for smiles in pool_df[smiles_col]:
-        mol = Chem.MolFromSmiles(smiles)
-        if mol is None:
-            sims.append(0.0)
-            continue
-        fp = _morgan_fp(mol)
-        sims.append(DataStructs.TanimotoSimilarity(target_fp, fp) if fp is not None else 0.0)
+    if pool_fps is not None:
+        # Fast path: pre-computed FPs + vectorised BulkTanimotoSimilarity
+        if not pool_fps:
+            return pd.DataFrame()
+        sims = DataStructs.BulkTanimotoSimilarity(target_fp, pool_fps)
+    else:
+        # Slow path: compute FPs on the fly (used when pool_fps not provided)
+        sims = []
+        for smiles in pool_df[smiles_col]:
+            mol = Chem.MolFromSmiles(smiles)
+            if mol is None:
+                sims.append(0.0)
+                continue
+            fp = _morgan_fp(mol)
+            sims.append(DataStructs.TanimotoSimilarity(target_fp, fp) if fp is not None else 0.0)
 
     result = pool_df.copy()
     result['_tanimoto'] = sims
@@ -156,6 +199,10 @@ def run_salsa_search(
     After *rounds* iterations, return the *top_k* pool molecules discovered
     across all rounds, sorted by *score_col* descending.
 
+    Pool fingerprints are pre-computed once before the rounds loop and reused
+    for all perturbation queries via BulkTanimotoSimilarity, reducing FP
+    computations from O(rounds × n_perturb × pool_size) to O(pool_size).
+
     All returned rows come from *savi_pool_df*, so their *product_name* values
     are valid for miner submission.
 
@@ -178,6 +225,13 @@ def run_salsa_search(
         logger.debug("SALSA: savi_pool_df is empty, skipping.")
         return pd.DataFrame()
 
+    # Pre-compute pool fingerprints once — reused for all perturbation queries.
+    # Filters out any rows with unparseable SMILES; valid_pool and pool_fps are aligned.
+    valid_pool, pool_fps = precompute_pool_fps(savi_pool_df, smiles_col)
+    if valid_pool.empty or not pool_fps:
+        logger.debug("SALSA: no valid pool molecules after FP pre-computation, skipping.")
+        return pd.DataFrame()
+
     best_smiles = seed_smiles
     all_hits: List[pd.DataFrame] = []
     seen_names: set[str] = set()
@@ -190,7 +244,9 @@ def run_salsa_search(
 
         round_hits: List[pd.Series] = []
         for pert_smiles in perturbations:
-            nearest = nearest_pool_molecules(pert_smiles, savi_pool_df, top_k=1, smiles_col=smiles_col)
+            nearest = nearest_pool_molecules(
+                pert_smiles, valid_pool, top_k=1, smiles_col=smiles_col, pool_fps=pool_fps
+            )
             if nearest.empty:
                 continue
             row = nearest.iloc[0]

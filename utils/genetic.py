@@ -35,7 +35,7 @@ import pandas as pd
 from rdkit import Chem
 from rdkit.Chem import BRICS
 
-from utils.salsa import generate_perturbations, nearest_pool_molecules
+from utils.salsa import generate_perturbations, nearest_pool_molecules, precompute_pool_fps
 
 logger = logging.getLogger(__name__)
 
@@ -195,10 +195,17 @@ def run_gradient_ga(
         logger.debug("GradientGA: seed_df is empty — skipping.")
         return pd.DataFrame()
 
+    # Pre-compute pool fingerprints once — reused for every offspring→SAVI
+    # nearest-neighbour lookup across all generations via BulkTanimotoSimilarity.
+    valid_pool, pool_fps = precompute_pool_fps(savi_pool_df, smiles_col)
+    if valid_pool.empty or not pool_fps:
+        logger.debug("GradientGA: no valid pool FPs, skipping.")
+        return pd.DataFrame()
+
     # ------------------------------------------------------------------ init
     # Seed population: elites + random sample from the stream pool
-    sample_n = min(pop_size, len(savi_pool_df))
-    sampled = savi_pool_df.sample(sample_n, random_state=42)
+    sample_n = min(pop_size, len(valid_pool))
+    sampled = valid_pool.sample(sample_n, random_state=42)
     init = pd.concat([seed_df, sampled], ignore_index=True)
     init.drop_duplicates(subset=[name_col], inplace=True)
     init.sort_values(score_col, ascending=False, inplace=True)
@@ -239,13 +246,13 @@ def run_gradient_ga(
             logger.debug(f"GA gen {gen_idx + 1}: no candidates generated")
             continue
 
-        # Map offspring → nearest SAVI-2020 molecule
+        # Map offspring → nearest SAVI-2020 molecule (pre-computed FPs for speed)
         seen_names: Set[str] = set(population[name_col].tolist())
         new_hit_frames: List[pd.DataFrame] = []
 
         for cand_smi in candidate_smiles:
             nearest = nearest_pool_molecules(
-                cand_smi, savi_pool_df, top_k=1, smiles_col=smiles_col
+                cand_smi, valid_pool, top_k=1, smiles_col=smiles_col, pool_fps=pool_fps
             )
             if nearest.empty:
                 continue
