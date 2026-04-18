@@ -721,16 +721,83 @@ SALSA and GA are still negligible vs. Boltz-2 inference, but the speedup means:
 
 ---
 
+## Implemented Optimisations (continued)
+
+### S. MSA Auto-fetch at Miner Startup (`utils/msa.py`, `neurons/miner.py`)
+
+**Problem:** Boltz-2 uses a Multiple Sequence Alignment (MSA) to incorporate
+evolutionary context into its structure and affinity predictions. The MSA is a
+pre-computed `.a3m` file stored at `boltz/msa_files/{protein_code}.a3m`. Without it,
+Boltz runs in single-sequence mode, which measurably weakens affinity estimates.
+
+Previously this file had to be generated manually and committed before each new epoch.
+If a miner was deployed on a new machine or the weekly target rotated while the miner
+was unattended, it would silently fall back to single-sequence mode with no warning.
+
+**Fix:** `utils/msa.py` adds three public functions:
+
+| Function | Purpose |
+|----------|---------|
+| `msa_exists(protein_code)` | Fast on-disk check — returns `True` if `.a3m` file is present |
+| `fetch_msa(protein_code, sequence)` | Submits sequence to ColabFold API, polls for result, extracts and saves `.a3m` |
+| `ensure_msa(protein_code, sequence)` | No-op if file exists; otherwise calls `fetch_msa` |
+
+**API flow (`fetch_msa`):**
+
+```
+POST https://api.colabfold.com/ticket/msa
+     {"q": ">query\n{sequence}", "mode": "env"}
+     → {"id": "<job_id>"}
+
+GET  https://api.colabfold.com/ticket/<job_id>
+     → {"status": "PENDING"|"RUNNING"|"COMPLETE"|"ERROR"}
+     (polled every 15 s, up to 15 min timeout)
+
+GET  https://api.colabfold.com/result/download/<job_id>
+     → tar.gz (or zip) archive containing 0.a3m
+     → written to boltz/msa_files/{protein_code}.a3m
+```
+
+The download handler supports both gzip-tarball and zip archives to be robust against
+API version changes.
+
+**Integration (`neurons/miner.py`):** Called once during `run_miner()` startup, after
+the Boltz cache is initialised and before the main epoch loop:
+
+```python
+_target_seq = get_sequence_from_protein_code(config.weekly_target)
+if _target_seq:
+    _msa_ok = ensure_msa(config.weekly_target, _target_seq)
+    if not _msa_ok:
+        bt.logging.warning("Boltz-2 will run in single-sequence mode (weaker predictions).")
+```
+
+All errors are caught and logged as warnings — the miner continues even if the API is
+unreachable (graceful degradation to single-sequence mode rather than a crash).
+
+**Typical timing:** ColabFold MSA jobs for typical drug-target proteins (300–500 aa)
+complete in 1–3 minutes. Miner startup is blocked until the MSA is ready or the
+15-minute timeout is reached. On subsequent starts the file is already on disk and the
+call returns immediately.
+
+**Files changed:**
+- `utils/msa.py` — new module (`ensure_msa`, `fetch_msa`, `msa_exists`)
+- `utils/__init__.py` — exports `ensure_msa`, `fetch_msa`, `msa_exists`
+- `neurons/miner.py` — imports `ensure_msa`; calls it at startup after cache init
+
+---
+
 ## Files Changed
 
 | File | Change |
 |------|--------|
-| `neurons/miner.py` | Added `is_boltz_safe_smiles` + `max_heavy_atoms` filters; `run_boltz_prescoring()` with two-tier cache; Boltz trigger at 100 blocks (was 50); `boltz_score_cache` + `boltz_cache_db` state fields; `_init_boltz_cache_db`, `_disk_cache_get`, `_disk_cache_put` helpers; fixed `entropy_weight` → `entropy_start_weight` AttributeError; pharmacophore pre-filter (§F); adaptive trigger using `boltz_trigger_blocks` state field (§G); anytime incremental scoring — one molecule at a time with immediate reorder (§H); PSICHIC ligand-efficiency scoring — divide combined_score by heavy_atoms (§I); global candidate pool — top-20 across all epoch chunks for Boltz (§J); dynamic max_candidates from available epoch time + `boltz_time_per_mol` state (§K); epoch-end guard before each cache-miss Boltz inference (§L); `boltz_time_per_mol` persisted in state (§M); SALSA stream pool + trigger + epoch reset (§N); `ga_run_this_epoch` added to initial state dict; validator constraint filters (banned atoms, rotatable bonds) added to `_pharma_ok` (§P); multi-seed SALSA — top-3 seeds for broader chemical space coverage (§Q) |
+| `neurons/miner.py` | Added `is_boltz_safe_smiles` + `max_heavy_atoms` filters; `run_boltz_prescoring()` with two-tier cache; Boltz trigger at 100 blocks (was 50); `boltz_score_cache` + `boltz_cache_db` state fields; `_init_boltz_cache_db`, `_disk_cache_get`, `_disk_cache_put` helpers; fixed `entropy_weight` → `entropy_start_weight` AttributeError; pharmacophore pre-filter (§F); adaptive trigger using `boltz_trigger_blocks` state field (§G); anytime incremental scoring — one molecule at a time with immediate reorder (§H); PSICHIC ligand-efficiency scoring — divide combined_score by heavy_atoms (§I); global candidate pool — top-20 across all epoch chunks for Boltz (§J); dynamic max_candidates from available epoch time + `boltz_time_per_mol` state (§K); epoch-end guard before each cache-miss Boltz inference (§L); `boltz_time_per_mol` persisted in state (§M); SALSA stream pool + trigger + epoch reset (§N); `ga_run_this_epoch` added to initial state dict; validator constraint filters (banned atoms, rotatable bonds) added to `_pharma_ok` (§P); multi-seed SALSA — top-3 seeds for broader chemical space coverage (§Q); MSA auto-fetch at startup via `ensure_msa` (§S) |
 | `boltz/wrapper.py` | Added `last_inference_duration` field populated after each `predict()` call (§G) |
 | `config/config.yaml` | Added `max_heavy_atoms: 35` |
 | `config/config_loader.py` | Loads and exposes `max_heavy_atoms` |
 | `utils/molecules.py` | Added `get_canonical_smiles()` |
-| `utils/__init__.py` | Exported `get_canonical_smiles`; exported SALSA functions (§N); exported `precompute_pool_fps` (§R) |
+| `utils/__init__.py` | Exported `get_canonical_smiles`; exported SALSA functions (§N); exported `precompute_pool_fps` (§R); exported `ensure_msa`, `fetch_msa`, `msa_exists` (§S) |
 | `utils/salsa.py` | New: SALSA algorithm — `generate_perturbations`, `nearest_pool_molecules`, `run_salsa_search` (§N); added `precompute_pool_fps` + optional `pool_fps` arg to `nearest_pool_molecules` (§R) |
 | `utils/genetic.py` | New: GradientGA — `brics_crossover`, `tournament_select`, `run_gradient_ga` (§O); pre-compute pool FPs + pass to `nearest_pool_molecules` (§R) |
+| `utils/msa.py` | New: MSA auto-fetch — `ensure_msa`, `fetch_msa`, `msa_exists` (§S) |
 | `BOLTZ2_INTEGRATION.md` | This file |

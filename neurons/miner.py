@@ -40,6 +40,7 @@ from utils import (
     compute_maccs_entropy,
 )
 from utils.molecules import is_boltz_safe_smiles, get_canonical_smiles
+from utils.msa import ensure_msa
 from utils.salsa import run_salsa_search
 from utils.genetic import run_gradient_ga
 from PSICHIC.wrapper import PsichicWrapper
@@ -967,6 +968,24 @@ async def run_miner(config: argparse.Namespace) -> None:
     _init_boltz_cache_db(state['boltz_cache_db'])
     _cleanup_boltz_cache(state['boltz_cache_db'], keep_protein=config.weekly_target)
     bt.logging.info(f"Boltz persistent cache initialised: {state['boltz_cache_db']}")
+
+    # Ensure MSA file exists for the current weekly target (§S).
+    # Boltz-2 predictions are significantly weaker without an MSA — this call
+    # is a no-op when the file already exists and fetches it via ColabFold
+    # API (~1–5 min) only when the target has rotated to a new protein.
+    try:
+        _target_seq = get_sequence_from_protein_code(config.weekly_target)
+        if _target_seq:
+            _msa_ok = ensure_msa(config.weekly_target, _target_seq)
+            if not _msa_ok:
+                bt.logging.warning(
+                    f"[MSA] Could not obtain MSA for {config.weekly_target}. "
+                    "Boltz-2 will run in single-sequence mode (weaker predictions)."
+                )
+        else:
+            bt.logging.warning(f"[MSA] Could not retrieve sequence for {config.weekly_target} — skipping MSA fetch.")
+    except Exception as _msa_exc:
+        bt.logging.warning(f"[MSA] MSA check failed (non-fatal): {_msa_exc}")
 
     bt.logging.info("Entering main miner loop...")
 
