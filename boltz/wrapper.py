@@ -164,6 +164,9 @@ properties:
                 seed = 68,
                 affinity_mw_correction = self.config['affinity_mw_correction'],
                 override = self.config['override'],
+                no_kernels = self.config.get('no_kernels', False),
+                num_workers = self.config.get('num_workers', 2),
+                preprocessing_threads = self.config.get('preprocessing_threads', 4),
             )
             self.last_inference_duration = time.time() - _t0
             bt.logging.info(f"Boltz2 predictions complete in {self.last_inference_duration:.1f}s")

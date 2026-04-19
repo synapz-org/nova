@@ -787,12 +787,43 @@ call returns immediately.
 
 ---
 
+## Implemented Optimisations (continued)
+
+### T. Forward `no_kernels`, `num_workers`, `preprocessing_threads` from config (`boltz/wrapper.py`)
+
+**Problem:** `BoltzWrapper.score_molecules_target()` called `predict()` with a hard-coded subset
+of parameters. Three config keys were silently ignored:
+
+| Key | Config value | `predict()` default | Effect of bug |
+|-----|-------------|---------------------|---------------|
+| `no_kernels` | `true` | `False` | Custom CUDA kernels enabled despite config saying disable — may fail on hardware without `cuequivariance` |
+| `num_workers` | *(unset → 2)* | 2 | No effect in this case, but un-configurable |
+| `preprocessing_threads` | *(unset → 4)* | 4 | Same |
+
+**Fix:** Three additional keyword arguments added to the `predict()` call:
+
+```python
+no_kernels = self.config.get('no_kernels', False),
+num_workers = self.config.get('num_workers', 2),
+preprocessing_threads = self.config.get('preprocessing_threads', 4),
+```
+
+`no_kernels` uses `dict.get()` for backward compatibility (old config files without the key
+get the library default of `False`).
+
+**Impact:** Miners running on hardware without `cuequivariance` or `triton` installed would
+previously get a runtime error when Boltz tried to load the custom kernel. With the fix, setting
+`no_kernels: true` in `boltz_config.yaml` (already the default) correctly falls back to the
+pure-PyTorch implementation.
+
+---
+
 ## Files Changed
 
 | File | Change |
 |------|--------|
 | `neurons/miner.py` | Added `is_boltz_safe_smiles` + `max_heavy_atoms` filters; `run_boltz_prescoring()` with two-tier cache; Boltz trigger at 100 blocks (was 50); `boltz_score_cache` + `boltz_cache_db` state fields; `_init_boltz_cache_db`, `_disk_cache_get`, `_disk_cache_put` helpers; fixed `entropy_weight` → `entropy_start_weight` AttributeError; pharmacophore pre-filter (§F); adaptive trigger using `boltz_trigger_blocks` state field (§G); anytime incremental scoring — one molecule at a time with immediate reorder (§H); PSICHIC ligand-efficiency scoring — divide combined_score by heavy_atoms (§I); global candidate pool — top-20 across all epoch chunks for Boltz (§J); dynamic max_candidates from available epoch time + `boltz_time_per_mol` state (§K); epoch-end guard before each cache-miss Boltz inference (§L); `boltz_time_per_mol` persisted in state (§M); SALSA stream pool + trigger + epoch reset (§N); `ga_run_this_epoch` added to initial state dict; validator constraint filters (banned atoms, rotatable bonds) added to `_pharma_ok` (§P); multi-seed SALSA — top-3 seeds for broader chemical space coverage (§Q); MSA auto-fetch at startup via `ensure_msa` (§S) |
-| `boltz/wrapper.py` | Added `last_inference_duration` field populated after each `predict()` call (§G) |
+| `boltz/wrapper.py` | Added `last_inference_duration` field populated after each `predict()` call (§G); pass `no_kernels`, `num_workers`, `preprocessing_threads` from config to `predict()` (§T) |
 | `config/config.yaml` | Added `max_heavy_atoms: 35` |
 | `config/config_loader.py` | Loads and exposes `max_heavy_atoms` |
 | `utils/molecules.py` | Added `get_canonical_smiles()` |
