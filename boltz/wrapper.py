@@ -167,6 +167,8 @@ properties:
                 no_kernels = self.config.get('no_kernels', False),
                 num_workers = self.config.get('num_workers', 2),
                 preprocessing_threads = self.config.get('preprocessing_threads', 4),
+                use_potentials = self.config.get('use_potentials', False),
+                step_scale = self.config.get('step_scale', None),
             )
             self.last_inference_duration = time.time() - _t0
             bt.logging.info(f"Boltz2 predictions complete in {self.last_inference_duration:.1f}s")

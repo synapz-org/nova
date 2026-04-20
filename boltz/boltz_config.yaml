@@ -13,3 +13,15 @@ remove_files: true # Remove files after processing
 
 batch_predictions: false
 
+# Inference-time potentials (FK steering + physical guidance).
+# When true, steers diffusion toward physically plausible poses — can improve
+# affinity accuracy on hardware with ample GPU memory (A100 / H100).
+# Adds ~10-20% to per-molecule inference time.  Default: false.
+use_potentials: false
+
+# Diffusion temperature scale (library default: 1.5).
+# Lower values (<1.5) reduce pose diversity but increase consistency.
+# Higher values (>1.5) increase diversity at the cost of more noise.
+# Set to null to use the library default.
+step_scale: null
+

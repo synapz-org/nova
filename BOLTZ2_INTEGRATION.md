@@ -818,12 +818,121 @@ pure-PyTorch implementation.
 
 ---
 
+---
+
+## Implemented Optimisations (continued)
+
+### U. `use_potentials` inference-time potentials (`boltz/wrapper.py`, `boltz/boltz_config.yaml`)
+
+**Background:** The Boltz-2 `predict()` function supports a `use_potentials` flag that
+activates FK (forward kinematics) steering and physical guidance during diffusion sampling.
+These are inference-time potentials that steer the diffusion trajectory toward physically
+plausible poses — improved backbone geometry, better clash avoidance, and stronger
+protein–ligand contacts.
+
+**Previous state:** `use_potentials` defaulted to `False` in the library and was never
+forwarded from our config, so it was always off regardless of hardware capabilities.
+
+**Fix:** Two changes:
+
+1. `boltz/boltz_config.yaml` — new key:
+   ```yaml
+   use_potentials: false  # set true on A100/H100 for better affinity accuracy
+   ```
+
+2. `boltz/wrapper.py` — added to `predict()` call:
+   ```python
+   use_potentials = self.config.get('use_potentials', False),
+   ```
+
+**When to enable:** On A100 / H100 hardware where the additional ~10–20% inference time
+overhead is affordable within the epoch window. On RTX 3090 (150 s/mol baseline), enabling
+potentials may push per-molecule time to ~180 s — the adaptive trigger (§G) will compensate
+automatically by updating `boltz_trigger_blocks`.
+
+**Risk:** Zero — the default remains `false`, preserving identical behaviour on all existing
+deployments. Miners on fast hardware can opt in by changing one YAML line.
+
+---
+
+### V. `step_scale` diffusion temperature control (`boltz/wrapper.py`, `boltz/boltz_config.yaml`)
+
+**Background:** The diffusion process has a temperature parameter `step_scale` (library
+default: 1.5) that controls pose diversity:
+
+| `step_scale` | Effect |
+|--------------|--------|
+| < 1.5 | Less diverse; more consistent, lower-variance poses |
+| 1.5 | Library default — balanced diversity/consistency |
+| > 1.5 | More diverse; explores wider conformational space |
+
+With `diffusion_samples_affinity: 3`, the affinity ensemble averages 3 samples at the
+configured temperature. A lower `step_scale` (e.g., 1.2) reduces variance between samples,
+giving a more stable `affinity_probability_binary` estimate. A higher scale (e.g., 1.8) may
+find a lucky high-energy binding mode but with higher score variance.
+
+**Previous state:** `step_scale` was not forwarded from config; the library default (1.5)
+was always used.
+
+**Fix:**
+
+1. `boltz/boltz_config.yaml`:
+   ```yaml
+   step_scale: null  # null → library default (1.5); set e.g. 1.2 for lower variance
+   ```
+
+2. `boltz/wrapper.py`:
+   ```python
+   step_scale = self.config.get('step_scale', None),
+   ```
+
+**Recommended tuning:** Start with `null` (library default). If Boltz scores are noisy
+between epochs for the same molecule (variance > 0.05 on `affinity_probability_binary`),
+try `step_scale: 1.2` to tighten the distribution.
+
+---
+
+## Remaining Future Opportunities
+
+### C. Multi-molecule entropy bonus
+
+When the validator increases `num_molecules_boltz > 1`, the entropy bonus activates
+(`ranking.py` lines 109–118). The miner should respond by submitting a set of molecules
+with high MACCS fingerprint diversity, not just the single best binder.
+
+Implementation: after Boltz pre-scoring, fill remaining submission slots greedily with
+molecules that maximise `compute_maccs_entropy()` relative to the already-selected set.
+
+### D. Binding-pocket guidance
+
+`config.yaml` exposes `binding_pocket`, `max_distance`, and `force`. When the validator
+sets a pocket constraint, Boltz-2 adds a soft or hard guidance term to steer the diffusion
+towards specific residues. Miners could pre-filter for molecules whose docked pose (from
+a fast docking tool like Vina or Gnina) is predicted to sit inside the specified pocket.
+
+### W. `sampling_steps_affinity` accuracy tuning
+
+Current value: **100** (boltz_config.yaml). Library default: **200**.
+
+This was intentionally halved for speed. On A100 hardware with the adaptive trigger, the
+per-epoch budget comfortably fits 5–6 molecules at 100 steps. Increasing to 150 or 200
+would improve affinity estimate accuracy at the cost of longer per-molecule inference
+(~1.5–2× longer). With `use_potentials: true` already adding overhead, consider profiling
+before increasing.
+
+Formula: `sampling_steps_affinity` linearly scales GPU time per molecule (more steps =
+more diffusion iterations = longer inference). The adaptive trigger (§G) accounts for this
+automatically after the first measured inference.
+
+---
+
 ## Files Changed
 
 | File | Change |
 |------|--------|
 | `neurons/miner.py` | Added `is_boltz_safe_smiles` + `max_heavy_atoms` filters; `run_boltz_prescoring()` with two-tier cache; Boltz trigger at 100 blocks (was 50); `boltz_score_cache` + `boltz_cache_db` state fields; `_init_boltz_cache_db`, `_disk_cache_get`, `_disk_cache_put` helpers; fixed `entropy_weight` → `entropy_start_weight` AttributeError; pharmacophore pre-filter (§F); adaptive trigger using `boltz_trigger_blocks` state field (§G); anytime incremental scoring — one molecule at a time with immediate reorder (§H); PSICHIC ligand-efficiency scoring — divide combined_score by heavy_atoms (§I); global candidate pool — top-20 across all epoch chunks for Boltz (§J); dynamic max_candidates from available epoch time + `boltz_time_per_mol` state (§K); epoch-end guard before each cache-miss Boltz inference (§L); `boltz_time_per_mol` persisted in state (§M); SALSA stream pool + trigger + epoch reset (§N); `ga_run_this_epoch` added to initial state dict; validator constraint filters (banned atoms, rotatable bonds) added to `_pharma_ok` (§P); multi-seed SALSA — top-3 seeds for broader chemical space coverage (§Q); MSA auto-fetch at startup via `ensure_msa` (§S) |
-| `boltz/wrapper.py` | Added `last_inference_duration` field populated after each `predict()` call (§G); pass `no_kernels`, `num_workers`, `preprocessing_threads` from config to `predict()` (§T) |
+| `boltz/wrapper.py` | Added `last_inference_duration` field populated after each `predict()` call (§G); pass `no_kernels`, `num_workers`, `preprocessing_threads` from config to `predict()` (§T); pass `use_potentials` from config (§U); pass `step_scale` from config (§V) |
+| `boltz/boltz_config.yaml` | Added `use_potentials: false` (§U); added `step_scale: null` (§V) |
 | `config/config.yaml` | Added `max_heavy_atoms: 35` |
 | `config/config_loader.py` | Loads and exposes `max_heavy_atoms` |
 | `utils/molecules.py` | Added `get_canonical_smiles()` |
