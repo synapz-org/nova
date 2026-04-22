@@ -892,6 +892,59 @@ try `step_scale: 1.2` to tighten the distribution.
 
 ---
 
+## Implemented Optimisations (continued)
+
+### X. Defensive Boltz wrapper — missing results, empty scores, MSA fallback (`boltz/wrapper.py`)
+
+Three crash paths eliminated from `BoltzWrapper`:
+
+**X.1 — Missing results directory** (`postprocess_data`):
+
+Previously, if Boltz-2 failed to write prediction files for a specific molecule (GPU OOM
+mid-batch, invalid YAML, upstream `predict()` partial failure), the call to
+`os.listdir(results_path)` would raise `FileNotFoundError` and propagate uncaught through
+`postprocess_data`, crashing the entire pre-scoring run and leaving `state['candidate_product']`
+at the raw PSICHIC ordering with no Boltz reorder.
+
+**Fix:** The `os.listdir` call is now wrapped in `try/except (FileNotFoundError, OSError)`.
+A failed molecule gets `scores[mol_idx] = {}` (empty dict) and a warning log. All other
+molecules in the batch continue to score normally.
+
+**X.2 — Empty scores → score assignment KeyError** (`postprocess_data`):
+
+If `scores[mol_idx]` is empty (from X.1 above, or if the results files contained no matching
+keys), the old code would call `self.combine_boltz_scores({}, smiles)`, which then tried
+`{}['affinity_probability_binary']` and raised `KeyError`.
+
+**Fix:** An explicit `if not mol_scores: final_score = -math.inf` guard precedes the
+score combination call. Also fixed the dead-code `else` branch (single-metric path) to use
+`mol_scores.get(metric_key, -math.inf)` instead of a bare `[]` index.
+
+**X.3 — combine_boltz_scores KeyError / ZeroDivisionError**:
+
+Added a `try/except (KeyError, TypeError, ZeroDivisionError)` around the entire
+`combine_boltz_scores` body. Catches (a) missing metric keys in the scores dict,
+(b) `None` values from a partially-parsed JSON file, and (c) zero `heavy_atom_count`
+from `get_heavy_atom_count` on a degenerate SMILES. All return `-math.inf`.
+
+**X.4 — MSA file missing → hard Boltz crash** (`create_yaml_content`):
+
+`create_yaml_content` previously always wrote `msa: /path/to/X.a3m` into the input YAML.
+If `ensure_msa` failed at startup (ColabFold timeout, network error), the `.a3m` file would
+not exist; Boltz-2 would crash on the non-existent path rather than falling back to
+single-sequence mode.
+
+**Fix:** The method now checks `os.path.exists(msa_path)` before including the `msa:` line.
+When the file is absent, the line is omitted entirely and a warning is logged. Boltz-2
+handles a missing `msa:` key by running in single-sequence mode — weaker predictions, but
+not a crash.
+
+**Net effect:** A GPU OOM on molecule N no longer aborts the entire Boltz pre-scoring loop.
+Molecules N+1 … M continue scoring, the anytime guarantee keeps the best-so-far at position 0,
+and the miner submits a meaningful result regardless.
+
+---
+
 ## Remaining Future Opportunities
 
 ### C. Multi-molecule entropy bonus
@@ -931,7 +984,7 @@ automatically after the first measured inference.
 | File | Change |
 |------|--------|
 | `neurons/miner.py` | Added `is_boltz_safe_smiles` + `max_heavy_atoms` filters; `run_boltz_prescoring()` with two-tier cache; Boltz trigger at 100 blocks (was 50); `boltz_score_cache` + `boltz_cache_db` state fields; `_init_boltz_cache_db`, `_disk_cache_get`, `_disk_cache_put` helpers; fixed `entropy_weight` → `entropy_start_weight` AttributeError; pharmacophore pre-filter (§F); adaptive trigger using `boltz_trigger_blocks` state field (§G); anytime incremental scoring — one molecule at a time with immediate reorder (§H); PSICHIC ligand-efficiency scoring — divide combined_score by heavy_atoms (§I); global candidate pool — top-20 across all epoch chunks for Boltz (§J); dynamic max_candidates from available epoch time + `boltz_time_per_mol` state (§K); epoch-end guard before each cache-miss Boltz inference (§L); `boltz_time_per_mol` persisted in state (§M); SALSA stream pool + trigger + epoch reset (§N); `ga_run_this_epoch` added to initial state dict; validator constraint filters (banned atoms, rotatable bonds) added to `_pharma_ok` (§P); multi-seed SALSA — top-3 seeds for broader chemical space coverage (§Q); MSA auto-fetch at startup via `ensure_msa` (§S) |
-| `boltz/wrapper.py` | Added `last_inference_duration` field populated after each `predict()` call (§G); pass `no_kernels`, `num_workers`, `preprocessing_threads` from config to `predict()` (§T); pass `use_potentials` from config (§U); pass `step_scale` from config (§V) |
+| `boltz/wrapper.py` | Added `last_inference_duration` field populated after each `predict()` call (§G); pass `no_kernels`, `num_workers`, `preprocessing_threads` from config to `predict()` (§T); pass `use_potentials` from config (§U); pass `step_scale` from config (§V); try/except around `os.listdir(results_path)` — missing directory → score=-inf instead of crash (§X.1); empty-scores guard + safe `mol_scores.get()` in score assignment (§X.2); try/except around entire `combine_boltz_scores` body (§X.3); `create_yaml_content` checks `os.path.exists(msa_path)` before including MSA line — absent file falls back to single-sequence mode gracefully (§X.4) |
 | `boltz/boltz_config.yaml` | Added `use_potentials: false` (§U); added `step_scale: null` (§V) |
 | `config/config.yaml` | Added `max_heavy_atoms: 35` |
 | `config/config_loader.py` | Loads and exposes `max_heavy_atoms` |

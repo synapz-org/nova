@@ -113,12 +113,22 @@ class BoltzWrapper:
     def create_yaml_content(self, ligand_smiles: str) -> str:
         """Create YAML content for Boltz2 prediction with no MSA"""
 
+        msa_path = os.path.join(self.base_dir, 'msa_files', self.subnet_config['weekly_target'] + '.a3m')
+        if os.path.exists(msa_path):
+            msa_line = f"        msa: {msa_path}"
+        else:
+            bt.logging.warning(
+                f"MSA file not found for {self.subnet_config['weekly_target']} "
+                f"at {msa_path} — running Boltz-2 in single-sequence mode."
+            )
+            msa_line = ""
+
         yaml_content = f"""version: 1
 sequences:
     - protein:
         id: A
         sequence: {self.protein_sequence}
-        msa: {os.path.join(self.base_dir, 'msa_files', self.subnet_config['weekly_target'] + '.a3m')}
+{msa_line}
     - ligand:
         id: B
         smiles: '{ligand_smiles}'
@@ -190,15 +200,21 @@ properties:
             results_path = os.path.join(self.output_dir, 'boltz_results_inputs', 'predictions', f'{mol_idx}')
             if mol_idx not in scores:
                 scores[mol_idx] = {}
-            for filepath in os.listdir(results_path):
-                if filepath.startswith('affinity'):
-                    with open(os.path.join(results_path, filepath), 'r') as f:
-                        affinity_data = json.load(f)
-                    scores[mol_idx].update(affinity_data)
-                elif filepath.startswith('confidence'):
-                    with open(os.path.join(results_path, filepath), 'r') as f:
-                        confidence_data = json.load(f)
-                    scores[mol_idx].update(confidence_data)
+            try:
+                for filepath in os.listdir(results_path):
+                    if filepath.startswith('affinity'):
+                        with open(os.path.join(results_path, filepath), 'r') as f:
+                            affinity_data = json.load(f)
+                        scores[mol_idx].update(affinity_data)
+                    elif filepath.startswith('confidence'):
+                        with open(os.path.join(results_path, filepath), 'r') as f:
+                            confidence_data = json.load(f)
+                        scores[mol_idx].update(confidence_data)
+            except (FileNotFoundError, OSError) as e:
+                bt.logging.warning(
+                    f"Boltz results missing for mol_idx={mol_idx} "
+                    f"(smiles={smiles[:60]}): {e} — score set to -inf"
+                )
         #bt.logging.debug(f"Collected scores: {scores}")
 
         if self.config['remove_files']:
@@ -217,17 +233,23 @@ properties:
                 if uid not in final_boltz_scores:
                     final_boltz_scores[uid] = []
 
-                if len(self.subnet_config['boltz_metric']) > 1:
-                    final_score = self.combine_boltz_scores(scores[mol_idx], smiles)
+                mol_scores = scores.get(mol_idx, {})
+                if not mol_scores:
+                    final_score = -math.inf
+                elif len(self.subnet_config['boltz_metric']) > 1:
+                    final_score = self.combine_boltz_scores(mol_scores, smiles)
                 else:
-                    final_score = scores[mol_idx][self.subnet_config['boltz_metric']]
+                    metric_key = self.subnet_config['boltz_metric']
+                    if isinstance(metric_key, list):
+                        metric_key = metric_key[0]
+                    final_score = mol_scores.get(metric_key, -math.inf)
 
                 final_boltz_scores[uid].append(final_score)
                 if uid not in self.per_molecule_metric:
                     self.per_molecule_metric[uid] = {}
                 self.per_molecule_metric[uid][smiles] = final_score
 
-                metrics = scores[mol_idx]
+                metrics = mol_scores
                 try:
                     affinity_probability_binary = metrics.get("affinity_probability_binary")
                     affinity_pred_value = metrics.get("affinity_pred_value")
@@ -303,13 +325,19 @@ properties:
                 data['boltz_score'] = -math.inf
 
     def combine_boltz_scores(self, scores: dict, smiles: str) -> float:
-        if self.subnet_config['combination_strategy'] == "average":
-            return np.mean([scores[metric] for metric in self.subnet_config['boltz_metric']])
-        elif self.subnet_config['combination_strategy'] == 'heavy_atom_normalization':
-            heavy_atom_count = get_heavy_atom_count(smiles)
-            normalized_score = (scores[self.subnet_config['boltz_metric'][0]] - scores[self.subnet_config['boltz_metric'][1]]) / heavy_atom_count
-            return normalized_score
-        else:
-            bt.logging.error(f"Invalid combination strategy: {self.subnet_config['combination_strategy']}")
+        try:
+            if self.subnet_config['combination_strategy'] == "average":
+                return float(np.mean([scores[metric] for metric in self.subnet_config['boltz_metric']]))
+            elif self.subnet_config['combination_strategy'] == 'heavy_atom_normalization':
+                heavy_atom_count = get_heavy_atom_count(smiles)
+                if not heavy_atom_count:
+                    return -math.inf
+                m0, m1 = self.subnet_config['boltz_metric'][0], self.subnet_config['boltz_metric'][1]
+                return (scores[m0] - scores[m1]) / heavy_atom_count
+            else:
+                bt.logging.error(f"Invalid combination strategy: {self.subnet_config['combination_strategy']}")
+                return -math.inf
+        except (KeyError, TypeError, ZeroDivisionError) as e:
+            bt.logging.warning(f"combine_boltz_scores failed ({e}) — returning -inf")
             return -math.inf
             
