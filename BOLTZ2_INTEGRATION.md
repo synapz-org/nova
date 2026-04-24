@@ -993,4 +993,42 @@ automatically after the first measured inference.
 | `utils/salsa.py` | New: SALSA algorithm — `generate_perturbations`, `nearest_pool_molecules`, `run_salsa_search` (§N); added `precompute_pool_fps` + optional `pool_fps` arg to `nearest_pool_molecules` (§R) |
 | `utils/genetic.py` | New: GradientGA — `brics_crossover`, `tournament_select`, `run_gradient_ga` (§O); pre-compute pool FPs + pass to `nearest_pool_molecules` (§R) |
 | `utils/msa.py` | New: MSA auto-fetch — `ensure_msa`, `fetch_msa`, `msa_exists` (§S) |
+| `neurons/miner.py` | Move `dataset_iter` creation inside the outer `while` loop (§Y) |
 | `BOLTZ2_INTEGRATION.md` | This file |
+
+---
+
+## Implemented Optimisations (continued)
+
+### Y. Dataset Iterator Refresh on Exhaustion (`neurons/miner.py`)
+
+**Problem:** `stream_random_chunk_from_dataset` was called once before the outer `while`
+loop in `run_psichic_model_loop`, creating a single HuggingFace streaming iterator tied
+to one randomly-chosen CSV file.  Once that file's batches were consumed, the inner
+`for chunk in dataset_iter` loop exited immediately on every subsequent outer-loop
+iteration, leaving the miner spinning on `await asyncio.sleep(2)` with no molecule
+exploration for the rest of the epoch.
+
+In practice SAVI-2020 files are large enough that exhaustion within a single ~72-minute
+epoch is unlikely, but the latent bug could silently degrade search throughput if a small
+file were selected or if epochs lengthen.
+
+**Fix:** Moved `dataset_iter` creation to the top of the `while` loop body so each cycle
+opens a fresh stream from a new randomly-chosen file:
+
+```python
+while not state['shutdown_event'].is_set():
+    dataset_iter = stream_random_chunk_from_dataset(
+        dataset_repo=state['hugging_face_dataset_repo'],
+        chunk_size=state['chunk_size'],
+    )
+    for chunk in dataset_iter:
+        ...
+```
+
+**Benefits:**
+- Prevents the spin-on-empty-iterator bug regardless of file size.
+- Explores a different region of the 283M-compound SAVI-2020 space on each outer cycle,
+  increasing chemical diversity for subsequent PSICHIC and Boltz-2 evaluations.
+- Zero overhead: the HuggingFace streaming client uses lazy loading; creating a new
+  iterator only issues an HTTP range request when the first batch is consumed.

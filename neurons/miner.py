@@ -298,13 +298,16 @@ async def run_psichic_model_loop(state: Dict[str, Any]) -> None:
             'last_submitted_product', 'shutdown_event', etc.
     """
     bt.logging.info("Starting PSICHIC model inference loop.")
-    dataset_iter = stream_random_chunk_from_dataset(
-        dataset_repo=state['hugging_face_dataset_repo'],
-        chunk_size=state['chunk_size']
-    )
 
     while not state['shutdown_event'].is_set():
         try:
+            # Create a fresh iterator each outer cycle so that when one streaming
+            # file is exhausted we immediately pick a new random file rather than
+            # spinning on an empty iterator.
+            dataset_iter = stream_random_chunk_from_dataset(
+                dataset_repo=state['hugging_face_dataset_repo'],
+                chunk_size=state['chunk_size']
+            )
             for chunk in dataset_iter:
                 if state['shutdown_event'].is_set():
                     break
