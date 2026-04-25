@@ -25,3 +25,26 @@ use_potentials: false
 # Set to null to use the library default.
 step_scale: null
 
+# MSA subsampling — controls how many sequences from the pre-computed .a3m file
+# are passed to the Boltz-2 model.  More sequences = richer evolutionary context
+# = better affinity predictions, at the cost of larger attention tensors and
+# slower inference.
+#
+# Library defaults: subsample_msa=true, num_subsampled_msa=1024, max_msa_seqs=8192
+#
+# Recommended tuning:
+#   RTX 3090 / RTX 4090 : keep num_subsampled_msa=1024 (memory-constrained)
+#   A100 80 GB           : try num_subsampled_msa=2048 for ~5-10% better affinity
+#   H100                 : try num_subsampled_msa=4096
+#
+# Set subsample_msa: false to use the full MSA (rarely beneficial — most MSAs
+# contain thousands of sequences that overwhelm GPU memory).
+subsample_msa: true
+num_subsampled_msa: 1024
+
+# I/O parallelism for data loading and preprocessing.
+# Increase on machines with many CPU cores and fast NVMe storage.
+# Reduce to 1/1 if PSICHIC and Boltz share CPU workers and cause contention.
+num_workers: 2
+preprocessing_threads: 4
+

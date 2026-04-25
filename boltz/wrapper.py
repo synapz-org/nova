@@ -179,6 +179,8 @@ properties:
                 preprocessing_threads = self.config.get('preprocessing_threads', 4),
                 use_potentials = self.config.get('use_potentials', False),
                 step_scale = self.config.get('step_scale', None),
+                subsample_msa = self.config.get('subsample_msa', True),
+                num_subsampled_msa = self.config.get('num_subsampled_msa', 1024),
             )
             self.last_inference_duration = time.time() - _t0
             bt.logging.info(f"Boltz2 predictions complete in {self.last_inference_duration:.1f}s")

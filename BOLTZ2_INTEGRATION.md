@@ -945,6 +945,54 @@ and the miner submits a meaningful result regardless.
 
 ---
 
+## Implemented Optimisations (continued)
+
+### Z. MSA Subsampling Control (`boltz/wrapper.py`, `boltz/boltz_config.yaml`)
+
+**Background:** Boltz-2 uses a Multiple Sequence Alignment to provide evolutionary context during
+inference.  The `predict()` function exposes two subsampling knobs that were not previously
+forwarded from config:
+
+| Parameter | Library default | Effect |
+|-----------|----------------|--------|
+| `subsample_msa` | `true` | Whether to subsample the MSA at all |
+| `num_subsampled_msa` | `1024` | How many sequences to keep from the full MSA |
+
+These parameters are passed at data-loading time and affect both the structure and affinity
+prediction passes — increasing `num_subsampled_msa` gives the model richer evolutionary
+context, which correlates with more accurate affinity predictions.
+
+**Fix:** Both parameters now forwarded from `boltz_config.yaml` to `predict()`:
+
+```python
+subsample_msa = self.config.get('subsample_msa', True),
+num_subsampled_msa = self.config.get('num_subsampled_msa', 1024),
+```
+
+The `boltz_config.yaml` defaults are unchanged (`subsample_msa: true`, `num_subsampled_msa: 1024`),
+so existing deployments are unaffected.
+
+**Recommended tuning:**
+
+| Hardware | `num_subsampled_msa` | Expected Δ inference time |
+|----------|----------------------|--------------------------|
+| RTX 3090 / 4090 | 1024 (default) | baseline |
+| A100 80 GB | 2048 | ~+15% |
+| H100 80 GB | 4096 | ~+30% |
+
+On A100 with the adaptive trigger (§G), the extra ~20s per molecule from 2048 sequences
+is automatically compensated: `boltz_trigger_blocks` updates to fire earlier, preserving the
+same total number of candidates scored per epoch.
+
+**Also exposed explicitly:**
+- `num_workers` (default 2) — data-loader worker threads
+- `preprocessing_threads` (default 4) — YAML preprocessing parallelism
+
+These were already forwarded via `self.config.get()` but not listed in `boltz_config.yaml`,
+making them invisible to miners who wanted to tune them.
+
+---
+
 ## Remaining Future Opportunities
 
 ### C. Multi-molecule entropy bonus
@@ -984,8 +1032,8 @@ automatically after the first measured inference.
 | File | Change |
 |------|--------|
 | `neurons/miner.py` | Added `is_boltz_safe_smiles` + `max_heavy_atoms` filters; `run_boltz_prescoring()` with two-tier cache; Boltz trigger at 100 blocks (was 50); `boltz_score_cache` + `boltz_cache_db` state fields; `_init_boltz_cache_db`, `_disk_cache_get`, `_disk_cache_put` helpers; fixed `entropy_weight` → `entropy_start_weight` AttributeError; pharmacophore pre-filter (§F); adaptive trigger using `boltz_trigger_blocks` state field (§G); anytime incremental scoring — one molecule at a time with immediate reorder (§H); PSICHIC ligand-efficiency scoring — divide combined_score by heavy_atoms (§I); global candidate pool — top-20 across all epoch chunks for Boltz (§J); dynamic max_candidates from available epoch time + `boltz_time_per_mol` state (§K); epoch-end guard before each cache-miss Boltz inference (§L); `boltz_time_per_mol` persisted in state (§M); SALSA stream pool + trigger + epoch reset (§N); `ga_run_this_epoch` added to initial state dict; validator constraint filters (banned atoms, rotatable bonds) added to `_pharma_ok` (§P); multi-seed SALSA — top-3 seeds for broader chemical space coverage (§Q); MSA auto-fetch at startup via `ensure_msa` (§S) |
-| `boltz/wrapper.py` | Added `last_inference_duration` field populated after each `predict()` call (§G); pass `no_kernels`, `num_workers`, `preprocessing_threads` from config to `predict()` (§T); pass `use_potentials` from config (§U); pass `step_scale` from config (§V); try/except around `os.listdir(results_path)` — missing directory → score=-inf instead of crash (§X.1); empty-scores guard + safe `mol_scores.get()` in score assignment (§X.2); try/except around entire `combine_boltz_scores` body (§X.3); `create_yaml_content` checks `os.path.exists(msa_path)` before including MSA line — absent file falls back to single-sequence mode gracefully (§X.4) |
-| `boltz/boltz_config.yaml` | Added `use_potentials: false` (§U); added `step_scale: null` (§V) |
+| `boltz/wrapper.py` | Added `last_inference_duration` field populated after each `predict()` call (§G); pass `no_kernels`, `num_workers`, `preprocessing_threads` from config to `predict()` (§T); pass `use_potentials` from config (§U); pass `step_scale` from config (§V); try/except around `os.listdir(results_path)` — missing directory → score=-inf instead of crash (§X.1); empty-scores guard + safe `mol_scores.get()` in score assignment (§X.2); try/except around entire `combine_boltz_scores` body (§X.3); `create_yaml_content` checks `os.path.exists(msa_path)` before including MSA line — absent file falls back to single-sequence mode gracefully (§X.4); forward `subsample_msa` and `num_subsampled_msa` from config to `predict()` (§Z) |
+| `boltz/boltz_config.yaml` | Added `use_potentials: false` (§U); added `step_scale: null` (§V); added `subsample_msa`, `num_subsampled_msa`, `num_workers`, `preprocessing_threads` with defaults (§Z) |
 | `config/config.yaml` | Added `max_heavy_atoms: 35` |
 | `config/config_loader.py` | Loads and exposes `max_heavy_atoms` |
 | `utils/molecules.py` | Added `get_canonical_smiles()` |
