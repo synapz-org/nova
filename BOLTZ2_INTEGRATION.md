@@ -993,6 +993,61 @@ making them invisible to miners who wanted to tune them.
 
 ---
 
+## Implemented Optimisations (continued)
+
+### AA. Warm Epoch Start from Disk Cache (`neurons/miner.py`)
+
+**Problem:** At every epoch boundary `candidate_product` was reset to `None`. The miner had
+nothing valid to submit until PSICHIC streaming processed enough chunks to find a candidate
+— typically 5–15 minutes into the epoch. If the miner restarted with only 10 blocks remaining,
+it would submit nothing at all for that epoch.
+
+**Fix:** The disk cache schema is extended with a `product_name TEXT` column. Whenever a
+molecule is scored by Boltz-2 during `run_boltz_prescoring`, its SAVI-2020 `product_name` is
+stored alongside the SMILES and score:
+
+```python
+_pname = row.get('product_name')
+if not isinstance(_pname, str):
+    _pname = None
+_disk_cache_put(db_path, canon, protein, score, product_name=_pname)
+```
+
+Two new helpers query the cache:
+
+| Function | Purpose |
+|----------|---------|
+| `_disk_cache_get_best(db_path, protein)` | Returns `(score, smiles, product_name)` for the highest-scoring cached entry with a non-NULL product_name |
+| `_apply_warm_start(state, db_path, protein)` | Calls `_disk_cache_get_best`; sets `state['candidate_product']` if a hit is found |
+
+`_apply_warm_start` is called in two places:
+1. **Miner startup** — immediately after `_cleanup_boltz_cache`.
+2. **Each epoch boundary** — after the epoch state reset.
+
+**Guarantee:** From block 1 of every epoch after the first, the miner has a Boltz-validated
+molecule at `candidate_product[0]`. If PSICHIC streaming subsequently finds a batch with a
+higher entropy-weighted PSICHIC score, it replaces `candidate_product` automatically (because
+`best_score` remains `−∞` for the warm-start molecule, so any positive PSICHIC result wins).
+If streaming is slow or the miner restarts late, the cached molecule is submitted.
+
+**Schema migration:** `_init_boltz_cache_db` now issues `ALTER TABLE boltz_cache ADD COLUMN
+product_name TEXT` after the `CREATE TABLE IF NOT EXISTS` statement. SQLite raises
+`OperationalError` if the column already exists; this is caught silently, making the migration
+backward-compatible with existing cache databases that predate §AA.
+
+**Interaction with Boltz prescoring trigger:** `candidate_product` being non-None from epoch
+start causes the Boltz trigger to evaluate at `blocks_until_epoch ≤ boltz_trigger_blocks`.
+If `global_candidate_pool` is still empty at that point (streaming not yet run), Boltz
+prescoring returns immediately with a warning. The prescoring flag `boltz_prescored` is then
+reset when PSICHIC finds its first new best, allowing a second Boltz pass on genuine PSICHIC
+candidates — no regression vs. the pre-§AA behaviour.
+
+**Files changed:**
+- `neurons/miner.py` — `_init_boltz_cache_db` (ALTER TABLE); `_disk_cache_put` (product_name
+  arg); new `_disk_cache_get_best`; new `_apply_warm_start`; two call sites in `run_miner()`
+
+---
+
 ## Remaining Future Opportunities
 
 ### C. Multi-molecule entropy bonus
@@ -1042,6 +1097,7 @@ automatically after the first measured inference.
 | `utils/genetic.py` | New: GradientGA — `brics_crossover`, `tournament_select`, `run_gradient_ga` (§O); pre-compute pool FPs + pass to `nearest_pool_molecules` (§R) |
 | `utils/msa.py` | New: MSA auto-fetch — `ensure_msa`, `fetch_msa`, `msa_exists` (§S) |
 | `neurons/miner.py` | Move `dataset_iter` creation inside the outer `while` loop (§Y) |
+| `neurons/miner.py` | Extend disk cache schema with `product_name`; add `_disk_cache_get_best`, `_apply_warm_start`; call warm-start at startup + each epoch boundary (§AA) |
 | `BOLTZ2_INTEGRATION.md` | This file |
 
 ---

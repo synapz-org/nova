@@ -63,6 +63,12 @@ def _init_boltz_cache_db(db_path: str) -> None:
                 PRIMARY KEY (smiles, protein)
             )
         """)
+        # Add product_name column when upgrading from older schema that lacked it.
+        # SQLite raises OperationalError if the column already exists; we swallow it.
+        try:
+            conn.execute("ALTER TABLE boltz_cache ADD COLUMN product_name TEXT")
+        except Exception:
+            pass
 
 
 def _disk_cache_get(db_path: str, smiles: str, protein: str) -> Optional[float]:
@@ -78,13 +84,13 @@ def _disk_cache_get(db_path: str, smiles: str, protein: str) -> Optional[float]:
         return None
 
 
-def _disk_cache_put(db_path: str, smiles: str, protein: str, score: float) -> None:
+def _disk_cache_put(db_path: str, smiles: str, protein: str, score: float, product_name: Optional[str] = None) -> None:
     """Upsert a Boltz score into the persistent cache (silently ignores errors)."""
     try:
         with sqlite3.connect(db_path) as conn:
             conn.execute(
-                "INSERT OR REPLACE INTO boltz_cache (smiles, protein, score) VALUES (?,?,?)",
-                (smiles, protein, score),
+                "INSERT OR REPLACE INTO boltz_cache (smiles, protein, score, product_name) VALUES (?,?,?,?)",
+                (smiles, protein, score, product_name),
             )
     except Exception:
         pass
@@ -112,6 +118,53 @@ def _cleanup_boltz_cache(db_path: str, keep_protein: str, max_age_days: int = 14
             bt.logging.info(f"Boltz cache cleanup: removed {deleted} stale entries (non-{keep_protein} or >{max_age_days}d old).")
     except Exception:
         pass
+
+
+def _disk_cache_get_best(db_path: str, protein: str) -> Optional[Tuple[float, str, str]]:
+    """
+    Return (score, smiles, product_name) for the highest-scoring cached entry for
+    *protein* that has a submittable product_name (non-NULL).
+
+    Used by _apply_warm_start to seed candidate_product at epoch start.
+    Returns None on cache miss or error.
+    """
+    try:
+        with sqlite3.connect(db_path) as conn:
+            row = conn.execute(
+                "SELECT score, smiles, product_name FROM boltz_cache "
+                "WHERE protein=? AND product_name IS NOT NULL "
+                "ORDER BY score DESC LIMIT 1",
+                (protein,),
+            ).fetchone()
+        if row:
+            return float(row[0]), str(row[1]), str(row[2])
+        return None
+    except Exception:
+        return None
+
+
+def _apply_warm_start(state: Dict[str, Any], db_path: str, protein: str) -> None:
+    """
+    Pre-populate state['candidate_product'] from the best Boltz-scored molecule
+    stored in the disk cache for *protein*.
+
+    Called at epoch start so the miner has a valid fallback submission from
+    block 1 — before PSICHIC streaming has had time to find new candidates.
+
+    Does not set best_score (left at -inf), so the first valid PSICHIC result
+    supersedes this molecule automatically within the first few minutes of streaming.
+    On epoch 2+ this guarantees we always have something Boltz-validated to submit
+    even if streaming is slow or the miner restarts late in an epoch.
+    """
+    best = _disk_cache_get_best(db_path, protein)
+    if best is None:
+        return
+    score, smiles, product_name = best
+    state['candidate_product'] = product_name
+    bt.logging.info(
+        f"[WarmStart] Seeded candidate_product from disk cache: "
+        f"{product_name} (boltz_score={score:.4f}, target={protein})"
+    )
 
 
 # ----------------------------------------------------------------------------
@@ -865,9 +918,12 @@ async def run_boltz_prescoring(state: Dict[str, Any], max_candidates: int = 5) -
                     mol_scores = wrapper.per_molecule_metric.get(uid, {})
                     score = mol_scores.get(smiles, -math.inf)
 
-                    # Persist to both cache layers
+                    # Persist to both cache layers (product_name enables warm-start §AA)
                     boltz_cache[key] = score
-                    _disk_cache_put(db_path, canon, protein, score)
+                    _pname = row.get('product_name')
+                    if not isinstance(_pname, str):
+                        _pname = None
+                    _disk_cache_put(db_path, canon, protein, score, product_name=_pname)
 
                     # Adaptive trigger: one molecule gives the most accurate per-mol timing
                     elapsed = wrapper.last_inference_duration
@@ -971,6 +1027,11 @@ async def run_miner(config: argparse.Namespace) -> None:
     _init_boltz_cache_db(state['boltz_cache_db'])
     _cleanup_boltz_cache(state['boltz_cache_db'], keep_protein=config.weekly_target)
     bt.logging.info(f"Boltz persistent cache initialised: {state['boltz_cache_db']}")
+
+    # Warm epoch start (§AA): pre-populate candidate_product from best cached result.
+    # On first run the cache is empty; on subsequent runs this gives an immediate
+    # fallback submission before PSICHIC streaming finds new candidates.
+    _apply_warm_start(state, state['boltz_cache_db'], config.weekly_target)
 
     # Ensure MSA file exists for the current weekly target (§S).
     # Boltz-2 predictions are significantly weaker without an MSA — this call
@@ -1110,6 +1171,11 @@ async def run_miner(config: argparse.Namespace) -> None:
                 state['boltz_prescored'] = False
                 state['last_submitted_product'] = None
                 state['shutdown_event'] = asyncio.Event()
+
+                # Warm-start (§AA): seed candidate_product from disk cache so
+                # there is always a valid Boltz-validated submission available
+                # even before PSICHIC streaming produces new candidates.
+                _apply_warm_start(state, state['boltz_cache_db'], config.weekly_target)
 
                 # Initialize models for new proteins
                 try:
