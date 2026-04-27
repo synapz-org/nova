@@ -352,6 +352,29 @@ async def run_psichic_model_loop(state: Dict[str, Any]) -> None:
     """
     bt.logging.info("Starting PSICHIC model inference loop.")
 
+    # Defined once here so we don't recreate the closure on every chunk iteration.
+    # Reads state['config'] on each call — picks up any live config changes correctly.
+    def _pharma_ok(smiles: str) -> bool:
+        mol = Chem.MolFromSmiles(smiles)
+        if mol is None:
+            return False
+        # Validator-enforced: banned atom types (e.g. Se)
+        _banned = getattr(state['config'], 'banned_atom_types', [])
+        if _banned and any(a.GetSymbol() in _banned for a in mol.GetAtoms()):
+            return False
+        # Validator-enforced: rotatable bond bounds
+        _rot = Descriptors.NumRotatableBonds(mol)
+        _min_rb = getattr(state['config'], 'min_rotatable_bonds', 1)
+        _max_rb = getattr(state['config'], 'max_rotatable_bonds', None)
+        if _rot < _min_rb or (_max_rb is not None and _rot > _max_rb):
+            return False
+        # Lipinski-inspired drug-likeness (fast heuristic filter)
+        return (
+            1 <= Descriptors.NumHDonors(mol) <= 3
+            and 2 <= Descriptors.NumHAcceptors(mol) <= 7
+            and 0.0 <= Descriptors.MolLogP(mol) <= 4.5
+        )
+
     while not state['shutdown_event'].is_set():
         try:
             # Create a fresh iterator each outer cycle so that when one streaming
@@ -385,30 +408,7 @@ async def run_psichic_model_loop(state: Dict[str, Any]) -> None:
                     continue
 
                 # Combined pre-filter: validator constraints + Lipinski drug-likeness.
-                # Applied before PSICHIC to skip molecules the validator would reject
-                # (banned atoms, rotatable bond bounds) and molecules unlikely to bind
-                # (extreme logP, insufficient H-bond capacity).
-                # All checks share a single RDKit mol parse per SMILES.
-                def _pharma_ok(smiles: str) -> bool:
-                    mol = Chem.MolFromSmiles(smiles)
-                    if mol is None:
-                        return False
-                    # Validator-enforced: banned atom types (e.g. Se)
-                    _banned = getattr(state['config'], 'banned_atom_types', [])
-                    if _banned and any(a.GetSymbol() in _banned for a in mol.GetAtoms()):
-                        return False
-                    # Validator-enforced: rotatable bond bounds
-                    _rot = Descriptors.NumRotatableBonds(mol)
-                    _min_rb = getattr(state['config'], 'min_rotatable_bonds', 1)
-                    _max_rb = getattr(state['config'], 'max_rotatable_bonds', None)
-                    if _rot < _min_rb or (_max_rb is not None and _rot > _max_rb):
-                        return False
-                    # Lipinski-inspired drug-likeness (fast heuristic filter)
-                    return (
-                        1 <= Descriptors.NumHDonors(mol) <= 3
-                        and 2 <= Descriptors.NumHAcceptors(mol) <= 7
-                        and 0.0 <= Descriptors.MolLogP(mol) <= 4.5
-                    )
+                # _pharma_ok is defined once at function entry (above the while loop).
                 df = df[df['product_smiles'].apply(_pharma_ok)]
                 if df.empty or len(df) < state['config'].num_molecules:
                     continue
@@ -451,7 +451,11 @@ async def run_psichic_model_loop(state: Dict[str, Any]) -> None:
 
                 # Calculate average scores
                 df['target_affinity'] = pd.DataFrame(target_scores).mean(axis=0)
-                df['antitarget_affinity'] = pd.DataFrame(antitarget_scores).mean(axis=0)
+                # Guard: if no antitargets are configured, default penalty to 0.
+                df['antitarget_affinity'] = (
+                    pd.DataFrame(antitarget_scores).mean(axis=0)
+                    if antitarget_scores else 0.0
+                )
                 # Ligand-efficiency scoring: divide by heavy atom count so the PSICHIC
                 # pre-filter uses the same per-atom normalisation as the Boltz-2 scoring
                 # formula (affinity_probability_binary - affinity_pred_value) / heavy_atoms.
@@ -848,7 +852,7 @@ async def run_boltz_prescoring(state: Dict[str, Any], max_candidates: int = 5) -
 
     def _reorder_submission(scores: Dict[str, float]) -> None:
         """Put the best Boltz-scored molecule first in state['candidate_product']."""
-        valid = {s: v for s, v in scores.items() if v != -math.inf}
+        valid = {s: v for s, v in scores.items() if math.isfinite(v)}
         if not valid:
             return
         best_smiles = max(valid, key=valid.get)
