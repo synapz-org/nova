@@ -368,11 +368,13 @@ async def run_psichic_model_loop(state: Dict[str, Any]) -> None:
         _max_rb = getattr(state['config'], 'max_rotatable_bonds', None)
         if _rot < _min_rb or (_max_rb is not None and _rot > _max_rb):
             return False
-        # Lipinski-inspired drug-likeness (fast heuristic filter)
+        # Lipinski-inspired drug-likeness (fast heuristic filter).
+        # HBD minimum is 0 — aromatic scaffolds with no NH/OH groups (e.g.
+        # N-alkylated heterocycles) are valid binders and must not be excluded.
         return (
-            1 <= Descriptors.NumHDonors(mol) <= 3
-            and 2 <= Descriptors.NumHAcceptors(mol) <= 7
-            and 0.0 <= Descriptors.MolLogP(mol) <= 4.5
+            Descriptors.NumHDonors(mol) <= 5
+            and 2 <= Descriptors.NumHAcceptors(mol) <= 10
+            and -1.0 <= Descriptors.MolLogP(mol) <= 5.0
         )
 
     while not state['shutdown_event'].is_set():

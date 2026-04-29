@@ -1098,7 +1098,46 @@ automatically after the first measured inference.
 | `utils/msa.py` | New: MSA auto-fetch — `ensure_msa`, `fetch_msa`, `msa_exists` (§S) |
 | `neurons/miner.py` | Move `dataset_iter` creation inside the outer `while` loop (§Y) |
 | `neurons/miner.py` | Extend disk cache schema with `product_name`; add `_disk_cache_get_best`, `_apply_warm_start`; call warm-start at startup + each epoch boundary (§AA) |
+| `neurons/miner.py` | Broader pharmacophore pre-filter: drop HBD minimum, raise HBA/logP ceilings to Lipinski Ro5 (§AB) |
 | `BOLTZ2_INTEGRATION.md` | This file |
+
+---
+
+## Implemented Optimisations (continued)
+
+### AB. Broader Pharmacophore Pre-filter (`neurons/miner.py`)
+
+**Problem:** The `_pharma_ok` filter previously required `NumHDonors >= 1`, which silently excluded
+entire drug scaffold classes with no NH/OH groups — N-alkylated heterocycles, pyrimidines with
+N-methyl substitution, and many aromatic kinase-inhibitor cores.  These molecules can bind strongly
+via their H-bond acceptor N/O atoms interacting with protein donors, and the Boltz-2 scoring formula
+has no intrinsic bias toward or against them.  By filtering them out before PSICHIC, we shrank the
+searchable chemical space unnecessarily.
+
+The old upper bounds (`NumHAcceptors <= 7`, `MolLogP <= 4.5`) were also tighter than the standard
+Lipinski Rule of 5, cutting out legitimate polar binders (HBA 8–10) and mild-logP compounds (4.5–5).
+
+**Fix:** Aligned with Lipinski Rule of 5:
+
+```python
+# Old (too restrictive)
+1 <= Descriptors.NumHDonors(mol) <= 3
+and 2 <= Descriptors.NumHAcceptors(mol) <= 7
+and 0.0 <= Descriptors.MolLogP(mol) <= 4.5
+
+# New (Lipinski-aligned)
+Descriptors.NumHDonors(mol) <= 5            # minimum removed; Ro5 max = 5
+and 2 <= Descriptors.NumHAcceptors(mol) <= 10  # Ro5 max = 10 (was 7)
+and -1.0 <= Descriptors.MolLogP(mol) <= 5.0   # allow mild polar + mild lipo
+```
+
+**Validator constraints enforced earlier in `_pharma_ok` are unchanged** (banned atom types,
+rotatable bond bounds). The only change is in the drug-likeness heuristic block.
+
+**Expected effect:** ~5–15% more molecules pass `_pharma_ok` per chunk (depends on SAVI-2020 file).
+The additional molecules all pass the validator's hard constraints (Se ban, rotatable bonds) and are
+within Lipinski space — so they're legitimate drug candidates the previous filter was wrongly
+excluding. Given PSICHIC inference is batched, the throughput impact is negligible.
 
 ---
 
