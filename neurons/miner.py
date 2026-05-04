@@ -491,18 +491,25 @@ async def run_psichic_model_loop(state: Dict[str, Any]) -> None:
                     state['global_candidate_pool'] = combined_pool.head(20).reset_index(drop=True)
 
                 # ---------------------------------------------------------------
-                # SAVI stream pool: accumulates ALL PSICHIC-scored molecules seen
-                # this epoch (capped at 5000).  Used by SALSA as the nearest-
-                # neighbour search space so its hits are guaranteed valid product
-                # names.  The full df (post-filter, post-score) is appended so
-                # every entry has a valid combined_score for ranking.
+                # SAVI stream pool: accumulates the top-5000 PSICHIC-scored
+                # molecules seen this epoch, sorted by combined_score.
+                # Keeping the highest-quality molecules (rather than the first
+                # seen) ensures SALSA/GA nearest-neighbor search operates on the
+                # best chemical space available at trigger time.
+                # Once both SALSA and GA have fired (salsa_run_this_epoch AND
+                # ga_run_this_epoch), the pool is no longer read — skip the
+                # concat/sort to save CPU for the remaining streaming window.
                 # ---------------------------------------------------------------
-                if state.get('savi_stream_pool') is None or state['savi_stream_pool'].empty:
-                    state['savi_stream_pool'] = df.copy()
-                else:
-                    state['savi_stream_pool'] = pd.concat(
-                        [state['savi_stream_pool'], df], ignore_index=True
-                    ).drop_duplicates(subset=['product_name']).head(5000)
+                if not (state.get('salsa_run_this_epoch') and state.get('ga_run_this_epoch')):
+                    if state.get('savi_stream_pool') is None or state['savi_stream_pool'].empty:
+                        state['savi_stream_pool'] = df.copy()
+                    else:
+                        _pool_combined = pd.concat(
+                            [state['savi_stream_pool'], df], ignore_index=True
+                        )
+                        _pool_combined.drop_duplicates(subset=['product_name'], inplace=True)
+                        _pool_combined.sort_values('combined_score', ascending=False, inplace=True)
+                        state['savi_stream_pool'] = _pool_combined.head(5000).reset_index(drop=True)
 
                 if not top_molecules.empty:
                     entropy = compute_maccs_entropy(top_molecules['product_smiles'].tolist())

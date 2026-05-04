@@ -1082,6 +1082,58 @@ automatically after the first measured inference.
 
 ---
 
+## Implemented Optimisations (continued)
+
+### BB. Quality-first SAVI Stream Pool (`neurons/miner.py`)
+
+**Problem:** `savi_stream_pool` previously kept the **first** 5000 unique molecules
+added during the epoch (insertion order).  After the pool filled up, later streaming
+chunks were silently discarded even if they contained higher-PSICHIC-scoring molecules.
+SALSA and GradientGA therefore searched a pool biased toward the chemistry found at the
+*start* of each epoch (a random SAVI-2020 CSV file), not the best chemistry found across
+all chunks.
+
+There was also wasted CPU: every streaming chunk continued to run `pd.concat +
+drop_duplicates` against the pool even after both SALSA and GA had already fired and
+the pool was no longer read by any algorithm.
+
+**Fix:** Two changes to the pool management block in `run_psichic_model_loop`:
+
+1. **Sort by `combined_score`, keep top-5000** (quality-first cap):
+   ```python
+   _pool_combined = pd.concat([state['savi_stream_pool'], df], ignore_index=True)
+   _pool_combined.drop_duplicates(subset=['product_name'], inplace=True)
+   _pool_combined.sort_values('combined_score', ascending=False, inplace=True)
+   state['savi_stream_pool'] = _pool_combined.head(5000).reset_index(drop=True)
+   ```
+   After the pool reaches capacity (5000 molecules), new chunks can still displace
+   low-scoring early entries when their `combined_score` is higher.  The pool always
+   represents the 5000 best molecules seen so far this epoch.
+
+2. **Skip update after SALSA + GA have both run:**
+   ```python
+   if not (state.get('salsa_run_this_epoch') and state.get('ga_run_this_epoch')):
+       # ... update pool ...
+   ```
+   Once `salsa_run_this_epoch` and `ga_run_this_epoch` are both `True`, no remaining
+   code path reads `savi_stream_pool`.  The guard eliminates a `pd.concat + sort` call
+   on a 5000-row DataFrame for every subsequent chunk (~30 chunks/min × up to 60 min =
+   ~1800 skipped operations).
+
+**Expected benefit for SALSA/GA search quality:**
+When SALSA fires at the `≥500-molecule` threshold, those 500 molecules are now the
+500 highest-PSICHIC-scoring molecules found so far, not the first 500 from a random
+streaming file.  SALSA's nearest-neighbour search therefore maps bioisosteric
+perturbations onto higher-efficiency scaffolds, improving the quality of candidates
+added to `global_candidate_pool` before Boltz-2 scoring.
+
+**Zero regression risk:** The sort order of `savi_stream_pool` is only used inside
+SALSA and GA (which extract the best `score_col` row as the hill-climbing seed and
+return pool rows ranked by `combined_score`).  The guard condition is strictly
+conservative — `savi_stream_pool` is only skipped after both flags are set.
+
+---
+
 ## Files Changed
 
 | File | Change |
@@ -1097,6 +1149,7 @@ automatically after the first measured inference.
 | `utils/genetic.py` | New: GradientGA — `brics_crossover`, `tournament_select`, `run_gradient_ga` (§O); pre-compute pool FPs + pass to `nearest_pool_molecules` (§R) |
 | `utils/msa.py` | New: MSA auto-fetch — `ensure_msa`, `fetch_msa`, `msa_exists` (§S) |
 | `neurons/miner.py` | Move `dataset_iter` creation inside the outer `while` loop (§Y) |
+| `neurons/miner.py` | Quality-first savi_stream_pool: sort by combined_score + skip after SALSA+GA done (§BB) |
 | `neurons/miner.py` | Extend disk cache schema with `product_name`; add `_disk_cache_get_best`, `_apply_warm_start`; call warm-start at startup + each epoch boundary (§AA) |
 | `neurons/miner.py` | Broader pharmacophore pre-filter: drop HBD minimum, raise HBA/logP ceilings to Lipinski Ro5 (§AB) |
 | `BOLTZ2_INTEGRATION.md` | This file |
