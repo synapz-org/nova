@@ -966,6 +966,44 @@ async def run_boltz_prescoring(state: Dict[str, Any], max_candidates: int = 5) -
         f"{len(valid_scores)}/{len(candidates)} molecules scored."
     )
 
+    # Warm-start guard (§CC): after reordering by this epoch's Boltz scores,
+    # check whether the best molecule in the persistent disk cache beats the
+    # best new score.  This covers the scenario where the warm-start molecule
+    # (scored in a prior session) was evicted from global_candidate_pool when
+    # PSICHIC reset the pool at epoch start, so it never appeared in
+    # `candidates` above — but its cached Boltz score is still valid and may
+    # be higher than anything found this epoch.
+    best_new = max((v for v in all_scores.values() if math.isfinite(v)), default=-math.inf)
+    _ws_best = _disk_cache_get_best(db_path, protein)
+    if (
+        _ws_best is not None
+        and state.get('candidate_product')
+    ):
+        _ws_score, _ws_smiles, _ws_pname = _ws_best
+        # Only act if the cached molecule is not already in all_scores (i.e.
+        # it was NOT evaluated during this run and thus not handled by
+        # _reorder_submission above).
+        _already_scored = any(
+            get_canonical_smiles(s) == get_canonical_smiles(_ws_smiles)
+            for s in all_scores
+        )
+        if (
+            not _already_scored
+            and math.isfinite(_ws_score)
+            and _ws_score > best_new
+            and _ws_pname
+        ):
+            _orig = state['candidate_product'].split(',')
+            if _ws_pname in _orig:
+                _reordered = [_ws_pname] + [n for n in _orig if n != _ws_pname]
+            else:
+                _reordered = [_ws_pname] + _orig
+            state['candidate_product'] = ','.join(_reordered)
+            bt.logging.info(
+                f"[WarmGuard] Prior-session molecule retained at position 0: "
+                f"{_ws_pname} (cached={_ws_score:.4f} > epoch_best={best_new:.4f})"
+            )
+
 
 # ----------------------------------------------------------------------------
 # 6. MAIN MINING LOOP

@@ -1048,6 +1048,64 @@ candidates — no regression vs. the pre-§AA behaviour.
 
 ---
 
+## Implemented Optimisations (continued)
+
+### CC. Warm-Start Guard — Retain Cached Best When It Beats Epoch Boltz Run (`neurons/miner.py`)
+
+**Problem:** The warm-start mechanism (§AA) seeds `state['candidate_product']` at epoch start from
+the disk cache's best Boltz-scored molecule for the current protein.  This is the fallback
+submission before PSICHIC streaming finds new candidates.
+
+However, once PSICHIC processes its first batch, it replaces `state['candidate_product']` entirely
+with the new PSICHIC top-10, and `state['global_candidate_pool']` is seeded fresh from those
+batches.  The warm-start molecule is no longer in the pool and is therefore **not evaluated by
+`run_boltz_prescoring`** later in the epoch.
+
+`_reorder_submission` only promotes molecules it has scored in the current run.  If the warm-start
+molecule's prior-session Boltz score (e.g., 0.42) is higher than all scores from the current run
+(e.g., best 0.31), the submission incorrectly puts a worse molecule at position 0.
+
+**Example:**
+```
+Epoch N−1: molecule A → Boltz 0.42 → stored in disk cache
+Epoch N:
+  _apply_warm_start  → candidate_product = "product_A"
+  PSICHIC streaming  → candidate_product = "product_B, product_C, ..."  (warm-start evicted)
+  Boltz run on pool  → B=0.31, C=0.28
+  _reorder_submission → product_B at position 0   ← BUG: product_A (0.42) was better
+```
+
+**Fix:** At the end of `run_boltz_prescoring`, after all candidates have been scored and
+`_reorder_submission` has placed the best new molecule at position 0:
+
+```python
+best_new = max(v for v in all_scores.values() if isfinite(v), default=-inf)
+ws_best = _disk_cache_get_best(db_path, protein)
+if ws_best and ws_best.score > best_new and ws_smiles not in all_scores:
+    # Cached molecule was not evaluated this run but is known to be better.
+    # Prepend (or move) its product_name to position 0.
+    state['candidate_product'] = ws_pname + ',' + rest_of_current_submission
+```
+
+**Conditions checked:**
+- `_ws_score > best_new` — cached molecule is demonstrably better
+- `not _already_scored` — molecule was not re-evaluated this run (avoids interfering with
+  `_reorder_submission`, which already handles molecules that were in the current pool)
+- `math.isfinite(_ws_score)` — guards against `-inf` sentinel values from failed prior runs
+- `state.get('candidate_product')` — no-op if the submission is empty
+
+**Typical scenarios:**
+- Fast hardware (A100): many molecules scored → warm-start rarely overrides
+- Slow hardware (RTX 3090): only 3 molecules fit in the window → warm-start override is more
+  likely to be beneficial, especially mid-epoch when the chemical search is still converging
+
+**Zero regression risk:** If the warm-start molecule IS in the current pool (because it appeared in
+a PSICHIC batch with high ligand efficiency), it enters `candidates`, gets re-evaluated (cache hit,
+microseconds), appears in `all_scores`, and is handled normally by `_reorder_submission`.  The
+`not _already_scored` check prevents the guard from firing in that case.
+
+---
+
 ## Remaining Future Opportunities
 
 ### C. Multi-molecule entropy bonus
