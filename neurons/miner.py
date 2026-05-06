@@ -793,6 +793,74 @@ async def submit_response(state: Dict[str, Any]) -> None:
 # 6. BOLTZ-2 PRE-SCORING
 # ----------------------------------------------------------------------------
 
+def _scaffold_diverse_candidates(
+    df: pd.DataFrame,
+    max_k: int,
+    smiles_col: str = 'product_smiles',
+    name_col: str = 'product_name',
+) -> pd.DataFrame:
+    """
+    Select up to *max_k* rows from *df* (sorted by score desc) such that
+    each selected molecule has a distinct Murcko scaffold from all previously
+    selected ones.
+
+    When SALSA or GA converges to a single chemical region, the top-N
+    candidates by PSICHIC score can all share one scaffold.  Scoring 5
+    near-identical molecules with Boltz-2 wastes the GPU budget: they'll
+    receive similar affinity estimates and only one can be submitted.
+
+    Strategy: greedy first-pass picks candidates with unseen scaffolds.  A
+    fill-pass then appends remaining top-ranked candidates (scaffold repeats
+    allowed) until *max_k* slots are filled — so if the pool is small or
+    chemically homogeneous we still return max_k candidates.
+
+    Fallback: any molecule whose SMILES can't be parsed gets a unique random
+    key and is always admitted, so malformed entries don't block the fill.
+    """
+    from rdkit.Chem import MurckoScaffold
+
+    selected_rows: list = []
+    seen_scaffolds: set = set()
+    seen_names: set = set()
+
+    # First pass: greedy scaffold-diversity selection
+    for _, row in df.iterrows():
+        if len(selected_rows) >= max_k:
+            break
+        smiles = row.get(smiles_col, '')
+        mol = Chem.MolFromSmiles(smiles)
+        if mol is None:
+            # Unparseable — admit unconditionally (Boltz-safe filter upstream
+            # would have already dropped truly invalid SMILES).
+            selected_rows.append(row)
+            seen_names.add(row.get(name_col, ''))
+            continue
+        try:
+            scaffold = MurckoScaffold.GetScaffoldForMol(mol)
+            scaffold_smi = Chem.MolToSmiles(scaffold) if scaffold is not None else smiles
+        except Exception:
+            scaffold_smi = smiles
+
+        if scaffold_smi not in seen_scaffolds:
+            seen_scaffolds.add(scaffold_smi)
+            selected_rows.append(row)
+            seen_names.add(row.get(name_col, ''))
+
+    # Fill-pass: if scaffold diversity exhausted the pool early, admit repeats
+    if len(selected_rows) < max_k:
+        for _, row in df.iterrows():
+            if len(selected_rows) >= max_k:
+                break
+            name = row.get(name_col, '')
+            if name not in seen_names:
+                selected_rows.append(row)
+                seen_names.add(name)
+
+    if not selected_rows:
+        return pd.DataFrame()
+    return pd.DataFrame(selected_rows).reset_index(drop=True)
+
+
 async def run_boltz_prescoring(state: Dict[str, Any], max_candidates: int = 5) -> None:
     """
     Runs Boltz-2 affinity predictions on the top PSICHIC candidates and reorders
@@ -826,14 +894,27 @@ async def run_boltz_prescoring(state: Dict[str, Any], max_candidates: int = 5) -
         bt.logging.warning("Boltz-2 pre-scoring: no candidate molecules available.")
         return
 
-    # Take at most max_candidates and keep only Boltz-safe SMILES
-    candidates = candidates.head(max_candidates).copy()
+    # Pull a wider slice (3× budget) so the scaffold-diversity filter has
+    # candidates to choose from even when SALSA has converged to one region.
+    # global_candidate_pool is capped at 20 rows, so this is at most 20.
+    candidates = candidates.head(max_candidates * 3).copy()
     safe_mask = candidates['product_smiles'].apply(lambda s: is_boltz_safe_smiles(s)[0])
     candidates = candidates[safe_mask].reset_index(drop=True)
 
     if candidates.empty:
         bt.logging.warning("Boltz-2 pre-scoring: no Boltz-safe candidates, keeping PSICHIC ranking.")
         return
+
+    # Scaffold-diverse selection: prefer candidates with distinct Murcko
+    # scaffolds so Boltz-2 explores different binding modes per epoch budget.
+    pre_div = len(candidates)
+    candidates = _scaffold_diverse_candidates(candidates, max_candidates)
+    post_div = len(candidates)
+    if pre_div != post_div:
+        bt.logging.info(
+            f"Boltz-2 scaffold diversity: selected {post_div} from {pre_div} Boltz-safe candidates "
+            f"({pre_div - post_div} near-duplicate scaffold(s) deferred)"
+        )
 
     protein = state['config'].weekly_target
     boltz_cache: Dict[Tuple[str, str], float] = state.setdefault('boltz_score_cache', {})

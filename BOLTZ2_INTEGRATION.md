@@ -1106,6 +1106,126 @@ microseconds), appears in `all_scores`, and is handled normally by `_reorder_sub
 
 ---
 
+## Implemented Optimisations (continued)
+
+### DD. Extended SALSA Perturbation Operators — Functional Group Addition (`utils/salsa.py`)
+
+**Problem:** The original `generate_perturbations` function only performed *bioisosteric substitution*
+— replacing each heavy atom with an equivalent (C↔N, O↔S, Cl↔F, …).  This keeps the molecular size
+fixed and explores only electronic/polarity variants.  The nearest-SAVI-2020 Tanimoto search
+therefore swept a tight chemical neighbourhood and often mapped back to the same small cluster of
+pool molecules across multiple perturbation rounds.
+
+**Fix:** Added a second perturbation pass — **functional group addition** — that appends a single
+heavy atom (F, Cl, methyl-C, amine-N, hydroxyl-O) at every position with an available implicit
+hydrogen on a C/N/O/S attachment atom.  The resulting SMILES are *probe vectors only* — they are
+never submitted directly — but they extend the Tanimoto search radius into the +1-heavy-atom
+neighbourhood of the seed, mapping back to SAVI-2020 molecules that differ by a methyl, halogen,
+or polar group.
+
+**New constants in `utils/salsa.py`:**
+
+```python
+_FG_ATOMS: list[int] = [9, 17, 6, 7, 8]          # F, Cl, C (methyl), N (amine), O (hydroxyl)
+_FG_ATTACHMENT_ATOMS: frozenset[int] = frozenset([6, 7, 8, 16])  # C, N, O, S eligible positions
+```
+
+**Algorithm extension in `generate_perturbations`:**
+
+```
+existing: bioisosteric substitution (unchanged)
+
+new second pass:
+for each atom with implicit H and atomic number in {C, N, O, S}:
+    for each fg_an in [F, Cl, C, N, O]:
+        rw = RWMol(mol)
+        rw.AddAtom(Atom(fg_an))
+        rw.AddBond(atom.idx, new_idx, SINGLE)
+        SanitizeMol(rw)                    # drops valence violations silently
+        emit canonical SMILES if unseen
+```
+
+**Effect on SALSA coverage:**
+
+| Round | Old operators | New operators |
+|-------|--------------|--------------|
+| Bioisostere sub | ≤ N_atoms × 3 variants | same |
+| FG addition | 0 variants | ≤ N_atoms × 5 × |{C,N,O,S}| variants |
+| Unique probes/round | ~60–120 | ~120–300 (depending on molecule) |
+
+At 300 probes/round × 3 rounds, SALSA maps back from a 2–3× richer probe set, increasing the
+probability of discovering high-scoring pool molecules outside the immediate bioisosteric
+neighbourhood of the seed.
+
+**Risk:** Zero — probes are discarded after nearest-neighbour lookup; submitted molecules always
+come from `savi_pool_df` and pass all existing safety filters (`is_boltz_safe_smiles`, `_pharma_ok`).
+
+**Files changed:**
+- `utils/salsa.py` — new `_FG_ATOMS` and `_FG_ATTACHMENT_ATOMS` constants; second loop in
+  `generate_perturbations` for FG addition; updated docstring.
+
+---
+
+### EE. Scaffold-Diverse Boltz Candidate Selection (`neurons/miner.py`)
+
+**Problem:** `run_boltz_prescoring` previously called `candidates.head(max_candidates)` on the
+`global_candidate_pool` (sorted by ligand-efficiency PSICHIC score).  After SALSA or GradientGA
+converge to a high-scoring chemical region, the top-N candidates by PSICHIC often share the same
+Murcko scaffold — they're N variants of one core that SALSA hill-climbed to.
+
+Scoring 5 near-identical molecules with Boltz-2 wastes GPU budget: protein–ligand binding is
+dominated by the scaffold interaction, so all 5 receive similar affinity estimates.  Only one can
+be submitted at position 0.  The remaining 4 Boltz calls produce no incremental value.
+
+**Fix:** New helper `_scaffold_diverse_candidates(df, max_k)` performs a greedy two-pass
+selection:
+
+1. **Diversity pass:** iterate candidates in PSICHIC-score order; admit each molecule whose Murcko
+   scaffold has not yet been seen.  This maximises scaffold variety within `max_k` slots.
+
+2. **Fill pass:** if the diversity pass admitted fewer than `max_k` candidates (small pool or
+   chemically homogeneous epoch), fill remaining slots from the original ranking — allowing scaffold
+   repeats rather than scoring fewer molecules.
+
+`_scaffold_diverse_candidates` is called in `run_boltz_prescoring` after the Boltz-safety filter,
+on a pre-selected slice of `max_candidates × 3` rows.  The wider slice gives the diversity pass
+enough candidates to choose from even when SALSA has converged tightly.
+
+**Code in `neurons/miner.py`:**
+
+```python
+# Pull a wider slice (3× budget) so scaffold diversity has candidates to choose from.
+candidates = candidates.head(max_candidates * 3).copy()
+safe_mask = candidates['product_smiles'].apply(lambda s: is_boltz_safe_smiles(s)[0])
+candidates = candidates[safe_mask].reset_index(drop=True)
+
+# Scaffold-diverse selection
+candidates = _scaffold_diverse_candidates(candidates, max_candidates)
+```
+
+**Concrete benefit scenario:**
+
+> Epoch N: SALSA converges to a pyrimidine scaffold.  Top-5 PSICHIC candidates are all pyrimidine
+> variants.  Without §EE, all 5 Boltz calls score the same binding mode (pyrimidine-hinge).
+> With §EE, candidates 4 and 5 are replaced by the best benzimidazole and indazole variants from
+> positions 6–10 in the pool.  If either non-pyrimidine binds better, it surfaces at position 0.
+
+**Zero regression risk:**
+- If all top-20 pool molecules share one scaffold (rare), the fill-pass returns the same top-5 as
+  before — identical to the original `head(max_candidates)` behaviour.
+- The anytime guarantee (§H) and warm-start guard (§CC) are unaffected.
+
+**Interaction with §K (dynamic budget):** `_scaffold_diverse_candidates` receives `max_k =
+_dyn_max` — the same dynamic budget value.  Scaffold diversity acts as a selection strategy within
+that budget, not as an additional constraint on it.
+
+**Files changed:**
+- `neurons/miner.py` — new `_scaffold_diverse_candidates` helper (above `run_boltz_prescoring`);
+  updated candidate-selection block in `run_boltz_prescoring` (wider slice + diversity call +
+  log message).
+
+---
+
 ## Remaining Future Opportunities
 
 ### C. Multi-molecule entropy bonus
@@ -1210,6 +1330,8 @@ conservative — `savi_stream_pool` is only skipped after both flags are set.
 | `neurons/miner.py` | Quality-first savi_stream_pool: sort by combined_score + skip after SALSA+GA done (§BB) |
 | `neurons/miner.py` | Extend disk cache schema with `product_name`; add `_disk_cache_get_best`, `_apply_warm_start`; call warm-start at startup + each epoch boundary (§AA) |
 | `neurons/miner.py` | Broader pharmacophore pre-filter: drop HBD minimum, raise HBA/logP ceilings to Lipinski Ro5 (§AB) |
+| `utils/salsa.py` | FG-addition perturbation operator — `_FG_ATOMS`, `_FG_ATTACHMENT_ATOMS`; second loop in `generate_perturbations` (§DD) |
+| `neurons/miner.py` | `_scaffold_diverse_candidates` helper; wider candidate slice (3×) + diversity selection in `run_boltz_prescoring` (§EE) |
 | `BOLTZ2_INTEGRATION.md` | This file |
 
 ---

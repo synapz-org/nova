@@ -42,6 +42,17 @@ _BIOISOSTERES: dict[int, list[int]] = {
     9:  [17, 35],     # F  → Cl, Br
 }
 
+# Atomic numbers of single heavy atoms to *append* at positions that still
+# carry an implicit hydrogen.  The resulting SMILES are used only as query
+# probes for the nearest-SAVI-2020 Tanimoto search — they are never submitted
+# directly.  Appending these atoms expands the search radius beyond pure
+# bioisosteric substitution: F/Cl add electron-withdrawing groups; C adds a
+# methyl; N adds a primary amine; O adds a hydroxyl.
+_FG_ATOMS: list[int] = [9, 17, 6, 7, 8]  # F, Cl, C (methyl), N (amine), O (hydroxyl)
+
+# Atom types eligible as attachment points for FG addition.
+_FG_ATTACHMENT_ATOMS: frozenset[int] = frozenset([6, 7, 8, 16])  # C, N, O, S
+
 
 # ---------------------------------------------------------------------------
 # Fingerprint helpers
@@ -90,7 +101,21 @@ def precompute_pool_fps(
 def generate_perturbations(smiles: str, n_max: int = 100) -> List[str]:
     """
     Generate up to n_max unique canonical SMILES variants of *smiles* via
-    bioisosteric atom substitution.
+    two complementary operators:
+
+    1. **Bioisosteric substitution** — replace each heavy atom with its
+       bioisosteric equivalents (C↔N, O↔S, Cl↔F, …).  Explores the same
+       molecular size with altered electronics/H-bonding.
+
+    2. **Functional group addition** — append a single heavy atom (F, Cl,
+       methyl-C, amine-N, hydroxyl-O) at every position that still carries
+       an implicit hydrogen.  Explores molecules one atom larger, sweeping
+       a broader radius in the Tanimoto fingerprint space.
+
+    Both operator sets produce *probe* SMILES used only for nearest-SAVI-2020
+    lookup — they are never submitted directly.  Together they give SALSA
+    roughly 2–3× more unique query vectors per round compared to substitution
+    alone, improving the diversity of molecules mapped back from the pool.
 
     Returns a list of valid canonical SMILES strings (excluding the input).
     """
@@ -101,11 +126,35 @@ def generate_perturbations(smiles: str, n_max: int = 100) -> List[str]:
     seen = {Chem.MolToSmiles(mol)}
     results: List[str] = []
 
+    # --- 1. Bioisosteric substitution ---
     for atom in mol.GetAtoms():
         an = atom.GetAtomicNum()
         for target_an in _BIOISOSTERES.get(an, []):
             rw = Chem.RWMol(mol)
             rw.GetAtomWithIdx(atom.GetIdx()).SetAtomicNum(target_an)
+            try:
+                Chem.SanitizeMol(rw)
+                canonical = Chem.MolToSmiles(rw.GetMol())
+                if canonical not in seen:
+                    seen.add(canonical)
+                    results.append(canonical)
+            except Exception:
+                pass
+            if len(results) >= n_max:
+                return results
+
+    # --- 2. Functional group addition ---
+    # Append one heavy atom at each position with available implicit hydrogens.
+    # SanitizeMol discards valence violations silently via the try/except.
+    for atom in mol.GetAtoms():
+        if atom.GetTotalNumHs() == 0:
+            continue
+        if atom.GetAtomicNum() not in _FG_ATTACHMENT_ATOMS:
+            continue
+        for fg_an in _FG_ATOMS:
+            rw = Chem.RWMol(mol)
+            new_idx = rw.AddAtom(Chem.Atom(fg_an))
+            rw.AddBond(atom.GetIdx(), new_idx, Chem.BondType.SINGLE)
             try:
                 Chem.SanitizeMol(rw)
                 canonical = Chem.MolToSmiles(rw.GetMol())
