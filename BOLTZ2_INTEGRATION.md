@@ -1226,6 +1226,60 @@ that budget, not as an additional constraint on it.
 
 ---
 
+## Implemented Optimisations (continued)
+
+### FF. Boltz-Guided SALSA — Second SALSA Pass from Best Boltz Molecule (`neurons/miner.py`)
+
+**Problem:** The main SALSA search (§N) and GradientGA (§O) use the PSICHIC-ranked pool as
+seeds.  PSICHIC and Boltz-2 have imperfect correlation: the molecule PSICHIC ranks #1 is often
+not the one Boltz-2 scores best.  After Boltz pre-scoring (§H), we have ground-truth Boltz
+scores for up to 5 molecules — but we never use that validated signal to guide further chemical
+space exploration.
+
+**Fix:** After the main anytime Boltz scoring loop completes, §FF launches a focused 2-round
+SALSA search seeded from the **actual best-Boltz SMILES** rather than the best PSICHIC SMILES.
+This explores the chemical neighbourhood of the confirmed best binder and maps perturbations
+back to SAVI-2020 molecules.  Each hit is then scored with Boltz (subject to epoch-end guard),
+and if any score better than the current best, the submission is immediately updated.
+
+**Algorithm:**
+
+```
+best_boltz_smiles ← argmax(all_scores)   # from main Boltz loop above
+if epoch_remaining > 2 × time_per_mol + 120s:
+    ff_hits ← run_salsa_search(best_boltz_smiles, savi_stream_pool, rounds=2, n_perturb=60, top_k=3)
+    for hit in ff_hits:
+        check epoch guard → break if < 5 blocks remain
+        score = cache_lookup(hit) or boltz_inference(hit)
+        if score > ff_best_score:
+            ff_best_score = score
+            put hit first in state['candidate_product']
+```
+
+**When it fires:** Only when `epoch_remaining > 2 × boltz_time_per_mol + 120s`.  On RTX 3090
+(150 s/mol) this requires > 420 s = ~35 blocks remaining after the main loop.  On A100 (45 s/mol)
+it fires with > 210 s remaining.  On slow hardware the main loop typically exhausts the window,
+so §FF is opportunistic — it degrades gracefully to a no-op when time is tight.
+
+**Why this helps:**
+
+> PSICHIC best ≠ Boltz best (different model objectives).  SALSA from the PSICHIC winner explores
+> PSICHIC-space; SALSA from the Boltz winner explores a region validated by the actual scoring
+> oracle.  Molecules in the Boltz winner's chemical neighbourhood are more likely to preserve its
+> binding mode and score similarly — potentially better.
+
+**Risk:** Zero — §FF uses the same `run_salsa_search` and `wrapper.score_molecules_target`
+infrastructure as the main loop.  All hits come from `savi_stream_pool`, so they are valid
+SAVI-2020 product names.  The epoch guard (`< 5 blocks`) prevents wasted GPU work past the
+submission deadline.  A top-level `try/except` ensures any SALSA or Boltz failure is logged
+and swallowed without touching the main submission.
+
+**Files changed:**
+- `neurons/miner.py` — §FF block inserted in `run_boltz_prescoring` between final summary
+  log and warm-start guard (§CC).
+
+---
+
 ## Remaining Future Opportunities
 
 ### C. Multi-molecule entropy bonus
@@ -1332,6 +1386,7 @@ conservative — `savi_stream_pool` is only skipped after both flags are set.
 | `neurons/miner.py` | Broader pharmacophore pre-filter: drop HBD minimum, raise HBA/logP ceilings to Lipinski Ro5 (§AB) |
 | `utils/salsa.py` | FG-addition perturbation operator — `_FG_ATOMS`, `_FG_ATTACHMENT_ATOMS`; second loop in `generate_perturbations` (§DD) |
 | `neurons/miner.py` | `_scaffold_diverse_candidates` helper; wider candidate slice (3×) + diversity selection in `run_boltz_prescoring` (§EE) |
+| `neurons/miner.py` | §FF Boltz-guided SALSA second pass — seeded from best Boltz molecule; epoch-guarded per-hit Boltz scoring; immediate submission update on improvement |
 | `BOLTZ2_INTEGRATION.md` | This file |
 
 ---

@@ -1047,6 +1047,106 @@ async def run_boltz_prescoring(state: Dict[str, Any], max_candidates: int = 5) -
         f"{len(valid_scores)}/{len(candidates)} molecules scored."
     )
 
+    # §FF: Boltz-guided SALSA — second SALSA pass seeded from the best Boltz molecule.
+    # The main loop above uses the PSICHIC-ranked candidate pool as seeds; PSICHIC and
+    # Boltz-2 correlate imperfectly, so the validated Boltz winner may occupy a different
+    # region of chemical space.  By running SALSA from the actual best-Boltz SMILES we
+    # explore its chemical neighbourhood and may find SAVI-2020 molecules that score
+    # even better — without any additional PSICHIC overhead.
+    # Only fires when the epoch has ≥2 mol-lengths + 2 min of runway remaining.
+    _ff_best_smiles = max(all_scores, key=lambda s: all_scores.get(s, -math.inf), default=None)
+    _savi_pool_ff = state.get('savi_stream_pool')
+    if (
+        _ff_best_smiles is not None
+        and math.isfinite(all_scores.get(_ff_best_smiles, -math.inf))
+        and _savi_pool_ff is not None
+        and not _savi_pool_ff.empty
+    ):
+        try:
+            _curr_blk_ff = await state['subtensor'].get_current_block()
+            _next_ep_ff = ((_curr_blk_ff // state['epoch_length']) + 1) * state['epoch_length']
+            _remaining_s_ff = (_next_ep_ff - _curr_blk_ff) * 12
+            _t_per_mol_ff = state.get('boltz_time_per_mol', 150.0)
+            if _remaining_s_ff > _t_per_mol_ff * 2 + 120:
+                bt.logging.info(
+                    f"§FF Boltz-guided SALSA: {_remaining_s_ff:.0f}s remaining — "
+                    f"seeding 2-round SALSA from best Boltz molecule..."
+                )
+                ff_salsa_hits = await asyncio.to_thread(
+                    run_salsa_search,
+                    _ff_best_smiles,
+                    _savi_pool_ff,
+                    2,   # rounds (fewer — time is limited)
+                    60,  # n_perturb
+                    3,   # top_k
+                )
+                if not ff_salsa_hits.empty:
+                    bt.logging.info(
+                        f"§FF: {len(ff_salsa_hits)} Boltz-guided SALSA hits — scoring with Boltz..."
+                    )
+                    _ff_best_score = max(
+                        (v for v in all_scores.values() if math.isfinite(v)), default=-math.inf
+                    )
+                    for _, _ff_row in ff_salsa_hits.iterrows():
+                        _ff_smiles = _ff_row['product_smiles']
+                        _ff_canon = get_canonical_smiles(_ff_smiles)
+                        _ff_key = (_ff_canon, protein)
+
+                        if _ff_key in boltz_cache:
+                            _ff_score = boltz_cache[_ff_key]
+                            bt.logging.debug(f"§FF cache hit: {_ff_score:.4f}")
+                        else:
+                            # Epoch guard before each GPU inference
+                            try:
+                                _curr_blk2 = await state['subtensor'].get_current_block()
+                                _next_ep2 = ((_curr_blk2 // state['epoch_length']) + 1) * state['epoch_length']
+                                if _next_ep2 - _curr_blk2 < 5:
+                                    bt.logging.info("§FF: epoch ends in <5 blocks — stopping.")
+                                    break
+                            except Exception:
+                                pass
+                            _ff_uid = 0
+                            _ff_vmbu = {_ff_uid: {"smiles": [_ff_smiles], "names": [_ff_row['product_name']]}}
+                            _ff_sd = {_ff_uid: {}}
+                            try:
+                                await asyncio.to_thread(
+                                    wrapper.score_molecules_target,
+                                    _ff_vmbu, _ff_sd, subnet_config, '0x' + '0' * 64,
+                                )
+                                _ff_mol_scores = wrapper.per_molecule_metric.get(_ff_uid, {})
+                                _ff_score = _ff_mol_scores.get(_ff_smiles, -math.inf)
+                                boltz_cache[_ff_key] = _ff_score
+                                _disk_cache_put(
+                                    db_path, _ff_canon, protein, _ff_score,
+                                    product_name=_ff_row.get('product_name'),
+                                )
+                                bt.logging.info(
+                                    f"§FF scored: {_ff_row.get('product_name', '?')} "
+                                    f"boltz={_ff_score:.4f}"
+                                )
+                            except Exception as _ff_e:
+                                bt.logging.error(f"§FF Boltz inference error: {_ff_e}")
+                                _ff_score = -math.inf
+
+                        if math.isfinite(_ff_score) and _ff_score > _ff_best_score:
+                            _ff_prev_score = _ff_best_score
+                            _ff_best_score = _ff_score
+                            _ff_pname = _ff_row.get('product_name', '')
+                            if _ff_pname:
+                                _orig = state['candidate_product'].split(',')
+                                if _ff_pname in _orig:
+                                    state['candidate_product'] = ','.join(
+                                        [_ff_pname] + [n for n in _orig if n != _ff_pname]
+                                    )
+                                else:
+                                    state['candidate_product'] = ','.join([_ff_pname] + _orig)
+                                bt.logging.info(
+                                    f"§FF: new best from Boltz-guided SALSA — "
+                                    f"{_ff_pname} (boltz={_ff_score:.4f} > prev={_ff_prev_score:.4f})"
+                                )
+        except Exception as _ff_err:
+            bt.logging.warning(f"§FF Boltz-guided SALSA failed (non-fatal): {_ff_err}")
+
     # Warm-start guard (§CC): after reordering by this epoch's Boltz scores,
     # check whether the best molecule in the persistent disk cache beats the
     # best new score.  This covers the scenario where the warm-start molecule
