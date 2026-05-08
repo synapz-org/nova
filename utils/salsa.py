@@ -166,6 +166,28 @@ def generate_perturbations(smiles: str, n_max: int = 100) -> List[str]:
             if len(results) >= n_max:
                 return results
 
+    # --- 3. Terminal atom removal ---
+    # Remove each terminal heavy atom (degree=1, not H) to generate probes that
+    # are one atom smaller.  Stripping a halogen, methyl, or hydroxyl from the
+    # seed and mapping back to SAVI-2020 finds molecules with fewer heavy atoms —
+    # directly targeting the scoring formula's heavy_atom_count denominator.
+    # These probes are never submitted; they are query vectors for Tanimoto search.
+    for atom in mol.GetAtoms():
+        if atom.GetDegree() != 1 or atom.GetAtomicNum() <= 1:
+            continue  # only terminal non-hydrogen heavy atoms
+        rw = Chem.RWMol(mol)
+        rw.RemoveAtom(atom.GetIdx())
+        try:
+            Chem.SanitizeMol(rw)
+            canonical = Chem.MolToSmiles(rw.GetMol())
+            if canonical not in seen:
+                seen.add(canonical)
+                results.append(canonical)
+        except Exception:
+            pass
+        if len(results) >= n_max:
+            return results
+
     return results
 
 

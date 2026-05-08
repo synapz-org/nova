@@ -1280,6 +1280,97 @@ and swallowed without touching the main submission.
 
 ---
 
+## Implemented Optimisations (continued)
+
+### GG. Terminal Atom Removal — Third SALSA Perturbation Operator (`utils/salsa.py`)
+
+**Problem:** `generate_perturbations` had two operators — bioisosteric substitution and functional
+group addition — but no operator for *shrinking* the molecule.  The Boltz-2 scoring formula
+penalises size via the `heavy_atom_count` denominator:
+
+```
+boltz_score = (affinity_probability_binary - affinity_pred_value) / heavy_atom_count
+```
+
+A probe smaller by 1–2 atoms, mapped back to the nearest SAVI-2020 molecule, can yield
+candidates with fewer heavy atoms but comparable affinity — i.e., *higher* ligand efficiency.
+Without a removal operator, SALSA's nearest-neighbour searches were biased toward molecules
+of the same size or larger.
+
+**Fix:** A third pass in `generate_perturbations` removes each *terminal* heavy atom
+(degree=1, atomic number > 1 — halogens, methyl groups, hydroxyl oxygens, etc.):
+
+```python
+for atom in mol.GetAtoms():
+    if atom.GetDegree() != 1 or atom.GetAtomicNum() <= 1:
+        continue  # only terminal non-hydrogen heavy atoms
+    rw = Chem.RWMol(mol)
+    rw.RemoveAtom(atom.GetIdx())
+    try:
+        Chem.SanitizeMol(rw)
+        canonical = Chem.MolToSmiles(rw.GetMol())
+        if canonical not in seen: ...
+```
+
+The resulting SMILES are *probe vectors only* — they are never submitted. They are queried
+against the SAVI-2020 streamed pool via Tanimoto similarity, returning valid SAVI-2020
+molecules that are chemically similar but potentially one atom smaller.
+
+**Coverage:** A typical 20-HA drug-like molecule has 3–6 terminal atoms.  The removal operator
+adds 3–6 new probes per round, sweeping a complementary region of fingerprint space that the
+addition and substitution operators cannot reach.
+
+**Risk:** Zero — probes are discarded after the nearest-neighbour lookup; submitted molecules
+always come from `savi_pool_df` and pass all existing safety filters.
+
+**Files changed:**
+- `utils/salsa.py` — third loop in `generate_perturbations` for terminal atom removal.
+
+---
+
+### HH. SALSA Threshold Floor for Fast Hardware (`neurons/miner.py`)
+
+**Problem:** The SALSA trigger threshold was computed as `int(boltz_trigger_blocks × 1.5)`.
+For the default `boltz_trigger_blocks = 100`, this gives threshold = 150 — correctly ensuring
+SALSA fires 50 blocks before Boltz.
+
+However, on A100 hardware the adaptive trigger (§G) reduces `boltz_trigger_blocks` to ~39
+after the first Boltz run:
+
+```
+1.5 × 39 = 58.5  →  threshold = 58  <  39 + 30 = 69
+```
+
+A threshold of 58 is only 19 blocks above the Boltz threshold of 39.  In subsequent epochs,
+if the 500-molecule pool is reached when `blocks_until_epoch` is between 39 and 58, SALSA
+fires but no headroom remains for the GA and the pre-selected SALSA hits to be incorporated
+into `global_candidate_pool` before Boltz fires.  Worse: on a late-starting miner where
+`blocks_until_epoch` is already ≤ 58 when the pool crosses 500, SALSA misses entirely.
+
+**Fix:** A `max()` floor guarantees at least 30 blocks between the SALSA threshold and the
+Boltz threshold regardless of hardware speed:
+
+```python
+salsa_threshold = max(int(boltz_trigger * 1.5), boltz_trigger + 30)
+```
+
+Effect on different hardware:
+
+| Hardware | `boltz_trigger_blocks` | Old threshold | New threshold |
+|----------|----------------------|---------------|---------------|
+| A100 80 GB | ~39 | 58 | **69** |
+| RTX 4090 | ~58 | 87 | 88 (unchanged) |
+| RTX 3090 | ~83 | 124 | 124 (unchanged) |
+
+On A100 the window between SALSA and Boltz increases from 19 to 30 blocks — 2 extra minutes
+for SALSA to run and inject hits into `global_candidate_pool` before Boltz evaluates it.  On
+slower hardware the formula is unchanged.
+
+**Files changed:**
+- `neurons/miner.py` — SALSA threshold now uses `max(int(boltz_trigger * 1.5), boltz_trigger + 30)`.
+
+---
+
 ## Remaining Future Opportunities
 
 ### C. Multi-molecule entropy bonus
@@ -1381,6 +1472,8 @@ conservative — `savi_stream_pool` is only skipped after both flags are set.
 | `utils/genetic.py` | New: GradientGA — `brics_crossover`, `tournament_select`, `run_gradient_ga` (§O); pre-compute pool FPs + pass to `nearest_pool_molecules` (§R) |
 | `utils/msa.py` | New: MSA auto-fetch — `ensure_msa`, `fetch_msa`, `msa_exists` (§S) |
 | `neurons/miner.py` | Move `dataset_iter` creation inside the outer `while` loop (§Y) |
+| `utils/salsa.py` | Terminal atom removal operator — third pass in `generate_perturbations` (§GG) |
+| `neurons/miner.py` | SALSA threshold floor `max(int(trigger*1.5), trigger+30)` for fast hardware (§HH) |
 | `neurons/miner.py` | Quality-first savi_stream_pool: sort by combined_score + skip after SALSA+GA done (§BB) |
 | `neurons/miner.py` | Extend disk cache schema with `product_name`; add `_disk_cache_get_best`, `_apply_warm_start`; call warm-start at startup + each epoch boundary (§AA) |
 | `neurons/miner.py` | Broader pharmacophore pre-filter: drop HBD minimum, raise HBA/logP ceilings to Lipinski Ro5 (§AB) |

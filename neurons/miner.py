@@ -547,7 +547,12 @@ async def run_psichic_model_loop(state: Dict[str, Any]) -> None:
                     salsa_pool = state.get('savi_stream_pool')
                     salsa_pool_size = 0 if salsa_pool is None else len(salsa_pool)
                     boltz_trigger = state.get('boltz_trigger_blocks', 100)
-                    salsa_threshold = int(boltz_trigger * 1.5)
+                    # Ensure SALSA fires at least 30 blocks before Boltz.
+                    # The 1.5× formula breaks down on fast hardware (A100/H100)
+                    # where the adaptive trigger drops boltz_trigger_blocks to ~39:
+                    # 1.5 × 39 = 58 < 39 + 30 = 69.  Without this floor, SALSA
+                    # could fire within the Boltz window on the same chunk iteration.
+                    salsa_threshold = max(int(boltz_trigger * 1.5), boltz_trigger + 30)
                     if (
                         not state.get('salsa_run_this_epoch', False)
                         and salsa_pool_size >= 500
