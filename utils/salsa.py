@@ -101,7 +101,7 @@ def precompute_pool_fps(
 def generate_perturbations(smiles: str, n_max: int = 100) -> List[str]:
     """
     Generate up to n_max unique canonical SMILES variants of *smiles* via
-    two complementary operators:
+    four complementary operators:
 
     1. **Bioisosteric substitution** — replace each heavy atom with its
        bioisosteric equivalents (C↔N, O↔S, Cl↔F, …).  Explores the same
@@ -112,10 +112,17 @@ def generate_perturbations(smiles: str, n_max: int = 100) -> List[str]:
        an implicit hydrogen.  Explores molecules one atom larger, sweeping
        a broader radius in the Tanimoto fingerprint space.
 
-    Both operator sets produce *probe* SMILES used only for nearest-SAVI-2020
-    lookup — they are never submitted directly.  Together they give SALSA
-    roughly 2–3× more unique query vectors per round compared to substitution
-    alone, improving the diversity of molecules mapped back from the pool.
+    3. **Terminal atom removal** — remove each terminal (degree-1) heavy atom.
+       Produces probes one atom smaller, targeting the Boltz-2 scoring formula's
+       heavy_atom_count denominator.
+
+    4. **Ring walk** — expand 4–6-membered rings by inserting CH₂ into a single
+       ring bond (+1 ring size), and contract 5–7-membered rings by removing a
+       degree-2 ring carbon (-1 ring size).  Covers 5↔6 and 6↔7 transitions
+       orthogonal to all three operators above.
+
+    All operators produce *probe* SMILES used only for nearest-SAVI-2020
+    Tanimoto lookup — they are never submitted directly.
 
     Returns a list of valid canonical SMILES strings (excluding the input).
     """
@@ -187,6 +194,78 @@ def generate_perturbations(smiles: str, n_max: int = 100) -> List[str]:
             pass
         if len(results) >= n_max:
             return results
+
+    # --- 4. Ring walk (ring size ±1) ---
+    # 4a. Ring expansion: insert CH₂ into each single bond within a 4–6 membered
+    #     ring, producing a ring one atom larger (5–7 membered).  Avoids expanding
+    #     rings already ≥7 atoms to prevent macrocycles.
+    # 4b. Ring contraction: remove each degree-2 ring carbon from a 5–7 membered
+    #     ring, reconnecting its two neighbours.  Avoids contracting below 4-membered
+    #     rings (5-membered is the smallest we contract from).
+    # Like all operators above, results are query probes for nearest-SAVI-2020
+    # Tanimoto search — never submitted directly.
+    _ring_info = mol.GetRingInfo()
+
+    # 4a — expansion: collect bonds in rings of size 4–6
+    _small_ring_bonds: set = set()
+    for _r in _ring_info.BondRings():
+        if 4 <= len(_r) <= 6:
+            _small_ring_bonds.update(_r)
+
+    for _bond_idx in _small_ring_bonds:
+        if len(results) >= n_max:
+            break
+        _bond = mol.GetBondWithIdx(_bond_idx)
+        if _bond.GetBondType() != Chem.BondType.SINGLE:
+            continue
+        _bi = _bond.GetBeginAtomIdx()
+        _ei = _bond.GetEndAtomIdx()
+        rw = Chem.RWMol(mol)
+        rw.RemoveBond(_bi, _ei)
+        _ni = rw.AddAtom(Chem.Atom(6))  # insert CH₂
+        rw.AddBond(_bi, _ni, Chem.BondType.SINGLE)
+        rw.AddBond(_ni, _ei, Chem.BondType.SINGLE)
+        try:
+            Chem.SanitizeMol(rw)
+            canonical = Chem.MolToSmiles(rw.GetMol())
+            if canonical not in seen:
+                seen.add(canonical)
+                results.append(canonical)
+        except Exception:
+            pass
+
+    # 4b — contraction: remove degree-2 ring carbons from 5–7 membered rings
+    for _ring in _ring_info.AtomRings():
+        if len(results) >= n_max:
+            break
+        if not (5 <= len(_ring) <= 7):
+            continue
+        for _rpos, _ai in enumerate(_ring):
+            if len(results) >= n_max:
+                break
+            _atom = mol.GetAtomWithIdx(_ai)
+            if _atom.GetAtomicNum() != 6:
+                continue  # only remove unsubstituted carbons
+            if _atom.GetDegree() != 2:
+                continue  # substituent present — removal would lose a group
+            _prev = _ring[(_rpos - 1) % len(_ring)]
+            _next = _ring[(_rpos + 1) % len(_ring)]
+            # Adjust neighbour indices after _ai is removed
+            _adj_prev = _prev - (1 if _prev > _ai else 0)
+            _adj_next = _next - (1 if _next > _ai else 0)
+            rw = Chem.RWMol(mol)
+            rw.RemoveAtom(_ai)
+            # Reconnect the two former neighbours to close the smaller ring
+            if rw.GetBondBetweenAtoms(_adj_prev, _adj_next) is None:
+                rw.AddBond(_adj_prev, _adj_next, Chem.BondType.SINGLE)
+            try:
+                Chem.SanitizeMol(rw)
+                canonical = Chem.MolToSmiles(rw.GetMol())
+                if canonical not in seen:
+                    seen.add(canonical)
+                    results.append(canonical)
+            except Exception:
+                pass
 
     return results
 
