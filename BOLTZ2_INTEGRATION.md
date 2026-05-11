@@ -382,7 +382,7 @@ added directly to `global_candidate_pool` and validated with Boltz-2.
 **State fields added:**
 
 | Field | Type | Purpose |
-|-------|------|---------|
+|-------|------|--------|
 | `savi_stream_pool` | DataFrame | All PSICHIC-scored molecules this epoch, up to 5000 rows |
 | `salsa_run_this_epoch` | bool | Prevents duplicate SALSA runs per epoch |
 
@@ -445,7 +445,7 @@ return top-5 molecules from all generations
 **State fields added:**
 
 | Field | Type | Purpose |
-|-------|------|---------|
+|-------|------|--------|
 | `ga_run_this_epoch` | bool | Prevents duplicate GA runs per epoch |
 
 **Trigger conditions:**
@@ -1148,7 +1148,7 @@ for each atom with implicit H and atomic number in {C, N, O, S}:
 **Effect on SALSA coverage:**
 
 | Round | Old operators | New operators |
-|-------|--------------|--------------|
+|-------|--------------|---------------|
 | Bioisostere sub | ≤ N_atoms × 3 variants | same |
 | FG addition | 0 variants | ≤ N_atoms × 5 × |{C,N,O,S}| variants |
 | Unique probes/round | ~60–120 | ~120–300 (depending on molecule) |
@@ -1556,3 +1556,79 @@ while not state['shutdown_event'].is_set():
   increasing chemical diversity for subsequent PSICHIC and Boltz-2 evaluations.
 - Zero overhead: the HuggingFace streaming client uses lazy loading; creating a new
   iterator only issues an HTTP range request when the first batch is consumed.
+
+---
+
+## Implemented Optimisations (continued)
+
+### II. Ring Walk — Ring Size ±1 Perturbation Operator (`utils/salsa.py`)
+
+**Problem:** `generate_perturbations` had three operators — bioisosteric substitution,
+functional group addition, and terminal atom removal — but none that changed *ring size*.
+Many potent drug scaffolds are ring-size variants of each other (piperidine↔morpholine,
+pyrrole↔imidazole, indane↔tetralin), and the nearest-SAVI-2020 Tanimoto search could not
+navigate between them.  The three existing operators are constrained to: same ring with
+different atoms (substitution), same core plus a pendant group (addition), or same core
+minus a pendant atom (removal).  Changing the ring atom count is orthogonal to all three
+and opens a qualitatively different region of chemical space.
+
+**Fix:** A fourth operator pass added to `generate_perturbations` in `utils/salsa.py`:
+
+**4a — Ring expansion:** insert CH₂ into each single bond within a 4–6 membered ring,
+creating a ring one atom larger (5–7 membered):
+
+```python
+for _bond_idx in _small_ring_bonds:   # bonds in rings of size 4–6
+    if _bond.GetBondType() != Chem.BondType.SINGLE:
+        continue
+    rw = Chem.RWMol(mol)
+    rw.RemoveBond(_bi, _ei)
+    _ni = rw.AddAtom(Chem.Atom(6))    # new CH₂
+    rw.AddBond(_bi, _ni, Chem.BondType.SINGLE)
+    rw.AddBond(_ni, _ei, Chem.BondType.SINGLE)
+    SanitizeMol(rw)  # drops valence violations
+    emit canonical SMILES if unseen
+```
+
+**4b — Ring contraction:** remove each degree-2 ring carbon from a 5–7 membered ring and
+reconnect its two neighbours, creating a ring one atom smaller (4–6 membered):
+
+```python
+for _ring in rings of size 5–7:
+    for _ai in _ring:
+        if atom.AtomicNum != 6 or atom.Degree != 2:
+            continue    # only unsubstituted carbons — removal would lose a substituent
+        rw.RemoveAtom(_ai)
+        # re-bond the two former ring-neighbours (adjusting indices post-removal)
+        if no bond already between adj_prev, adj_next:
+            rw.AddBond(adj_prev, adj_next, SINGLE)
+        SanitizeMol(rw)
+        emit canonical SMILES if unseen
+```
+
+**Size guards:**
+- Expansion: only operates on rings of size ≤ 6 (result ≤ 7) — avoids generating macrocycles.
+- Contraction: only operates on rings of size ≥ 5 (result ≥ 4) — avoids 3-membered ring strain.
+
+**Coverage added per probe round (typical 20-HA drug-like molecule):**
+
+| Operator | Typical new probes |
+|----------|-----------------|
+| Bioisosteric substitution | 30–60 |
+| FG addition | 40–100 |
+| Terminal removal | 3–6 |
+| **Ring walk (new)** | **4–18** (2–6 expandable bonds + 2–12 contractable atoms) |
+
+The ring walk contribution is modest in count but qualitatively unique: it maps to SAVI-2020
+molecules that differ from the seed by ring size, which the other operators cannot reach.
+In epochs where the target protein binds ring-size variants differently (common in kinase
+hinge-binding scaffolds), ring walk can surface a ring-expanded or ring-contracted analogue
+that scores higher under Boltz-2.
+
+**Risk:** Zero — probes are discarded after nearest-neighbour lookup; submitted molecules
+always come from `savi_pool_df` and pass all existing safety filters.  The `n_max` cap
+applies to the combined output of all four operators, so adding ring walk does not break
+any existing call sites.
+
+**Files changed:**
+- `utils/salsa.py` — fourth operator pass in `generate_perturbations`; updated docstring.
