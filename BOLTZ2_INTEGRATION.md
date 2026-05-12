@@ -382,7 +382,7 @@ added directly to `global_candidate_pool` and validated with Boltz-2.
 **State fields added:**
 
 | Field | Type | Purpose |
-|-------|------|--------|
+|-------|------|-------|
 | `savi_stream_pool` | DataFrame | All PSICHIC-scored molecules this epoch, up to 5000 rows |
 | `salsa_run_this_epoch` | bool | Prevents duplicate SALSA runs per epoch |
 
@@ -445,7 +445,7 @@ return top-5 molecules from all generations
 **State fields added:**
 
 | Field | Type | Purpose |
-|-------|------|--------|
+|-------|------|-------|
 | `ga_run_this_epoch` | bool | Prevents duplicate GA runs per epoch |
 
 **Trigger conditions:**
@@ -540,14 +540,26 @@ back to single-seed behaviour.
 
 ### A. (Implemented — see §O above)
 
-### C. Multi-molecule entropy bonus
+### C. Multi-molecule MACCS diversity reordering ✅ Implemented
 
 When the validator increases `num_molecules_boltz > 1`, the entropy bonus activates
-(`ranking.py` lines 109–118). The miner should respond by submitting a set of molecules
-with high MACCS fingerprint diversity, not just the single best binder.
+(`ranking.py` lines 109–118). The miner responds by reordering positions 1..N-1 of
+`candidate_product` by decreasing MACCS Tanimoto distance from the anchor molecule at
+position 0 — maximising structural diversity without displacing the best Boltz binder.
 
-Implementation: after Boltz pre-scoring, fill remaining submission slots greedily with
-molecules that maximise `compute_maccs_entropy()` relative to the already-selected set.
+**Implementation** (`neurons/miner.py`, lines 869–932, 1260–1272):
+
+```python
+def _reorder_for_diversity(state):
+    best_fp = MACCSkeys.GenMACCSKeys(Chem.MolFromSmiles(best_smiles))
+    scored_rest = [(1.0 - TanimotoSimilarity(best_fp, fp), name) for name in names[1:]]
+    scored_rest.sort(reverse=True)   # most distant first
+    state['candidate_product'] = ','.join([names[0]] + [n for _, n in scored_rest])
+```
+
+Called at the end of `run_boltz_prescoring` when `num_molecules_boltz > 1`.
+Currently a no-op (`num_molecules_boltz: 1` in `config.yaml`); activates automatically
+when the validator raises that parameter.
 
 ### D. Binding-pocket guidance
 
@@ -861,7 +873,7 @@ deployments. Miners on fast hardware can opt in by changing one YAML line.
 default: 1.5) that controls pose diversity:
 
 | `step_scale` | Effect |
-|--------------|--------|
+|--------------|---------|
 | < 1.5 | Less diverse; more consistent, lower-variance poses |
 | 1.5 | Library default — balanced diversity/consistency |
 | > 1.5 | More diverse; explores wider conformational space |
@@ -1373,14 +1385,30 @@ slower hardware the formula is unchanged.
 
 ## Remaining Future Opportunities
 
-### C. Multi-molecule entropy bonus
+### C. Multi-molecule entropy bonus ✅ Implemented
 
 When the validator increases `num_molecules_boltz > 1`, the entropy bonus activates
-(`ranking.py` lines 109–118). The miner should respond by submitting a set of molecules
-with high MACCS fingerprint diversity, not just the single best binder.
+(`ranking.py` lines 109–118). The miner responds by placing molecules with high MACCS
+fingerprint diversity in slots 1..N-1 of the submission, while keeping the best Boltz
+molecule at position 0.
 
-Implementation: after Boltz pre-scoring, fill remaining submission slots greedily with
-molecules that maximise `compute_maccs_entropy()` relative to the already-selected set.
+**Implementation** (`neurons/miner.py`):
+
+New helper `_reorder_for_diversity(state)`, called at the end of `run_boltz_prescoring`
+when `num_molecules_boltz > 1`:
+
+```python
+# Build name→SMILES lookup from global_candidate_pool / candidate_molecules / savi_stream_pool
+# Score each non-anchor molecule by MACCS Tanimoto distance from position-0 anchor
+# Sort descending (most diverse first) → reorder state['candidate_product']
+```
+
+**Current status:** `num_molecules_boltz: 1` in config.yaml → this is a no-op today.
+When the validator raises that parameter, `_reorder_for_diversity` activates automatically
+with no further code changes needed.
+
+**Risk:** Zero — position 0 (the molecule the validator actually scores for Boltz) is never
+moved.  Only positions 1+ are reordered, and only when `num_molecules_boltz > 1`.
 
 ### D. Binding-pocket guidance
 
@@ -1480,6 +1508,7 @@ conservative — `savi_stream_pool` is only skipped after both flags are set.
 | `utils/salsa.py` | FG-addition perturbation operator — `_FG_ATOMS`, `_FG_ATTACHMENT_ATOMS`; second loop in `generate_perturbations` (§DD) |
 | `neurons/miner.py` | `_scaffold_diverse_candidates` helper; wider candidate slice (3×) + diversity selection in `run_boltz_prescoring` (§EE) |
 | `neurons/miner.py` | §FF Boltz-guided SALSA second pass — seeded from best Boltz molecule; epoch-guarded per-hit Boltz scoring; immediate submission update on improvement |
+| `neurons/miner.py` | §C `_reorder_for_diversity` helper; call site at end of `run_boltz_prescoring` when `num_molecules_boltz > 1` |
 | `BOLTZ2_INTEGRATION.md` | This file |
 
 ---
@@ -1613,7 +1642,7 @@ for _ring in rings of size 5–7:
 **Coverage added per probe round (typical 20-HA drug-like molecule):**
 
 | Operator | Typical new probes |
-|----------|-----------------|
+|----------|------------------|
 | Bioisosteric substitution | 30–60 |
 | FG addition | 40–100 |
 | Terminal removal | 3–6 |
