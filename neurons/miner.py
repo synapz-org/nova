@@ -539,7 +539,7 @@ async def run_psichic_model_loop(state: Dict[str, Any]) -> None:
                     # SALSA trigger: run once per epoch when the stream pool is
                     # large enough to support meaningful NN search and we still have
                     # time before Boltz kicks in.
-                    #   - Requires ≥500 molecules in the stream pool (enough for NN).
+                    #   - Requires >=500 molecules in the stream pool (enough for NN).
                     #   - Fires only when > boltz_trigger * 1.5 blocks remain, so
                     #     SALSA hits are in global_candidate_pool before Boltz starts.
                     #   - One-shot per epoch (salsa_run_this_epoch flag).
@@ -548,9 +548,9 @@ async def run_psichic_model_loop(state: Dict[str, Any]) -> None:
                     salsa_pool_size = 0 if salsa_pool is None else len(salsa_pool)
                     boltz_trigger = state.get('boltz_trigger_blocks', 100)
                     # Ensure SALSA fires at least 30 blocks before Boltz.
-                    # The 1.5× formula breaks down on fast hardware (A100/H100)
+                    # The 1.5x formula breaks down on fast hardware (A100/H100)
                     # where the adaptive trigger drops boltz_trigger_blocks to ~39:
-                    # 1.5 × 39 = 58 < 39 + 30 = 69.  Without this floor, SALSA
+                    # 1.5 x 39 = 58 < 39 + 30 = 69.  Without this floor, SALSA
                     # could fire within the Boltz window on the same chunk iteration.
                     salsa_threshold = max(int(boltz_trigger * 1.5), boltz_trigger + 30)
                     if (
@@ -563,7 +563,7 @@ async def run_psichic_model_loop(state: Dict[str, Any]) -> None:
                         state['salsa_run_this_epoch'] = True
                         # Multi-seed SALSA: run from up to top-3 candidates so we
                         # explore three distinct chemical neighbourhoods in one pass.
-                        # Runtime: ~3 × 180 ms = ~540 ms CPU — negligible vs Boltz.
+                        # Runtime: ~3 x 180 ms = ~540 ms CPU -- negligible vs Boltz.
                         _n_seeds = min(3, len(state['global_candidate_pool']))
                         _seeds = state['global_candidate_pool'].head(_n_seeds)['product_smiles'].tolist()
                         bt.logging.info(
@@ -622,7 +622,7 @@ async def run_psichic_model_loop(state: Dict[str, Any]) -> None:
                     #   - salsa_run_this_epoch (SALSA must have run first so its hits
                     #     are already in global_candidate_pool)
                     #   - ga_run_this_epoch == False (one-shot per epoch)
-                    # Runtime: ~1-3 s CPU for 5 generations — negligible vs Boltz.
+                    # Runtime: ~1-3 s CPU for 5 generations -- negligible vs Boltz.
                     # ---------------------------------------------------------------
                     ga_pool = state.get('savi_stream_pool')
                     ga_pool_size = 0 if ga_pool is None else len(ga_pool)
@@ -816,7 +816,7 @@ def _scaffold_diverse_candidates(
 
     Strategy: greedy first-pass picks candidates with unseen scaffolds.  A
     fill-pass then appends remaining top-ranked candidates (scaffold repeats
-    allowed) until *max_k* slots are filled — so if the pool is small or
+    allowed) until *max_k* slots are filled -- so if the pool is small or
     chemically homogeneous we still return max_k candidates.
 
     Fallback: any molecule whose SMILES can't be parsed gets a unique random
@@ -835,7 +835,7 @@ def _scaffold_diverse_candidates(
         smiles = row.get(smiles_col, '')
         mol = Chem.MolFromSmiles(smiles)
         if mol is None:
-            # Unparseable — admit unconditionally (Boltz-safe filter upstream
+            # Unparseable -- admit unconditionally (Boltz-safe filter upstream
             # would have already dropped truly invalid SMILES).
             selected_rows.append(row)
             seen_names.add(row.get(name_col, ''))
@@ -866,6 +866,73 @@ def _scaffold_diverse_candidates(
     return pd.DataFrame(selected_rows).reset_index(drop=True)
 
 
+def _reorder_for_diversity(state: Dict[str, Any]) -> None:
+    """
+    Reorder positions 1+ of state['candidate_product'] to maximise MACCS fingerprint
+    diversity relative to the best Boltz molecule at position 0.
+
+    Active when num_molecules_boltz > 1.  The validator computes compute_maccs_entropy()
+    over the first N molecules and applies a diversity bonus to boltz_score.  Placing the
+    most MACCS-dissimilar molecules in slots 1..N-1 maximises that bonus without
+    disturbing the best Boltz binder at position 0.
+
+    Zero-effect when num_molecules_boltz == 1 (current validator default).
+    """
+    from rdkit.Chem import MACCSkeys, DataStructs as _DS
+
+    current = state.get('candidate_product') or ''
+    names = [n for n in current.split(',') if n]
+    if len(names) <= 1:
+        return
+
+    # Build name->SMILES lookup from all available molecule pools (ordered by quality)
+    name_to_smiles: Dict[str, str] = {}
+    for frame in (
+        state.get('global_candidate_pool'),
+        state.get('candidate_molecules'),
+        state.get('savi_stream_pool'),
+    ):
+        if frame is None or frame.empty:
+            continue
+        if 'product_name' not in frame.columns or 'product_smiles' not in frame.columns:
+            continue
+        for _, r in frame.iterrows():
+            pn, ps = str(r.get('product_name', '')), str(r.get('product_smiles', ''))
+            if pn and ps and pn not in name_to_smiles:
+                name_to_smiles[pn] = ps
+
+    best_smiles = name_to_smiles.get(names[0], '')
+    if not best_smiles:
+        return
+    best_mol = Chem.MolFromSmiles(best_smiles)
+    if best_mol is None:
+        return
+    best_fp = MACCSkeys.GenMACCSKeys(best_mol)
+
+    scored_rest: List[Tuple[float, str]] = []
+    unknown: List[str] = []
+    for name in names[1:]:
+        smiles = name_to_smiles.get(name, '')
+        if not smiles:
+            unknown.append(name)
+            continue
+        mol = Chem.MolFromSmiles(smiles)
+        if mol is None:
+            unknown.append(name)
+            continue
+        fp = MACCSkeys.GenMACCSKeys(mol)
+        sim = _DS.TanimotoSimilarity(best_fp, fp)
+        scored_rest.append((1.0 - sim, name))  # higher distance = more diverse
+
+    scored_rest.sort(reverse=True)
+    state['candidate_product'] = ','.join(
+        [names[0]] + [n for _, n in scored_rest] + unknown
+    )
+    bt.logging.debug(
+        f"§C diversity reorder: {len(scored_rest)} molecules sorted by MACCS distance from anchor"
+    )
+
+
 async def run_boltz_prescoring(state: Dict[str, Any], max_candidates: int = 5) -> None:
     """
     Runs Boltz-2 affinity predictions on the top PSICHIC candidates and reorders
@@ -874,12 +941,12 @@ async def run_boltz_prescoring(state: Dict[str, Any], max_candidates: int = 5) -
     Implements an ANYTIME / incremental scoring strategy: candidates are scored
     one-by-one in PSICHIC-rank order and state['candidate_product'] is reordered
     immediately after each molecule is scored.  This means even if the epoch ends
-    mid-run, the submission already reflects the best Boltz score seen so far —
+    mid-run, the submission already reflects the best Boltz score seen so far --
     not just the raw PSICHIC ranking.
 
     Results are cached in state['boltz_score_cache'] keyed by
     (canonical_smiles, protein_code) so molecules already scored in this session
-    skip inference entirely — saving 45-150 s of GPU time per cache hit.
+    skip inference entirely -- saving 45-150 s of GPU time per cache hit.
 
     The validator uses sample_selection="first" with num_molecules_boltz=1, so the
     molecule placed first in the submission is the one that determines our Boltz score.
@@ -899,7 +966,7 @@ async def run_boltz_prescoring(state: Dict[str, Any], max_candidates: int = 5) -
         bt.logging.warning("Boltz-2 pre-scoring: no candidate molecules available.")
         return
 
-    # Pull a wider slice (3× budget) so the scaffold-diversity filter has
+    # Pull a wider slice (3x budget) so the scaffold-diversity filter has
     # candidates to choose from even when SALSA has converged to one region.
     # global_candidate_pool is capped at 20 rows, so this is at most 20.
     candidates = candidates.head(max_candidates * 3).copy()
@@ -960,7 +1027,7 @@ async def run_boltz_prescoring(state: Dict[str, Any], max_candidates: int = 5) -
         reordered = [best_name] + [n for n in original_names if n != best_name]
         state['candidate_product'] = ','.join(reordered)
         bt.logging.info(
-            f"  → submission updated after {len(scores)}/{len(candidates)} scored: "
+            f"  -> submission updated after {len(scores)}/{len(candidates)} scored: "
             f"best={best_name} (boltz_score={best_score:.4f})"
         )
 
@@ -973,7 +1040,7 @@ async def run_boltz_prescoring(state: Dict[str, Any], max_candidates: int = 5) -
         canon = get_canonical_smiles(smiles)
         key = (canon, protein)
 
-        # --- Cache lookup (in-memory → disk → GPU inference) ---
+        # --- Cache lookup (in-memory -> disk -> GPU inference) ---
         if key in boltz_cache:
             score = boltz_cache[key]
             bt.logging.debug(f"[{i+1}/{len(candidates)}] in-memory cache hit: {score:.4f}")
@@ -992,7 +1059,7 @@ async def run_boltz_prescoring(state: Dict[str, Any], max_candidates: int = 5) -
                     _next_ep = ((_curr_blk // state['epoch_length']) + 1) * state['epoch_length']
                     if _next_ep - _curr_blk < 5:
                         bt.logging.info(
-                            f"[{i+1}/{len(candidates)}] epoch ends in <5 blocks — "
+                            f"[{i+1}/{len(candidates)}] epoch ends in <5 blocks -- "
                             f"stopping Boltz after {len(all_scores)}/{len(candidates)} scored."
                         )
                         break
@@ -1031,7 +1098,7 @@ async def run_boltz_prescoring(state: Dict[str, Any], max_candidates: int = 5) -
                         adaptive_trigger = int(elapsed * max_candidates / 12) + 20
                         state['boltz_trigger_blocks'] = max(adaptive_trigger, 30)
                         bt.logging.info(
-                            f"  adaptive timing: {elapsed:.1f}s/mol → "
+                            f"  adaptive timing: {elapsed:.1f}s/mol -> "
                             f"trigger={state['boltz_trigger_blocks']} blocks"
                         )
                 except Exception as e:
@@ -1041,7 +1108,7 @@ async def run_boltz_prescoring(state: Dict[str, Any], max_candidates: int = 5) -
 
         all_scores[smiles] = score
 
-        # Reorder submission immediately — anytime guarantee: if epoch ends
+        # Reorder submission immediately -- anytime guarantee: if epoch ends
         # after this molecule, the best Boltz score seen so far is at position 0.
         _reorder_submission(all_scores)
 
@@ -1052,13 +1119,13 @@ async def run_boltz_prescoring(state: Dict[str, Any], max_candidates: int = 5) -
         f"{len(valid_scores)}/{len(candidates)} molecules scored."
     )
 
-    # §FF: Boltz-guided SALSA — second SALSA pass seeded from the best Boltz molecule.
+    # §FF: Boltz-guided SALSA -- second SALSA pass seeded from the best Boltz molecule.
     # The main loop above uses the PSICHIC-ranked candidate pool as seeds; PSICHIC and
     # Boltz-2 correlate imperfectly, so the validated Boltz winner may occupy a different
     # region of chemical space.  By running SALSA from the actual best-Boltz SMILES we
     # explore its chemical neighbourhood and may find SAVI-2020 molecules that score
-    # even better — without any additional PSICHIC overhead.
-    # Only fires when the epoch has ≥2 mol-lengths + 2 min of runway remaining.
+    # even better -- without any additional PSICHIC overhead.
+    # Only fires when the epoch has >=2 mol-lengths + 2 min of runway remaining.
     _ff_best_smiles = max(all_scores, key=lambda s: all_scores.get(s, -math.inf), default=None)
     _savi_pool_ff = state.get('savi_stream_pool')
     if (
@@ -1074,20 +1141,20 @@ async def run_boltz_prescoring(state: Dict[str, Any], max_candidates: int = 5) -
             _t_per_mol_ff = state.get('boltz_time_per_mol', 150.0)
             if _remaining_s_ff > _t_per_mol_ff * 2 + 120:
                 bt.logging.info(
-                    f"§FF Boltz-guided SALSA: {_remaining_s_ff:.0f}s remaining — "
+                    f"§FF Boltz-guided SALSA: {_remaining_s_ff:.0f}s remaining -- "
                     f"seeding 2-round SALSA from best Boltz molecule..."
                 )
                 ff_salsa_hits = await asyncio.to_thread(
                     run_salsa_search,
                     _ff_best_smiles,
                     _savi_pool_ff,
-                    2,   # rounds (fewer — time is limited)
+                    2,   # rounds (fewer -- time is limited)
                     60,  # n_perturb
                     3,   # top_k
                 )
                 if not ff_salsa_hits.empty:
                     bt.logging.info(
-                        f"§FF: {len(ff_salsa_hits)} Boltz-guided SALSA hits — scoring with Boltz..."
+                        f"§FF: {len(ff_salsa_hits)} Boltz-guided SALSA hits -- scoring with Boltz..."
                     )
                     _ff_best_score = max(
                         (v for v in all_scores.values() if math.isfinite(v)), default=-math.inf
@@ -1106,7 +1173,7 @@ async def run_boltz_prescoring(state: Dict[str, Any], max_candidates: int = 5) -
                                 _curr_blk2 = await state['subtensor'].get_current_block()
                                 _next_ep2 = ((_curr_blk2 // state['epoch_length']) + 1) * state['epoch_length']
                                 if _next_ep2 - _curr_blk2 < 5:
-                                    bt.logging.info("§FF: epoch ends in <5 blocks — stopping.")
+                                    bt.logging.info("§FF: epoch ends in <5 blocks -- stopping.")
                                     break
                             except Exception:
                                 pass
@@ -1146,7 +1213,7 @@ async def run_boltz_prescoring(state: Dict[str, Any], max_candidates: int = 5) -
                                 else:
                                     state['candidate_product'] = ','.join([_ff_pname] + _orig)
                                 bt.logging.info(
-                                    f"§FF: new best from Boltz-guided SALSA — "
+                                    f"§FF: new best from Boltz-guided SALSA -- "
                                     f"{_ff_pname} (boltz={_ff_score:.4f} > prev={_ff_prev_score:.4f})"
                                 )
         except Exception as _ff_err:
@@ -1157,7 +1224,7 @@ async def run_boltz_prescoring(state: Dict[str, Any], max_candidates: int = 5) -
     # best new score.  This covers the scenario where the warm-start molecule
     # (scored in a prior session) was evicted from global_candidate_pool when
     # PSICHIC reset the pool at epoch start, so it never appeared in
-    # `candidates` above — but its cached Boltz score is still valid and may
+    # `candidates` above -- but its cached Boltz score is still valid and may
     # be higher than anything found this epoch.
     best_new = max((v for v in all_scores.values() if math.isfinite(v)), default=-math.inf)
     _ws_best = _disk_cache_get_best(db_path, protein)
@@ -1189,6 +1256,20 @@ async def run_boltz_prescoring(state: Dict[str, Any], max_candidates: int = 5) -
                 f"[WarmGuard] Prior-session molecule retained at position 0: "
                 f"{_ws_pname} (cached={_ws_score:.4f} > epoch_best={best_new:.4f})"
             )
+
+    # §C: Multi-molecule diversity reordering.
+    # When num_molecules_boltz > 1, the validator awards a MACCS entropy bonus.
+    # Reorder slots 1..N-1 by decreasing MACCS distance from the best Boltz molecule
+    # so the submitted set maximises structural diversity -- and the bonus -- without
+    # changing the best binder at position 0.
+    # Currently a no-op (num_molecules_boltz == 1), but activates automatically
+    # when the validator increases that parameter.
+    _num_boltz = getattr(state.get('config'), 'num_molecules_boltz', 1)
+    if _num_boltz > 1:
+        try:
+            _reorder_for_diversity(state)
+        except Exception as _div_err:
+            bt.logging.warning(f"§C diversity reorder failed (non-fatal): {_div_err}")
 
 
 # ----------------------------------------------------------------------------
@@ -1248,7 +1329,7 @@ async def run_miner(config: argparse.Namespace) -> None:
         'shutdown_event': asyncio.Event(),
 
         # Boltz score cache: {(canonical_smiles, protein_code): float}
-        # In-memory layer — persists across epochs within a session.
+        # In-memory layer -- persists across epochs within a session.
         'boltz_score_cache': {},
         # Path to persistent SQLite cache (survives process restarts).
         'boltz_cache_db': BOLTZ_CACHE_DB,
@@ -1271,9 +1352,9 @@ async def run_miner(config: argparse.Namespace) -> None:
     _apply_warm_start(state, state['boltz_cache_db'], config.weekly_target)
 
     # Ensure MSA file exists for the current weekly target (§S).
-    # Boltz-2 predictions are significantly weaker without an MSA — this call
+    # Boltz-2 predictions are significantly weaker without an MSA -- this call
     # is a no-op when the file already exists and fetches it via ColabFold
-    # API (~1–5 min) only when the target has rotated to a new protein.
+    # API (~1-5 min) only when the target has rotated to a new protein.
     try:
         _target_seq = get_sequence_from_protein_code(config.weekly_target)
         if _target_seq:
@@ -1284,7 +1365,7 @@ async def run_miner(config: argparse.Namespace) -> None:
                     "Boltz-2 will run in single-sequence mode (weaker predictions)."
                 )
         else:
-            bt.logging.warning(f"[MSA] Could not retrieve sequence for {config.weekly_target} — skipping MSA fetch.")
+            bt.logging.warning(f"[MSA] Could not retrieve sequence for {config.weekly_target} -- skipping MSA fetch.")
     except Exception as _msa_exc:
         bt.logging.warning(f"[MSA] MSA check failed (non-fatal): {_msa_exc}")
 
