@@ -143,6 +143,34 @@ def _disk_cache_get_best(db_path: str, protein: str) -> Optional[Tuple[float, st
         return None
 
 
+def _disk_cache_get_candidates(db_path: str, protein: str, limit: int = 20) -> list:
+    """
+    Return up to *limit* cached entries for *protein*, sorted by score desc.
+
+    Used as a synthetic candidate pool in run_boltz_prescoring when PSICHIC
+    has not yet produced candidates (e.g., early-epoch miner restart).  All
+    returned entries will be instant in-memory or disk cache hits — zero GPU
+    time — but the §CC warm-start guard and _reorder_submission will still run
+    correctly, confirming the best historical molecule is at position 0.
+
+    Only returns entries with a valid product_name (required for submission).
+    """
+    try:
+        with sqlite3.connect(db_path) as conn:
+            rows = conn.execute(
+                "SELECT score, smiles, product_name FROM boltz_cache "
+                "WHERE protein=? AND product_name IS NOT NULL "
+                "ORDER BY score DESC LIMIT ?",
+                (protein, limit),
+            ).fetchall()
+        return [
+            {'product_name': pn, 'product_smiles': sm, 'combined_score': sc}
+            for sc, sm, pn in rows
+        ]
+    except Exception:
+        return []
+
+
 def _apply_warm_start(state: Dict[str, Any], db_path: str, protein: str) -> None:
     """
     Pre-populate state['candidate_product'] from the best Boltz-scored molecule
@@ -956,6 +984,10 @@ async def run_boltz_prescoring(state: Dict[str, Any], max_candidates: int = 5) -
         state: Shared miner state dict.
         max_candidates: Maximum number of PSICHIC top-molecules to score with Boltz-2.
     """
+    protein = state['config'].weekly_target
+    boltz_cache: Dict[Tuple[str, str], float] = state.setdefault('boltz_score_cache', {})
+    db_path: str = state.get('boltz_cache_db', BOLTZ_CACHE_DB)
+
     # Prefer global candidate pool (spans entire epoch, sorted by ligand efficiency)
     # so Boltz always evaluates the best molecules seen so far, not just those from
     # the most recent best-batch.  Fall back to current-batch candidates if needed.
@@ -963,8 +995,25 @@ async def run_boltz_prescoring(state: Dict[str, Any], max_candidates: int = 5) -
     if candidates is None or candidates.empty:
         candidates = state.get('candidate_molecules')
     if candidates is None or candidates.empty:
-        bt.logging.warning("Boltz-2 pre-scoring: no candidate molecules available.")
-        return
+        # §JJ — Cache-fallback synthetic pool: when PSICHIC has not yet produced
+        # candidates (e.g., early-epoch miner restart), use disk-cached entries
+        # as a synthetic pool.  All entries are instant cache hits — zero GPU time
+        # — but the §CC warm-start guard and _reorder_submission still execute,
+        # ensuring the best historical molecule stays at position 0 even when
+        # both PSICHIC pools are empty at the time Boltz first triggers.
+        _cached_rows = _disk_cache_get_candidates(db_path, protein, limit=max_candidates)
+        if _cached_rows:
+            candidates = pd.DataFrame(_cached_rows)
+            candidates['heavy_atoms'] = candidates['product_smiles'].apply(
+                lambda s: get_heavy_atom_count(s) or 1
+            )
+            bt.logging.info(
+                f"Boltz-2 §JJ: PSICHIC pools empty — using {len(candidates)} "
+                f"disk-cached entries as synthetic pool (all instant cache hits)."
+            )
+        else:
+            bt.logging.warning("Boltz-2 pre-scoring: no candidate molecules available.")
+            return
 
     # Pull a wider slice (3x budget) so the scaffold-diversity filter has
     # candidates to choose from even when SALSA has converged to one region.
@@ -987,10 +1036,6 @@ async def run_boltz_prescoring(state: Dict[str, Any], max_candidates: int = 5) -
             f"Boltz-2 scaffold diversity: selected {post_div} from {pre_div} Boltz-safe candidates "
             f"({pre_div - post_div} near-duplicate scaffold(s) deferred)"
         )
-
-    protein = state['config'].weekly_target
-    boltz_cache: Dict[Tuple[str, str], float] = state.setdefault('boltz_score_cache', {})
-    db_path: str = state.get('boltz_cache_db', BOLTZ_CACHE_DB)
 
     # Subnet config reused for every single-molecule Boltz call
     subnet_config = {
