@@ -1485,6 +1485,75 @@ conservative — `savi_stream_pool` is only skipped after both flags are set.
 
 ---
 
+## Implemented Optimisations (continued)
+
+### JJ. Cache-Fallback Synthetic Pool in Boltz Pre-scoring (`neurons/miner.py`)
+
+**Problem:** `run_boltz_prescoring` begins by selecting candidates from
+`global_candidate_pool` (falling back to `candidate_molecules`).  When both pools are
+empty — typically when a miner restarts late in an epoch before PSICHIC streaming has had
+time to produce results — the function returns immediately with a warning and
+`boltz_prescored` is set to `True` by the caller.
+
+The only Boltz trigger slot for the early-epoch restart window has now been consumed by a
+no-op.  If PSICHIC later finds new candidates and resets `boltz_prescored = False`, a
+second Boltz trigger fires and the §CC warm-start guard correctly restores the cached
+best molecule at position 0 — but **only after one wasted trigger**.  More critically,
+if PSICHIC produces no output before the submission window (rare but possible on very
+late restarts), the §CC guard never runs and the submission relies entirely on the
+warm-start molecule already being correct (which it is, but the guard provides an
+additional cross-epoch sanity check).
+
+**Fix:** Added `_disk_cache_get_candidates(db_path, protein, limit)` — a new helper
+that returns all cached entries for the current protein, sorted by score descending.
+
+When both PSICHIC pools are empty at the start of `run_boltz_prescoring`, the function
+now builds a **synthetic candidate pool** from these disk-cache entries and proceeds
+through the full scoring loop:
+
+```
+candidates = state['global_candidate_pool']  # None or empty
+candidates = state['candidate_molecules']     # None or empty
+→ §JJ fallback:
+  cached_rows = _disk_cache_get_candidates(db_path, protein, max_candidates)
+  candidates = pd.DataFrame(cached_rows)      # product_name, product_smiles, combined_score
+  candidates['heavy_atoms'] = ...             # from get_heavy_atom_count()
+```
+
+The synthetic pool is then passed through the same path as a regular pool:
+1. Boltz-safe filter (all previously-scored molecules should pass)
+2. Scaffold-diverse candidate selection
+3. Scoring loop — **all cache hits, zero GPU time**
+4. `_reorder_submission` puts best at position 0
+5. §CC warm-start guard runs and cross-checks the prior-session best
+
+**Result:** The first Boltz trigger is never wasted on a no-op. On an early-epoch restart
+the miner immediately confirms all its historical best molecules (instantly), re-orders
+the submission to reflect the true best across all prior epochs, and sets
+`boltz_prescored = True` having done meaningful work.
+
+**Interaction with `protein`/`db_path` variable placement:** As part of this change,
+`protein` and `db_path` were hoisted from after the empty-pool guard to before it,
+so they are available when building the synthetic pool.  The rest of `run_boltz_prescoring`
+is unchanged.
+
+**Zero regression risk:**
+- If PSICHIC pools are non-empty (the common case), `_disk_cache_get_candidates` is never
+  called and the function behaves identically to before.
+- If the disk cache is empty (first epoch ever), `_cached_rows` is `[]` and the function
+  returns with the existing "no candidate molecules available" warning — identical to
+  the old behaviour.
+- The synthetic pool's `combined_score` values are the cached Boltz scores (≈ 0.0–0.5),
+  different in scale from PSICHIC combined_scores (≈ 0.0–0.1).  This only affects
+  ordering *within* the synthetic pool (ordering by Boltz score descending is correct).
+  PSICHIC pools supersede the synthetic pool in every subsequent chunk of the epoch.
+
+**Files changed:**
+- `neurons/miner.py` — new `_disk_cache_get_candidates` helper; hoisted `protein`/`db_path`
+  before pool check; §JJ fallback block in `run_boltz_prescoring`.
+
+---
+
 ## Files Changed
 
 | File | Change |
@@ -1509,6 +1578,7 @@ conservative — `savi_stream_pool` is only skipped after both flags are set.
 | `neurons/miner.py` | `_scaffold_diverse_candidates` helper; wider candidate slice (3×) + diversity selection in `run_boltz_prescoring` (§EE) |
 | `neurons/miner.py` | §FF Boltz-guided SALSA second pass — seeded from best Boltz molecule; epoch-guarded per-hit Boltz scoring; immediate submission update on improvement |
 | `neurons/miner.py` | §C `_reorder_for_diversity` helper; call site at end of `run_boltz_prescoring` when `num_molecules_boltz > 1` |
+| `neurons/miner.py` | §JJ `_disk_cache_get_candidates` helper; hoisted `protein`/`db_path` before empty-pool guard; synthetic cache-fallback pool in `run_boltz_prescoring` |
 | `BOLTZ2_INTEGRATION.md` | This file |
 
 ---
@@ -1660,4 +1730,3 @@ applies to the combined output of all four operators, so adding ring walk does n
 any existing call sites.
 
 **Files changed:**
-- `utils/salsa.py` — fourth operator pass in `generate_perturbations`; updated docstring.
