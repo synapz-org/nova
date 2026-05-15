@@ -1730,3 +1730,57 @@ applies to the combined output of all four operators, so adding ring walk does n
 any existing call sites.
 
 **Files changed:**
+- `utils/salsa.py` — ring walk operator (4a expansion, 4b contraction) added as fourth pass in `generate_perturbations`.
+
+---
+
+## Implemented Optimisations (continued)
+
+### KK. Post-Boltz Early Submission (`neurons/miner.py`)
+
+**Problem:** The validator breaks ties between miners with equal `boltz_score` (rounded to 4 decimal
+places) using `block_submitted` ascending — the miner that committed *earliest* wins.
+
+The current 20-block submission gate (`blocks_until_epoch ≤ 20`) means all miners submit at most
+20 blocks before epoch end, within a 4-minute window.  When two miners independently discover the
+same or identically-scoring molecule — increasingly likely as the subnet matures and the search
+converges — the miner that submits first wins.
+
+The miner's best Boltz-validated molecule is **already finalised when `run_boltz_prescoring`
+returns**, which can be 40–80 blocks (8–16 minutes) before the epoch ends depending on hardware:
+
+| Hardware | Boltz finishes at | Old submission | §KK submission | Tiebreaker advantage |
+|----------|------------------|----------------|----------------|----------------------|
+| A100 80 GB | ~39 blocks from end | 20 blocks | ~39 blocks | +19 blocks (~4 min) |
+| RTX 4090 | ~58 blocks from end | 20 blocks | ~58 blocks | +38 blocks (~8 min) |
+| RTX 3090 | ~83 blocks from end | 20 blocks | ~83 blocks | +63 blocks (~13 min) |
+
+**Fix:** At the end of `run_boltz_prescoring` (after §CC warm-start guard and §C diversity
+reorder), immediately attempt submission:
+
+```python
+try:
+    if (
+        state.get('candidate_product')
+        and state.get('candidate_product') != state.get('last_submitted_product')
+        and state.get('subtensor') is not None
+    ):
+        bt.logging.info("[KK] Post-Boltz early submission attempt.")
+        await submit_response(state)
+except Exception as _kk_err:
+    bt.logging.warning(f"[KK] Early submission failed (non-fatal): {_kk_err}")
+```
+
+**Fallback:** `MetadataError` (chain rate-limit: too soon to commit again) is caught inside
+`submit_response` and logged as an info message.  If the rate limit blocks the early call,
+the normal 20-block submission gate handles it identically to the pre-§KK behaviour.
+
+**No regression risk:** The `candidate_product != last_submitted_product` guard prevents
+uploading the same molecule twice.  If PSICHIC subsequently finds a new best (rare after Boltz
+has fired), `candidate_product` changes, `boltz_prescored` resets to `False`, and a second
+Boltz pass fires — §KK runs again from the second Boltz result.  The 20-block gate also re-fires
+if `candidate_product` changed, giving a second submission attempt.
+
+**Files changed:**
+- `neurons/miner.py` — §KK block added at the end of `run_boltz_prescoring` after §C diversity reorder.
+

@@ -1316,6 +1316,30 @@ async def run_boltz_prescoring(state: Dict[str, Any], max_candidates: int = 5) -
         except Exception as _div_err:
             bt.logging.warning(f"§C diversity reorder failed (non-fatal): {_div_err}")
 
+    # §KK. Post-Boltz early submission.
+    # The validator breaks ties between miners with equal Boltz scores using
+    # block_submitted (smallest = earliest wins), then push_time.  Waiting for the
+    # 20-block window means we submit at most 20 blocks before epoch end -- but our
+    # best Boltz molecule is already finalised now.  By submitting immediately after
+    # Boltz validation we secure the earliest possible block_submitted for our
+    # validated candidate, which can be 40–80 blocks (8–16 minutes) earlier on
+    # fast / slow hardware respectively.
+    #
+    # MetadataError (chain rate-limit: too soon to commit again) is caught silently
+    # inside submit_response.  In that case we fall back to the normal 20-block
+    # submission gate with no regression.  The `candidate_product !=
+    # last_submitted_product` guard prevents re-uploading the same molecule.
+    try:
+        if (
+            state.get('candidate_product')
+            and state.get('candidate_product') != state.get('last_submitted_product')
+            and state.get('subtensor') is not None
+        ):
+            bt.logging.info("[KK] Post-Boltz early submission attempt.")
+            await submit_response(state)
+    except Exception as _kk_err:
+        bt.logging.warning(f"[KK] Early submission failed (non-fatal): {_kk_err}")
+
 
 # ----------------------------------------------------------------------------
 # 6. MAIN MINING LOOP
