@@ -40,22 +40,41 @@ def _combined_score(affinity_prob_binary: float, affinity_pred_value: float, hea
 
 
 class ProxyScorer:
-    """Cheap offline proxy. Score based on heavy-atom-normalized random affinity.
+    """Cheap offline proxy. Used both for ranking pre-Boltz2 candidates and
+    standalone (v1) scoring.
 
-    Useful for v1 where real Boltz2 isn't running. The validity filter is
-    where v1's edge actually comes from (vs random sampling); the proxy here
-    just keeps a deterministic ranking so we always submit our "best" candidate.
+    Important: the validator's heavy_atom_normalization combines as
+    (prob_binary - pred_value) / heavy_atoms. A naive uniform-random proxy
+    biases toward the smallest molecules (denominator) and hurts us against
+    random sampling. So:
+      - Prefer mid-range heavy-atom counts (~25-35 is drug-like sweet spot)
+      - Penalize extremes (very small = denominator artifact; very large = bad ADMET)
     """
+
+    # Drug-like sweet spot for heavy atoms (typical small-molecule binders)
+    HA_SWEET_LOW = 20
+    HA_SWEET_HIGH = 40
 
     def __init__(self, rng: Optional[random.Random] = None):
         self.rng = rng or random.Random()
 
+    def _ha_penalty(self, ha: int) -> float:
+        """0 inside [low, high]; quadratic penalty outside."""
+        if ha < self.HA_SWEET_LOW:
+            return (self.HA_SWEET_LOW - ha) ** 2 * 0.005
+        if ha > self.HA_SWEET_HIGH:
+            return (ha - self.HA_SWEET_HIGH) ** 2 * 0.005
+        return 0.0
+
     def score(self, name: str, smiles: str) -> ScoredMolecule:
         ha = _heavy_atom_count(smiles)
-        # Pseudo-affinities so the combined formula is well-defined
-        pb = self.rng.uniform(0.2, 0.9)
-        pv = self.rng.uniform(-2.0, 0.0)
-        s = _combined_score(pb, pv, ha)
+        # Mock affinity components — fixed distribution so randomness adds
+        # tie-breaking variation but not magnitude
+        pb = self.rng.uniform(0.4, 0.7)
+        pv = self.rng.uniform(-1.0, -0.3)
+        base = _combined_score(pb, pv, ha)
+        # Subtract penalty for non-drug-like size (higher is better, so penalty reduces score)
+        s = base - self._ha_penalty(ha)
         return ScoredMolecule(
             name=name,
             smiles=smiles,

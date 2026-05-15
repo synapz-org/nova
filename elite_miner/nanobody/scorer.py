@@ -25,17 +25,29 @@ class ScoredNanobody:
 
 
 class ProxyNanobodyScorer:
-    """Offline proxy for v1. Score ~ -length + noise to weakly prefer
-    moderate-length sequences that exercise CDR3 surface area.
+    """Offline proxy for v1. Penalty for length extremes (too short = won't bind,
+    too long = expression/stability issues). Sweet spot: 110-130 (typical VHH).
+
+    Lower score is better (mirrors validator's boltzgen_rank_mode='min').
     """
+
+    SWEET_LOW = 110
+    SWEET_HIGH = 130
 
     def __init__(self, rng: Optional[random.Random] = None):
         self.rng = rng or random.Random()
 
+    def _length_penalty(self, length: int) -> float:
+        if length < self.SWEET_LOW:
+            return (self.SWEET_LOW - length) ** 2 * 0.1
+        if length > self.SWEET_HIGH:
+            return (length - self.SWEET_HIGH) ** 2 * 0.1
+        return 0.0
+
     def score(self, seq: str) -> ScoredNanobody:
-        # Pseudo rank_sum: lower is better. Add noise so equal-length sequences
-        # don't tie, which would let block_submitted tiebreaker dominate.
-        proxy = -len(seq) + self.rng.uniform(0, 5)
+        # Random tiebreak noise + length penalty (lower is better)
+        noise = self.rng.uniform(0, 5)
+        proxy = self._length_penalty(len(seq)) + noise
         return ScoredNanobody(sequence=seq, score=proxy)
 
     def score_batch(self, sequences: list[str]) -> list[ScoredNanobody]:

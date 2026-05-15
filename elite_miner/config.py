@@ -25,10 +25,10 @@ def parse_arguments() -> argparse.Namespace:
                         help="Search loop iterations per epoch (per track)")
     parser.add_argument("--use_inference", action="store_true",
                         help="Use real Boltz2/BoltzGen scoring (requires GPU). Default: proxy scoring.")
-    parser.add_argument("--enable_molecule_track", action="store_true", default=True,
-                        help="Enable molecule track (default: on)")
-    parser.add_argument("--enable_nanobody_track", action="store_true", default=True,
-                        help="Enable nanobody track (default: on)")
+    parser.add_argument("--disable_molecule_track", action="store_true",
+                        help="Disable molecule track (default: enabled)")
+    parser.add_argument("--disable_nanobody_track", action="store_true",
+                        help="Disable nanobody track (default: enabled)")
     parser.add_argument("--no_uniqueness_check", action="store_true",
                         help="Skip HF archive uniqueness check (faster, but may submit duplicates)")
     parser.add_argument("--log_level", default="info", choices=["debug", "info", "warning", "error"],
@@ -40,9 +40,8 @@ def parse_arguments() -> argparse.Namespace:
 
     config = bt.config(parser)
     subnet_cfg = load_config()
-    # Merge subnet config (config.yaml) into argparse namespace
-    for k, v in subnet_cfg.items():
-        setattr(config, k, v)
+    # bt.config is a Munch (dict-like). Use update() so dict access also works.
+    config.update(subnet_cfg)
 
     config.full_path = os.path.expanduser(
         "{}/{}/{}/netuid{}/elite_miner".format(
