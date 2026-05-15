@@ -15,7 +15,6 @@ from __future__ import annotations
 
 import asyncio
 import os
-import random
 import sys
 import traceback
 from typing import Any, Optional
@@ -516,6 +515,8 @@ async def run_miner(config) -> None:
 
     bdt = _get_quicknet_timelock()()
     github_path = build_github_path()
+    # Rate limiter persists across reconnects (block history is global to subnet)
+    rate_limiter = SubmissionRateLimiter(config.no_submission_blocks)
 
     bt.logging.info("entering main mining loop")
     last_epoch_block = -1
@@ -533,9 +534,8 @@ async def run_miner(config) -> None:
                     "epoch_length": epoch_length,
                     "bdt": bdt,
                     "github_path": github_path,
-                    "rate_limiter": getattr(run_miner, "_rl", None) or SubmissionRateLimiter(config.no_submission_blocks),
+                    "rate_limiter": rate_limiter,
                 }
-                run_miner._rl = state["rate_limiter"]
 
                 epoch_state = await get_epoch_state(subtensor, epoch_length)
                 if epoch_state.last_boundary != last_epoch_block:
