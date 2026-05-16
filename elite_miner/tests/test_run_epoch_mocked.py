@@ -63,6 +63,10 @@ def _build_config():
         no_uniqueness_check=True,   # skip HF lookups in tests
         disable_molecule_track=False,
         disable_nanobody_track=False,
+        surrogate_model_dir=None,
+        surrogate_batch_size=5000,
+        surrogate_topk=5,
+        surrogate_min_spearman=0.0,
     )
 
 

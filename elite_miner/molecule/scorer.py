@@ -92,12 +92,24 @@ class Boltz2Scorer:
 
     Lazy-imports torch/boltz so the rest of the miner can be tested without
     a CUDA env. Activate via --use-inference at the run.py level.
+
+    Side effect: every successful score is appended to cache/labels/{target}.parquet
+    as training data for the surrogate. Disable via stream_labels=False.
     """
 
-    def __init__(self, target: str, clip_interval=None, config_path: Optional[str] = None):
+    def __init__(
+        self,
+        target: str,
+        clip_interval=None,
+        config_path: Optional[str] = None,
+        stream_labels: bool = True,
+        labels_path: Optional[str] = None,
+    ):
         self.target = target
         self.clip_interval = clip_interval
         self.config_path = config_path
+        self.stream_labels = stream_labels
+        self._labels_path = labels_path
         self._wrapper = None  # lazy
 
     def _ensure_loaded(self):
@@ -126,6 +138,7 @@ class Boltz2Scorer:
 
         # Map per-molecule components back to our ScoredMolecule objects
         out: list[ScoredMolecule] = []
+        label_rows: list[dict] = []
         per_mol = getattr(self._wrapper, "per_molecule_components", {}) or {}
         for name, smiles in candidates:
             ha = _heavy_atom_count(smiles)
@@ -135,15 +148,35 @@ class Boltz2Scorer:
                 continue
             pb = metrics.get("affinity_probability_binary", 0.0)
             pv = metrics.get("affinity_pred_value", 0.0)
+            score = _combined_score(pb, pv, ha)
             out.append(
                 ScoredMolecule(
                     name=name,
                     smiles=smiles,
                     heavy_atoms=ha,
-                    score=_combined_score(pb, pv, ha),
+                    score=score,
                     raw=metrics,
                 )
             )
+            label_rows.append({
+                "smiles": smiles,
+                "name": name,
+                "heavy_atoms": ha,
+                "target": self.target,
+                "pb": float(pb),
+                "pv": float(pv),
+                "raw_score": float(score),
+            })
+
+        if self.stream_labels and label_rows:
+            try:
+                from .label_writer import append_labels, default_path
+                path = self._labels_path or default_path(self.target)
+                append_labels(path, label_rows)
+            except Exception:
+                # Never let label streaming break scoring — it's free data, not critical
+                pass
+
         return out
 
 

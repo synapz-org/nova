@@ -25,6 +25,15 @@ def parse_arguments() -> argparse.Namespace:
                         help="Search loop iterations per epoch (per track)")
     parser.add_argument("--use_inference", action="store_true",
                         help="Use real Boltz2/BoltzGen scoring (requires GPU). Default: proxy scoring.")
+    parser.add_argument("--surrogate_model_dir", default=None,
+                        help="Path to trained LightGBM surrogate. If unset, proxy scoring is used.")
+    parser.add_argument("--surrogate_batch_size", type=int, default=5000,
+                        help="Candidate pool size per batch when surrogate is active "
+                             "(surrogate inference is cheap, so we widen).")
+    parser.add_argument("--surrogate_topk", type=int, default=5,
+                        help="Top-K from surrogate to send to real Boltz2 when --use_inference.")
+    parser.add_argument("--surrogate_min_spearman", type=float, default=0.0,
+                        help="Refuse a surrogate model with holdout spearman below this threshold.")
     parser.add_argument("--disable_molecule_track", action="store_true",
                         help="Disable molecule track (default: enabled)")
     parser.add_argument("--disable_nanobody_track", action="store_true",

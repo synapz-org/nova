@@ -43,6 +43,9 @@ from elite_miner.molecule import (
     warm_archive_cache as warm_mol_cache,
     is_molecule_unique,
 )
+from elite_miner.molecule.surrogate import SurrogateScorer
+from elite_miner.molecule.diversity import DiversityTracker
+from elite_miner.protein.features import target_features as protein_target_features
 from elite_miner.nanobody import (
     NanobodyFilter,
     NanobodyValidityConfig,
@@ -132,9 +135,33 @@ class MoleculeTrack:
         })
         self.skip_unique = config.no_uniqueness_check
         self.use_inference = config.use_inference
+
+        # Surrogate is the pre-ranker when a model directory is configured + a model
+        # is present + holdout spearman exceeds the threshold. Falls back to proxy
+        # transparently otherwise. The boundary between proxy and surrogate is here.
+        self.surrogate: Optional[SurrogateScorer] = None
+        if getattr(config, "surrogate_model_dir", None):
+            try:
+                tgt_feats = protein_target_features(self.targets[0])
+            except Exception as e:
+                bt.logging.warning(f"molecule: protein features unavailable for surrogate: {e}")
+                tgt_feats = None
+            self.surrogate = SurrogateScorer(
+                model_dir=config.surrogate_model_dir,
+                target_features=tgt_feats,
+                min_spearman=getattr(config, "surrogate_min_spearman", 0.0),
+            )
+            if self.surrogate.is_ready:
+                bt.logging.info(
+                    f"molecule: surrogate ready (holdout_spearman="
+                    f"{self.surrogate.metrics.spearman_rho:.3f if self.surrogate.metrics else 'n/a'})"
+                )
+            else:
+                bt.logging.warning(
+                    f"molecule: surrogate not ready ({self.surrogate.fallback_reason}); using proxy"
+                )
+
         # In inference mode we score against the *primary* target (first one).
-        # Multi-target scoring requires multiple runs and a combine step which we
-        # defer to v2.
         if self.use_inference:
             self.scorer = Boltz2Scorer(target=self.targets[0])
         else:
@@ -142,7 +169,30 @@ class MoleculeTrack:
         self.searcher: Optional[CombinatorialSearcher] = None
         self.best: Optional[ScoredMolecule] = None
         self.candidates_scored = 0
-        self.proxy = MolProxyScorer()  # always available for top-N pre-filter
+        self.proxy = MolProxyScorer()  # always available
+        # Diversity guard: detect mode collapse across recent submissions
+        self.diversity = DiversityTracker(
+            window_size=getattr(config, "diversity_window", 20),
+            similarity_threshold=getattr(config, "diversity_threshold", 0.85),
+        )
+
+    def _pre_rank_scorer(self):
+        """The scorer used to triage large candidate pools before real Boltz2.
+        Prefers surrogate when available AND no mode collapse detected.
+        Falls back to proxy on either condition."""
+        if self.surrogate is None or not self.surrogate.is_ready:
+            return self.proxy
+        if self.diversity.is_collapsed():
+            bt.logging.warning(
+                f"molecule: diversity collapse (median sim={self.diversity.median_similarity():.3f}) "
+                f"— falling back to proxy this batch"
+            )
+            return self.proxy
+        return self.surrogate
+
+    def record_submission(self, smiles: str) -> None:
+        """Hook to record our submitted SMILES for diversity tracking."""
+        self.diversity.record(smiles)
 
     def reset_for_epoch(self, rxn_id: int) -> None:
         bt.logging.info(f"molecule: epoch start rxn={rxn_id} targets={self.targets}")
@@ -164,10 +214,18 @@ class MoleculeTrack:
             return False  # conservative
 
     def search_one_batch(self, batch_size: Optional[int] = None) -> Optional[ScoredMolecule]:
-        """Search → filter → uniqueness → score → rank. Returns best of this batch."""
+        """Search → filter → uniqueness → (surrogate pre-rank) → score → rank.
+        Returns best of this batch.
+
+        When surrogate is ready, we can sample MUCH bigger batches (10x-100x normal
+        batch_size) because surrogate inference is millisecond-fast vs Boltz2's seconds.
+        """
         if self.searcher is None:
             return None
         size = batch_size if batch_size is not None else self.config.batch_size
+        # If surrogate is live, expand the search budget — that's the whole point
+        if self.surrogate is not None and self.surrogate.is_ready and batch_size is None:
+            size = max(size, getattr(self.config, "surrogate_batch_size", size * 10))
 
         raw = self.searcher.generate_batch(size)
         valid = self.vfilter.filter_batch(raw)
@@ -176,14 +234,17 @@ class MoleculeTrack:
         if not valid:
             return None
 
+        pre_ranker = self._pre_rank_scorer()
+        pre_scored = pre_ranker.score_batch(valid)
+
         if self.use_inference:
-            # Pre-rank by cheap proxy, then run real Boltz2 on top 5 only.
-            proxy_scored = self.proxy.score_batch(valid)
-            top = mol_rank(proxy_scored)[:5]
+            # Take top-K by pre-ranker, then run real Boltz2 to refine
+            topk = getattr(self.config, "surrogate_topk", 5)
+            top = mol_rank(pre_scored)[:topk]
             candidates = [(c.name, c.smiles) for c in top]
             scored = self.scorer.score_batch(candidates, self.subnet_cfg)
         else:
-            scored = self.proxy.score_batch(valid)
+            scored = pre_scored
 
         self.candidates_scored += len(scored)
         ranked = mol_rank(scored)
@@ -357,6 +418,9 @@ async def _try_submit(state, mt, nt) -> bool:
     # After awaiting set_commitment, re-read block — the extrinsic may have landed later.
     landed_block = await state["subtensor"].get_current_block()
     rl.record_submission(landed_block)
+    # Track submitted SMILES for diversity guard
+    if mt is not None and mt.best is not None:
+        mt.record_submission(mt.best.smiles)
     return True
 
 
