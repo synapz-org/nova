@@ -7,3 +7,7 @@ venv/
 combinatorial_db/molecules.sqlite
 combinatorial_db/molecules.sqlite-shm
 combinatorial_db/molecules.sqlite-wal
+
+# Phase 2 surrogate artifacts (trained from real Boltz2 — preserve locally, don't commit binary)
+models/
+cache/

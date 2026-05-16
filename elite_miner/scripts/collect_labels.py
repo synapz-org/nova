@@ -183,7 +183,9 @@ def run_boltz2_scoring(
     label schema."""
     from elite_miner.molecule.scorer import Boltz2Scorer
 
-    scorer = Boltz2Scorer(target=target)
+    # Disable label streaming inside the scorer — this script writes its own rows
+    # explicitly via append_parquet. Without this flag, every row gets written twice.
+    scorer = Boltz2Scorer(target=target, stream_labels=False)
     rows = []
     run_id = hashlib.sha256(f"{target}-{dt.datetime.now()}".encode()).hexdigest()[:12]
 
