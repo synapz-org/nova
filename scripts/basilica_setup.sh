@@ -53,6 +53,9 @@ pip install lightgbm pyarrow
 echo "=== Install boltz (vendored) ==="
 pip install -e ./external_tools/boltz
 
+echo "=== Install boltzgen (vendored) ==="
+pip install -e ./external_tools/boltzgen
+
 echo "=== Install torch 2.7.1 cu126 (boltz needs this exact version, will pull torch 2.12 otherwise) ==="
 pip install --quiet 'torch==2.7.1' 'torchvision==0.22.1' 'torchaudio==2.7.1' \
     --index-url https://download.pytorch.org/whl/cu126
