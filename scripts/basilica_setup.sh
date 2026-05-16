@@ -50,6 +50,31 @@ pip install -r requirements/requirements.txt
 echo "=== Install Phase 2 extras ==="
 pip install lightgbm pyarrow
 
+echo "=== Install boltz (vendored) ==="
+pip install -e ./external_tools/boltz
+
+echo "=== Install torch 2.7.1 cu126 (boltz needs this exact version, will pull torch 2.12 otherwise) ==="
+pip install --quiet 'torch==2.7.1' 'torchvision==0.22.1' 'torchaudio==2.7.1' \
+    --index-url https://download.pytorch.org/whl/cu126
+
+echo "=== Stub timelock (label collection doesn't need real timelock encryption) ==="
+SITE_PKG="$(python -c 'import site; print(site.getsitepackages()[0])')"
+cat > "${SITE_PKG}/timelock.py" <<'PYEOF'
+# Stub for label collection. Real mining (which calls drand encrypt) requires
+# the maturin-built timelock from external_tools/timelock/. Build via:
+#   cd external_tools/timelock && uv pip install --upgrade build && python3 -m build && uv pip install timelock
+class Timelock:
+    def __init__(self, *a, **kw): pass
+    def encrypt(self, *a, **kw): raise NotImplementedError("timelock stub")
+    def decrypt(self, *a, **kw): raise NotImplementedError("timelock stub")
+PYEOF
+
+echo "=== Download combinatorial DB ==="
+if [ ! -s combinatorial_db/molecules.sqlite ]; then
+    wget -q 'https://huggingface.co/datasets/Metanova/Mol-Rxn-DB/resolve/main/molecules.sqlite?download=true' \
+        -O combinatorial_db/molecules.sqlite
+fi
+
 echo "=== Sanity check ==="
 python -c "
 import sys
