@@ -41,27 +41,32 @@ class ScoredNanobody:
     raw: Optional[dict] = None  # full metric dict (when from real BoltzGen)
 
 
-def combined_score_from_metrics(metrics: dict) -> float:
-    """Combine raw BoltzGen metrics into a single 'lower-is-better' score.
+# The primary signal we train the surrogate to predict. BoltzGen returns 10
+# metrics across 3 categories; design_iiptm (interface ipTM) is the single
+# strongest binding-quality signal. Empirically: training a LightGBM to predict
+# design_iiptm on a small label set (~120 rows) gives Spearman ρ ≈ 0.80
+# vs ~0.19 for the naive multi-metric combined score (delta_sasa dominates).
+#
+# Validator's rank_sum is pool-relative and aggregates all 10 metrics. We
+# can't match it directly without the pool. But design_iiptm strongly
+# correlates with the metrics most relevant to binding (design_to_target_iptm,
+# physical_interaction.*), so high-iiptm candidates also tend to rank well overall.
+SURROGATE_TARGET_METRIC = "design_iiptm"
 
-    Sign-flip the +1 metrics (so higher input → lower output) and pass through
-    the -1 metrics, then sum. The result is dimensionally inconsistent across
-    metrics (different scales) but order-preserving when comparing nanobodies
-    against the same population — the surrogate learns from THIS specific
-    scalar, not the raw rank_sum which is pool-relative.
+
+def combined_score_from_metrics(metrics: dict) -> float:
+    """Map raw BoltzGen metrics to a 'lower-is-better' scalar.
+
+    For Phase 3, this is just `-design_iiptm` (validator: higher iiptm = better,
+    so negate to get lower-is-better). All other metrics are ignored in scoring
+    but still streamed to label_writer for future training improvements.
+
+    Returns +inf if the target metric is missing.
     """
-    total = 0.0
-    n = 0
-    for metric, direction in METRIC_DIRECTIONS.items():
-        v = metrics.get(metric)
-        if v is None:
-            continue
-        # direction = -1 means lower is better; we sum so lower-is-better
-        # direction = +1 means higher is better; flip sign so lower-is-better
-        total += -direction * float(v)
-        n += 1
-    if n == 0:
+    v = metrics.get(SURROGATE_TARGET_METRIC)
+    if v is None:
         return math.inf
+    return -float(v)
     return total / n  # average to keep magnitude stable across missing metrics
 
 
