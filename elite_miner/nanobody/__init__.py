@@ -12,6 +12,9 @@ from .templates import VHHTemplate, TEMPLATES, list_templates, get_template
 from .generator import NanobodyGenerator, GenerationConfig
 from .uniqueness import is_nanobody_unique, filter_unique, warm_archive_cache
 from .scorer import ProxyNanobodyScorer, BoltzGenScorer, ScoredNanobody, rank
+from .surrogate import NanobodySurrogateScorer, NanobodySurrogateMetrics
+from .diversity import NanobodyDiversityTracker
+from .features import nb_features, nb_features_batch, feature_dim as nb_feature_dim
 
 __all__ = [
     "NanobodyFilter",

@@ -1,12 +1,13 @@
 """Nanobody scoring: proxy (offline) + BoltzGen (real inference, gated).
 
-The validator's BoltzGen scoring produces per-(seq, target) components with
-confidence_rank_sum / physical_interaction_rank_sum / developability_rank_sum,
-combined to a final score via min-max weighted rank. Lower is better.
+The validator's BoltzGen scoring produces per-(seq, target) components — a flat
+dict of raw metric values (design_iiptm, plip_hbonds_refolded, etc.). The
+validator then ranks across the whole submission pool and aggregates to a
+rank_sum (lower is better). We can't predict rank_sum directly (it's pool-
+relative), but we CAN predict raw metric values and combine them into a
+pseudo-rank-sum at score time using signed normalization.
 
-For v1 (no real inference), the proxy is a length-normalized random score
-so we still produce a deterministic ranking. The competitive edge in v1
-comes entirely from the validity filter passing more candidates through.
+For v1 (no real inference), the proxy is a length-penalized random score.
 """
 
 from __future__ import annotations
@@ -17,19 +18,55 @@ from dataclasses import dataclass
 from typing import Optional
 
 
+# Validator's metric directions (mirrors config/boltzgen_config.yaml).
+# +1 = higher is better, -1 = lower is better.
+METRIC_DIRECTIONS = {
+    "design_iiptm": +1,
+    "design_ptm": +1,
+    "design_to_target_iptm": +1,
+    "min_design_to_target_pae": -1,
+    "interaction_pae": -1,
+    "plip_hbonds_refolded": +1,
+    "plip_saltbridge_refolded": +1,
+    "delta_sasa_refolded": +1,
+    "liability_score": -1,
+    "liability_num_violations": -1,
+}
+
+
 @dataclass
 class ScoredNanobody:
     sequence: str
     score: float  # lower is better (matches validator's rank_sum semantics)
-    raw: Optional[dict] = None  # full component dict when from real BoltzGen
+    raw: Optional[dict] = None  # full metric dict (when from real BoltzGen)
+
+
+def combined_score_from_metrics(metrics: dict) -> float:
+    """Combine raw BoltzGen metrics into a single 'lower-is-better' score.
+
+    Sign-flip the +1 metrics (so higher input → lower output) and pass through
+    the -1 metrics, then sum. The result is dimensionally inconsistent across
+    metrics (different scales) but order-preserving when comparing nanobodies
+    against the same population — the surrogate learns from THIS specific
+    scalar, not the raw rank_sum which is pool-relative.
+    """
+    total = 0.0
+    n = 0
+    for metric, direction in METRIC_DIRECTIONS.items():
+        v = metrics.get(metric)
+        if v is None:
+            continue
+        # direction = -1 means lower is better; we sum so lower-is-better
+        # direction = +1 means higher is better; flip sign so lower-is-better
+        total += -direction * float(v)
+        n += 1
+    if n == 0:
+        return math.inf
+    return total / n  # average to keep magnitude stable across missing metrics
 
 
 class ProxyNanobodyScorer:
-    """Offline proxy for v1. Penalty for length extremes (too short = won't bind,
-    too long = expression/stability issues). Sweet spot: 110-130 (typical VHH).
-
-    Lower score is better (mirrors validator's boltzgen_rank_mode='min').
-    """
+    """Offline proxy. Penalty for length extremes (sweet spot 110-130)."""
 
     SWEET_LOW = 110
     SWEET_HIGH = 130
@@ -45,7 +82,6 @@ class ProxyNanobodyScorer:
         return 0.0
 
     def score(self, seq: str) -> ScoredNanobody:
-        # Random tiebreak noise + length penalty (lower is better)
         noise = self.rng.uniform(0, 5)
         proxy = self._length_penalty(len(seq)) + noise
         return ScoredNanobody(sequence=seq, score=proxy)
@@ -57,13 +93,21 @@ class ProxyNanobodyScorer:
 class BoltzGenScorer:
     """Wraps vendored BoltzGen for miner-side scoring.
 
-    Lazy-imports the wrapper so this module is importable without the heavy
-    boltzgen deps installed. Activate via --use-inference at the run.py level.
+    Streams raw metrics to cache/nb_labels/{target}.parquet (free training data).
+    Returns ScoredNanobody whose `score` is the combined min-is-better scalar.
     """
 
-    def __init__(self, target: str, clip_interval=None):
+    def __init__(
+        self,
+        target: str,
+        clip_interval=None,
+        stream_labels: bool = True,
+        labels_path: Optional[str] = None,
+    ):
         self.target = target
         self.clip_interval = clip_interval
+        self.stream_labels = stream_labels
+        self._labels_path = labels_path
         self._wrapper = None  # lazy
 
     def _ensure_loaded(self):
@@ -73,30 +117,40 @@ class BoltzGenScorer:
         self._wrapper = BoltzgenWrapper()
 
     def score_batch(self, sequences: list[str], subnet_config: dict) -> list[ScoredNanobody]:
-        """Run BoltzGen on a batch of candidate sequences against self.target."""
         self._ensure_loaded()
-        # Validator-shape input: pretend one uid=0 owns all our candidates
-        nanobodies_by_uid = {0: {"sequences": sequences, "hashes": [str(i) for i in range(len(sequences))]}}
+        from .filters import seq_hash
+        # Validator-shape input: pretend uid=0 owns all candidates.
+        # Pass sequence hashes so the wrapper's seq_idx → seq map works.
+        hashes = [seq_hash(s) for s in sequences]
+        nanobodies_by_uid = {0: {"sequences": sequences, "hashes": hashes}}
         per_nb_components = self._wrapper.run_nanobody_inference(nanobodies_by_uid, subnet_config)
 
         out: list[ScoredNanobody] = []
+        label_rows: list[dict] = []
+        # per_nanobody_components keyed [uid][seq][target] — same bug class as Boltz2
         uid_components = (per_nb_components or {}).get(0, {})
-        for i, seq in enumerate(sequences):
-            seq_components = uid_components.get(str(i), {})
+        for seq in sequences:
+            seq_components = uid_components.get(seq, {})
             target_components = seq_components.get(self.target, {})
             if not target_components:
                 out.append(ScoredNanobody(sequence=seq, score=math.inf))
                 continue
-            # Conservative: use confidence_rank_sum if available, else sum of all rank_sums
-            confidence_rs = target_components.get("confidence_rank_sum")
-            physical_rs = target_components.get("physical_interaction_rank_sum")
-            developability_rs = target_components.get("developability_rank_sum")
-            parts = [v for v in (confidence_rs, physical_rs, developability_rs) if v is not None]
-            score = sum(parts) if parts else math.inf
+            score = combined_score_from_metrics(target_components)
             out.append(ScoredNanobody(sequence=seq, score=score, raw=target_components))
+            label_rows.append((seq, target_components))
+
+        if self.stream_labels and label_rows:
+            try:
+                from .label_writer import append_labels, default_path, make_label_row
+                path = self._labels_path or default_path(self.target)
+                rows = [make_label_row(s, self.target, m) for s, m in label_rows]
+                append_labels(path, rows)
+            except Exception:
+                pass
+
         return out
 
 
 def rank(scored: list[ScoredNanobody]) -> list[ScoredNanobody]:
-    """Sort ascending by score (lower rank_sum is better; validator boltzgen_rank_mode='min')."""
+    """Sort ascending by score (lower is better)."""
     return sorted(scored, key=lambda s: s.score)

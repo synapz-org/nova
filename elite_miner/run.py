@@ -45,6 +45,8 @@ from elite_miner.molecule import (
 )
 from elite_miner.molecule.surrogate import SurrogateScorer
 from elite_miner.molecule.diversity import DiversityTracker
+from elite_miner.nanobody.surrogate import NanobodySurrogateScorer
+from elite_miner.nanobody.diversity import NanobodyDiversityTracker
 from elite_miner.protein.features import target_features as protein_target_features
 from elite_miner.nanobody import (
     NanobodyFilter,
@@ -302,6 +304,29 @@ class NanobodyTrack:
         self.skip_unique = config.no_uniqueness_check
         self.use_inference = config.use_inference
 
+        # Phase 3 surrogate: when configured, replaces proxy as pre-ranker
+        self.surrogate: Optional[NanobodySurrogateScorer] = None
+        if getattr(config, "nb_surrogate_model_dir", None):
+            try:
+                tgt_feats = protein_target_features(self.targets[0])
+            except Exception as e:
+                bt.logging.warning(f"nanobody: protein features unavailable for surrogate: {e}")
+                tgt_feats = None
+            self.surrogate = NanobodySurrogateScorer(
+                model_dir=config.nb_surrogate_model_dir,
+                target_features=tgt_feats,
+                min_spearman=getattr(config, "nb_surrogate_min_spearman", 0.0),
+            )
+            if self.surrogate.is_ready:
+                rho = self.surrogate.metrics.spearman_rho if self.surrogate.metrics else None
+                bt.logging.info(
+                    f"nanobody: surrogate ready (holdout_spearman={rho})"
+                )
+            else:
+                bt.logging.warning(
+                    f"nanobody: surrogate not ready ({self.surrogate.fallback_reason}); using proxy"
+                )
+
         if self.use_inference:
             self.scorer = BoltzGenScorer(target=self.targets[0])
         else:
@@ -309,6 +334,26 @@ class NanobodyTrack:
         self.proxy = ProxyNanobodyScorer()  # always available
         self.best: Optional[ScoredNanobody] = None
         self.candidates_scored = 0
+        # Mode-collapse guard: pairwise sequence identity over recent submissions
+        self.diversity = NanobodyDiversityTracker(
+            window_size=getattr(config, "nb_diversity_window", 10),
+            identity_threshold=getattr(config, "nb_diversity_threshold", 0.95),
+        )
+
+    def _pre_rank_scorer(self):
+        if self.surrogate is None or not self.surrogate.is_ready:
+            return self.proxy
+        if self.diversity.is_collapsed():
+            bt.logging.warning(
+                f"nanobody: diversity collapse (median identity={self.diversity.median_identity():.3f}) "
+                f"— falling back to proxy this batch"
+            )
+            return self.proxy
+        return self.surrogate
+
+    def record_submission(self, sequence: str) -> None:
+        """Hook to record submitted sequence for diversity tracking."""
+        self.diversity.record(sequence)
 
     def reset_for_epoch(self) -> None:
         bt.logging.info(f"nanobody: epoch start targets={self.targets}")
@@ -331,19 +376,26 @@ class NanobodyTrack:
 
     def search_one_batch(self, batch_size: Optional[int] = None) -> Optional[ScoredNanobody]:
         size = batch_size if batch_size is not None else self.config.batch_size
+        # If surrogate is live, expand the search budget (surrogate is cheap)
+        if self.surrogate is not None and self.surrogate.is_ready and batch_size is None:
+            size = max(size, getattr(self.config, "nb_surrogate_batch_size", size * 5))
+
         seqs = self.generator.generate_batch(size)
         if not self.skip_unique and seqs:
             seqs = [s for s in seqs if self._safe_is_unique_all_targets(s)]
         if not seqs:
             return None
 
+        pre_ranker = self._pre_rank_scorer()
+        pre_scored = pre_ranker.score_batch(seqs)
+
         if self.use_inference:
-            proxy_scored = self.proxy.score_batch(seqs)
-            top = nb_rank(proxy_scored)[:5]
+            topk = getattr(self.config, "nb_surrogate_topk", 5)
+            top = nb_rank(pre_scored)[:topk]
             top_seqs = [c.sequence for c in top]
             scored = self.scorer.score_batch(top_seqs, self.subnet_cfg)
         else:
-            scored = self.proxy.score_batch(seqs)
+            scored = pre_scored
         self.candidates_scored += len(scored)
         ranked = nb_rank(scored)
         return ranked[0] if ranked else None
@@ -418,9 +470,11 @@ async def _try_submit(state, mt, nt) -> bool:
     # After awaiting set_commitment, re-read block — the extrinsic may have landed later.
     landed_block = await state["subtensor"].get_current_block()
     rl.record_submission(landed_block)
-    # Track submitted SMILES for diversity guard
+    # Track submitted candidates for diversity guards
     if mt is not None and mt.best is not None:
         mt.record_submission(mt.best.smiles)
+    if nt is not None and nt.best is not None:
+        nt.record_submission(nt.best.sequence)
     return True
 
 

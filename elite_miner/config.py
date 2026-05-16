@@ -34,6 +34,14 @@ def parse_arguments() -> argparse.Namespace:
                         help="Top-K from surrogate to send to real Boltz2 when --use_inference.")
     parser.add_argument("--surrogate_min_spearman", type=float, default=0.0,
                         help="Refuse a surrogate model with holdout spearman below this threshold.")
+    parser.add_argument("--nb_surrogate_model_dir", default=None,
+                        help="Path to trained nanobody LightGBM surrogate (Phase 3). Falls back to proxy.")
+    parser.add_argument("--nb_surrogate_batch_size", type=int, default=1000,
+                        help="Candidate pool size per batch when nanobody surrogate is active.")
+    parser.add_argument("--nb_surrogate_topk", type=int, default=5,
+                        help="Top-K from nb surrogate to send to real BoltzGen when --use_inference.")
+    parser.add_argument("--nb_surrogate_min_spearman", type=float, default=0.0,
+                        help="Refuse a nb surrogate model with holdout spearman below this threshold.")
     parser.add_argument("--disable_molecule_track", action="store_true",
                         help="Disable molecule track (default: enabled)")
     parser.add_argument("--disable_nanobody_track", action="store_true",

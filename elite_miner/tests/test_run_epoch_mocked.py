@@ -67,6 +67,10 @@ def _build_config():
         surrogate_batch_size=5000,
         surrogate_topk=5,
         surrogate_min_spearman=0.0,
+        nb_surrogate_model_dir=None,
+        nb_surrogate_batch_size=1000,
+        nb_surrogate_topk=5,
+        nb_surrogate_min_spearman=0.0,
     )
 
 
