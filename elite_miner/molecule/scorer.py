@@ -139,7 +139,10 @@ class Boltz2Scorer:
         # Map per-molecule components back to our ScoredMolecule objects
         out: list[ScoredMolecule] = []
         label_rows: list[dict] = []
-        per_mol = getattr(self._wrapper, "per_molecule_components", {}) or {}
+        # BoltzWrapper.per_molecule_components is keyed [uid][smiles][target].
+        # We passed uid=0 in valid_molecules_by_uid above, so unwrap that level.
+        per_mol_by_uid = getattr(self._wrapper, "per_molecule_components", {}) or {}
+        per_mol = per_mol_by_uid.get(0, {})
         for name, smiles in candidates:
             ha = _heavy_atom_count(smiles)
             metrics = per_mol.get(smiles, {}).get(self.target, {})
