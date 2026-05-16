@@ -113,7 +113,9 @@ class BoltzGenScorer:
     def _ensure_loaded(self):
         if self._wrapper is not None:
             return
-        from external_tools.boltzgen.boltzgen_wrapper import BoltzgenWrapper
+        # boltzgen is pip-installed from external_tools/boltzgen (src layout),
+        # so the module is just `boltzgen.boltzgen_wrapper`, not `external_tools.*`
+        from boltzgen.boltzgen_wrapper import BoltzgenWrapper
         self._wrapper = BoltzgenWrapper()
 
     def score_batch(self, sequences: list[str], subnet_config: dict) -> list[ScoredNanobody]:
