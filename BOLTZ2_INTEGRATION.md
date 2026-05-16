@@ -1784,3 +1784,155 @@ if `candidate_product` changed, giving a second submission attempt.
 **Files changed:**
 - `neurons/miner.py` — §KK block added at the end of `run_boltz_prescoring` after §C diversity reorder.
 
+---
+
+## Implemented Optimisations (continued)
+
+### LL. Per-Molecule Boltz Component Logging (`neurons/miner.py`)
+
+**Problem:** When Boltz-2 scores a molecule, the composite `boltz_score` is stored and logged,
+but the individual affinity and confidence components were not surfaced in the miner logs.  This
+made it difficult to:
+- Understand why a molecule scored well or poorly
+- Diagnose low-confidence predictions that may indicate physically implausible binding modes
+- Tune `boltz_config.yaml` parameters (e.g., `step_scale`) based on observed score variance
+
+**Fix:** After each successful Boltz-2 GPU inference in `run_boltz_prescoring`, the four key
+components are extracted from `wrapper.per_molecule_components` and logged:
+
+```python
+_comps = wrapper.per_molecule_components.get(uid, {}).get(smiles, {})
+bt.logging.info(
+    f"  [Boltz components] score={score:.4f} | "
+    f"apb={_fv(_comps.get('affinity_probability_binary'))} "
+    f"apv={_fv(_comps.get('affinity_pred_value'))} "
+    f"conf={_fv(_comps.get('confidence_score'))} "
+    f"ligand_iptm={_fv(_comps.get('ligand_iptm'))}"
+)
+```
+
+**Component meanings:**
+
+| Component | Range | High is good? | Notes |
+|-----------|-------|---------------|-------|
+| `affinity_probability_binary` (apb) | [0, 1] | Yes | Probability ligand binds at all |
+| `affinity_pred_value` (apv) | (−∞, 0] | Lower (more negative) | Predicted binding energy (kcal/mol) |
+| `confidence_score` | [0, 1] | Yes | Overall structural confidence |
+| `ligand_iptm` | [0, 1] | Yes | Interface confidence for the ligand specifically |
+
+**Diagnostic patterns:**
+- `conf < 0.3` + high `apb` → possibly a hallucinated binding mode; treat score with caution
+- `ligand_iptm < 0.3` → Boltz-2 is unsure about the ligand's position in the predicted complex
+- `apb > 0.8` + `apv < -8` + `ligand_iptm > 0.5` → high-confidence strong binder; excellent submission
+
+**No behavioural change:** This is purely diagnostic logging.  The scoring and submission logic
+are unchanged.  Only applies to cache-miss GPU inference calls (cached scores have no components
+readily available).
+
+**Files changed:**
+- `neurons/miner.py` — `_fv` formatter + `bt.logging.info` component log after score retrieval.
+
+---
+
+## Hardware-Specific Tuning Guide
+
+### Balancing Boltz Speed vs Quality
+
+The single largest lever for competitive performance is **how many candidates Boltz-2 can score
+per epoch**.  More candidates → higher probability of submitting the epoch winner.  The tradeoff
+is inference quality per molecule.
+
+#### Key parameters (edit `boltz/boltz_config.yaml`):
+
+| Parameter | Default | Effect |
+|-----------|---------|--------|
+| `sampling_steps_affinity` | 100 | Steps for affinity diffusion sampling; fewer = faster but noisier |
+| `diffusion_samples_affinity` | 3 | Ensemble size; fewer = faster, less stable mean |
+| `recycling_steps` | 3 | Self-conditioning passes; fewer = faster, potentially weaker structure |
+| `num_subsampled_msa` | 1024 | MSA depth; more = richer evolutionary context but slower |
+| `use_potentials` | false | FK steering; adds ~10–20% time, may improve accuracy on A100/H100 |
+
+#### Recommended presets by hardware:
+
+**RTX 3090 (~150 s/mol at default settings)**
+```yaml
+sampling_steps_affinity: 50    # 75 s/mol → 2x more candidates per epoch
+diffusion_samples_affinity: 2  # reduce ensemble noise from 1 sample
+num_subsampled_msa: 512        # halve MSA overhead
+use_potentials: false
+```
+*Expected: ~75 s/mol → ~12 candidates in 15-min window vs. 6 at default*
+
+**RTX 4090 (~90 s/mol at default settings)**
+```yaml
+sampling_steps_affinity: 75    # ~68 s/mol — modest quality/speed balance
+diffusion_samples_affinity: 3  # keep full ensemble
+num_subsampled_msa: 1024
+use_potentials: false
+```
+*Expected: ~68 s/mol → ~13 candidates vs. 8 at default*
+
+**A100 80 GB (~45 s/mol at default settings)**
+```yaml
+sampling_steps_affinity: 100   # keep quality — GPU is fast enough
+diffusion_samples_affinity: 3
+num_subsampled_msa: 2048       # richer evolutionary context ≈+5–10% affinity accuracy
+use_potentials: true           # FK steering: better geometry, ~+15% inference time
+```
+*Expected: ~65 s/mol with potentials → ~14 candidates in 15-min window*
+
+**H100 80 GB (~25 s/mol at default settings)**
+```yaml
+sampling_steps_affinity: 100
+diffusion_samples_affinity: 5  # larger ensemble for lower variance
+num_subsampled_msa: 4096       # maximum evolutionary context
+use_potentials: true
+```
+*Expected: ~40 s/mol → ~22 candidates — GPU is the non-bottleneck*
+
+#### Adaptive trigger interaction
+
+The adaptive trigger (§G) automatically updates `boltz_trigger_blocks` after the first real
+Boltz run.  Reducing `sampling_steps_affinity` from 100 → 50 roughly halves `boltz_time_per_mol`,
+which the adaptive trigger translates into a later firing point — giving PSICHIC/SALSA/GA more
+time to find a better seed before Boltz validation begins.
+
+#### Minimum quality floor
+
+Avoid `sampling_steps_affinity < 30` or `diffusion_samples_affinity < 1` — at very low step
+counts the affinity predictions become highly stochastic and the miner may submit molecules whose
+true Boltz score (re-run by the validator) is lower than what the miner measured.  The validator
+runs at its own configured step count (typically 100), so extreme miner-side reduction creates a
+train/test gap.
+
+---
+
+## Remaining Optimisation Opportunities
+
+### §D: Binding-Pocket Pre-Docking Filter (Conditional, Not Yet Implemented)
+
+When `config.yaml` sets `binding_pocket` to a list of residue numbers, Boltz-2 applies a soft
+or hard pocket constraint during diffusion.  A miner could pre-filter candidates using fast
+CPU-based docking (AutoDock Vina, ~5 s/mol) to eliminate molecules whose predicted pose does
+not satisfy the pocket constraint — saving Boltz-2 inference on clearly wrong binders.
+
+**Status:** Currently a no-op because `binding_pocket: null` in `config.yaml`.  Implementation
+needed only when the validator enables pocket guidance.  Estimated effort: ~150 lines in
+`utils/docking.py`.
+
+### FBLD: Fragment-Based Lead Discovery (Research Stage)
+
+The scoring formula's `heavy_atom_count` denominator creates a structural incentive for very
+small molecules (10–15 HA).  A SAVI-2020 fragment with 10 heavy atoms and moderate binding
+(`apb=0.6, apv=-5`) scores `(0.6+5)/10 = 0.56` — beating most drug-like molecules.
+
+**Open questions:**
+1. Is Boltz-2 well-calibrated for fragment-sized molecules (MW < 200 Da)?  Training data is
+   dominated by drug-like compounds (200–500 Da).
+2. What fraction of SAVI-2020 molecules fall below 15 HA?  Setting `max_heavy_atoms: 15` may
+   starve PSICHIC of candidates.
+
+**Next step:** Run a diagnostic: lower `max_heavy_atoms` to 20 for one epoch, observe whether
+Boltz-2 scores improve and whether PSICHIC candidate volume remains adequate (≥ 500 molecules
+per epoch in `savi_stream_pool`).  Revert if the pool shrinks below the SALSA trigger threshold.
+

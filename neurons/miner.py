@@ -1129,6 +1129,20 @@ async def run_boltz_prescoring(state: Dict[str, Any], max_candidates: int = 5) -
                     mol_scores = wrapper.per_molecule_metric.get(uid, {})
                     score = mol_scores.get(smiles, -math.inf)
 
+                    # §LL: Log component breakdown to aid diagnostics and tuning.
+                    # affinity_probability_binary (apb) and affinity_pred_value (apv)
+                    # drive the boltz_score formula; confidence_score and ligand_iptm
+                    # reflect structural reliability (low values = uncertain binding mode).
+                    _comps = wrapper.per_molecule_components.get(uid, {}).get(smiles, {})
+                    def _fv(v): return f"{v:.3f}" if isinstance(v, (int, float)) else "n/a"
+                    bt.logging.info(
+                        f"  [Boltz components] score={score:.4f} | "
+                        f"apb={_fv(_comps.get('affinity_probability_binary'))} "
+                        f"apv={_fv(_comps.get('affinity_pred_value'))} "
+                        f"conf={_fv(_comps.get('confidence_score'))} "
+                        f"ligand_iptm={_fv(_comps.get('ligand_iptm'))}"
+                    )
+
                     # Persist to both cache layers (product_name enables warm-start §AA)
                     boltz_cache[key] = score
                     _pname = row.get('product_name')
