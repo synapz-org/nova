@@ -250,12 +250,14 @@ class MoleculeTrack:
             bt.logging.warning(f"molecule: uniqueness check error: {e}")
             return False  # conservative
 
-    def search_one_batch(self, batch_size: Optional[int] = None) -> Optional[ScoredMolecule]:
+    def search_one_batch(self, batch_size: Optional[int] = None, skip_inference: bool = False) -> Optional[ScoredMolecule]:
         """Search → filter → uniqueness → (surrogate pre-rank) → score → rank.
         Returns best of this batch.
 
         When surrogate is ready, we can sample MUCH bigger batches (10x-100x normal
         batch_size) because surrogate inference is millisecond-fast vs Boltz2's seconds.
+        If `skip_inference=True`, returns surrogate's best WITHOUT running real Boltz2
+        (used for phase-1 fast submission).
         """
         if self.searcher is None:
             return None
@@ -274,7 +276,7 @@ class MoleculeTrack:
         pre_ranker = self._pre_rank_scorer()
         pre_scored = pre_ranker.score_batch(valid)
 
-        if self.use_inference:
+        if self.use_inference and not skip_inference:
             # Take top-K by pre-ranker, then run real Boltz2 to refine
             topk = getattr(self.config, "surrogate_topk", 5)
             top = mol_rank(pre_scored)[:topk]
@@ -444,7 +446,7 @@ class NanobodyTrack:
             bt.logging.warning(f"nanobody: uniqueness check error: {e}")
             return False
 
-    def search_one_batch(self, batch_size: Optional[int] = None) -> Optional[ScoredNanobody]:
+    def search_one_batch(self, batch_size: Optional[int] = None, skip_inference: bool = False) -> Optional[ScoredNanobody]:
         size = batch_size if batch_size is not None else self.config.batch_size
         # If surrogate is live, expand the search budget (surrogate is cheap)
         if self.surrogate is not None and self.surrogate.is_ready and batch_size is None:
@@ -459,7 +461,7 @@ class NanobodyTrack:
         pre_ranker = self._pre_rank_scorer()
         pre_scored = pre_ranker.score_batch(seqs)
 
-        if self.use_inference:
+        if self.use_inference and not skip_inference:
             topk = getattr(self.config, "nb_surrogate_topk", 5)
             top = nb_rank(pre_scored)[:topk]
             top_seqs = [c.sequence for c in top]
@@ -601,19 +603,32 @@ async def run_epoch(
     async def fast_search_mol():
         if molecule_track is None or rxn_id is None:
             return
-        cand = await asyncio.to_thread(molecule_track.search_one_batch, fast_batch_size)
+        # skip real Boltz2 — use surrogate top-1 directly for fast submit
+        cand = await asyncio.to_thread(
+            lambda: molecule_track.search_one_batch(batch_size=fast_batch_size, skip_inference=True)
+        )
         molecule_track.update_best(cand)
 
     async def fast_search_nb():
         if nanobody_track is None:
             return
-        cand = await asyncio.to_thread(nanobody_track.search_one_batch, fast_batch_size)
+        # skip real BoltzGen — surrogate (ρ=0.94) for fast submit
+        cand = await asyncio.to_thread(
+            lambda: nanobody_track.search_one_batch(batch_size=fast_batch_size, skip_inference=True)
+        )
         nanobody_track.update_best(cand)
 
+    # Serialize mol then nb — both share a single GPU. Parallel calls cause
+    # GPU contention (2-5x slowdown) and stack inference processes.
     try:
-        await asyncio.gather(fast_search_mol(), fast_search_nb())
+        await fast_search_mol()
     except Exception as e:
-        bt.logging.error(f"epoch: fast search failed: {e}")
+        bt.logging.error(f"epoch: fast mol search failed: {e}")
+        bt.logging.debug(traceback.format_exc())
+    try:
+        await fast_search_nb()
+    except Exception as e:
+        bt.logging.error(f"epoch: fast nb search failed: {e}")
         bt.logging.debug(traceback.format_exc())
 
     if await _try_submit(state, molecule_track, nanobody_track):
@@ -640,10 +655,16 @@ async def run_epoch(
             cand = await asyncio.to_thread(nanobody_track.search_one_batch)
             nanobody_track.update_best(cand)
 
+        # Serialize mol then nb to avoid GPU contention
         try:
-            await asyncio.gather(refine_mol(), refine_nb())
+            await refine_mol()
         except Exception as e:
-            bt.logging.error(f"epoch: refine batch {batch_idx} failed: {e}")
+            bt.logging.error(f"epoch: refine mol batch {batch_idx} failed: {e}")
+            bt.logging.debug(traceback.format_exc())
+        try:
+            await refine_nb()
+        except Exception as e:
+            bt.logging.error(f"epoch: refine nb batch {batch_idx} failed: {e}")
             bt.logging.debug(traceback.format_exc())
 
         if await _try_submit(state, molecule_track, nanobody_track):
