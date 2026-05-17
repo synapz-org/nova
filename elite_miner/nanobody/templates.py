@@ -1,19 +1,17 @@
-"""Curated VHH templates for nanobody generation.
+"""VHH templates for nanobody generation.
 
-Each template is a known camelid VHH that passes our local validity filter
-(length, AA whitelist, no homopolymers, FR2 hallmark heuristic, etc).
+After empirical analysis of Metanova/Submission-Archive (May 2026):
+- All top-10% winners for Q9NZQ7 are length 120
+- They cluster around a single parent VHH scaffold with CDR mutations
+- design_iiptm range for top: 0.81-0.83 vs our local generated max of 0.30
 
-Templates from literature & PDB. CDRs (highlighted by approximate raw
-positions) are the natural mutation hotspots; the framework regions should
-stay close to template to preserve VHH-ness.
+So we use the actual archive winners as templates. The generator's mutation
+strategy stays the same (template + CDR mutation), but now the starting
+point is in the winning neighborhood instead of literature VHHs from unrelated
+targets.
 
-Approximate CDR positions (raw, not Kabat) — varies by template:
-    CDR1: ~26-35
-    CDR2: ~50-65
-    CDR3: ~95-115 (most variable, most consequential for binding)
-
-Adding more templates is cheap — we keep them as a list for round-robin
-sampling in the generator.
+The first ~10 templates are the top archive winners for Q9NZQ7. CDR ranges
+are derived from alignment against framework anchors (WVRQ, WGQG/HGQG).
 """
 
 from __future__ import annotations
@@ -25,59 +23,52 @@ from dataclasses import dataclass
 class VHHTemplate:
     name: str
     sequence: str
-    cdr1_range: tuple[int, int]  # (start, end_exclusive) raw positions
+    cdr1_range: tuple[int, int]
     cdr2_range: tuple[int, int]
     cdr3_range: tuple[int, int]
     notes: str = ""
 
 
-# CDR ranges are conservative estimates; we mutate within them.
-# Coordinates were aligned by visual inspection of the WVRQAPG / WGQG framework anchors.
+# Top winners pulled from Metanova/Submission-Archive on 2026-05-16.
+# All are length 120, design_iiptm 0.81-0.83 (top 1% of historical submissions).
+# CDR ranges aligned by framework anchors:
+#   CDR1 ≈ pos 26-35  (between SCAA and WVRQ)
+#   CDR2 ≈ pos 50-58  (between WV and ADF/AKG)
+#   CDR3 ≈ pos 96-108 (between YYC and HGQG)
+ARCHIVE_TOP_WINNERS = [
+    ("archive_iiptm_8262",
+     "DVTLSESGGGLVQAGGSLRLSCAASGFTYSSYAMSWVRQRAGKEREWVSDVTSSGDQTDYADFVKGRFTISRDNAKQTLYLQMTSLRPEDTAVYYCSKWPYRFMKQYASHGQGTTVTVSS"),
+    ("archive_iiptm_8251",
+     "DVTLAESGGGLVQAGGSLKLSCAATGFTFSSYAMSWVRQRPGKQREWVSDITSQGDQTDYADFVKGRFTISRDNAKNTLYLQMTSLRPEDTAVYYCSKFPYRFMPQYAQHSQGTTVTVSA"),
+    ("archive_iiptm_8218",
+     "DVTLVESGGGLVQAGGSLRLSCAATGFTYSSWAMSWVRQAPGKEREWVSDISSQGDQTDYADWVKGRFTISRDQAKNTLYLQMTSLRPEDTAVYYCSKFPYRFLPQFAQHGQGTTVTVSA"),
+    ("archive_iiptm_8211",
+     "DVTIAESGGGLVQAGGSLRMSCAATGFTFSSYSMSWVRQRPGKQREWVSDISSQGDQTDYADFVKGRFTISRDNAKNTLYLQMSSLRPEDTAVYYCSKFPWRFMPQFAQHGQGTTVTVTA"),
+    ("archive_iiptm_8206",
+     "DVSLAESGGGLVQAGGSLKLSCAASGFTYSSYAMSWVRQRPGKEREWVSDITSQGDQTDYADFVKGRFTISRDSAKNTLYLQMTSLRPEDTAVYYCSKWPYRFMPQYAQHGQGTTVTVSA"),
+    ("archive_iiptm_8204",
+     "DVVISESGGGLVQAGGSLRLSCAATGFTYSSYAMSWVRQRAGKEREWVSDITSQGDQTDYADFVKGRFTISRDNAKNTLYLQMTSLRPEDTAVYYCSKYPYRFDQARAQHGQGNTVTVSA"),
+    ("archive_iiptm_8192",
+     "DVTLVESGGGLVTAGGSLRLSCAATGFTYSSYAMSWVRQRPGKEREWVSDISSQGDQTDYADFVKGRFTISRDNAKNTLYLQMTSLRPEDTAVYYCSKFPWRFMPQFAQHGQGTTVTVSA"),
+    ("archive_iiptm_8190",
+     "DVVMAESGGGLVQAGGSLRLSCAASGFTYTSYAMSWVRQRPGKEREWVSDVTSQGDQTDYADFVKGRFTISRDNAKNTLYLQMTSLRPEDTAVYYCSKFPWRFMQTFAQHGQGTTVTVSA"),
+    ("archive_iiptm_8185",
+     "DVVMAESGGGLVQAGGSLRLSCAASGFTFTSYAMSWVRQRPGKEREWVSDLTSQGDQTDYADFVKGRFTISRDNAKNTLYLQMTSLRPEDTAVYYCSKFPWRFMQTFAQHGQGTTVTVSA"),
+    ("archive_iiptm_8181",
+     "DVLMAESGGGLVQAGGSLRLSCAATGFTYSSYAMSWVRQRAGKEREWVSDITSQGDQTDYADFVKGRFTISRDNAKNTLYLQMTSLRPEDTAVYYCSKFPWRFMQTFAQHGQGTTVTVSA"),
+]
+
+
 TEMPLATES: list[VHHTemplate] = [
     VHHTemplate(
-        name="reference_baseline",
-        sequence=(
-            "EVELLASGGDLVQPGGSLRLSCAASGFTFSTYAMSWVRQAPGKGLERVSRVNQNGGTTTYADAMKGR"
-            "FTISRDNAKNTLYLQMINVKPEDTAIYYCARWDGGSWSTDPWGRGTLVTVS"
-        ),
+        name=name,
+        sequence=seq,
         cdr1_range=(26, 35),
-        cdr2_range=(50, 65),
-        cdr3_range=(95, 115),
-        notes="Reference miner's base template. 118aa, passes validator filters.",
-    ),
-    VHHTemplate(
-        name="anti_EGFR_7D12",
-        sequence=(
-            "QVQLVESGGGLVQPGGSLRLSCAASGRTFSSYAMGWFRQAPGKEREFVAGISWSGGSTYYTDSVKGR"
-            "FTISRDNAKNTLYLQMNSLKPEDTAVYYCAAAGSAWYGTLYEYDYWGQGTQVTVSS"
-        ),
-        cdr1_range=(26, 35),
-        cdr2_range=(50, 65),
-        cdr3_range=(95, 120),
-        notes="Anti-EGFR 7D12 (PDB 4KRL). Classic camelid VHH framework.",
-    ),
-    VHHTemplate(
-        name="humanized_VHH_C32",
-        sequence=(
-            "QVQLVESGGGLVQAGGSLRLSCAASERTFRRYNMGWFRQAPGKEREFVATISWSGGITYYADSVKGR"
-            "FTISRDNAKNTLYLQMNSLKPEDTAVYYCAAQYGSRYPGRLYDYWGQGTQVTVSS"
-        ),
-        cdr1_range=(26, 35),
-        cdr2_range=(50, 65),
-        cdr3_range=(95, 119),
-        notes="Humanized VHH C32-style framework. Strong human framework score.",
-    ),
-    VHHTemplate(
-        name="anti_CD38_iVHH",
-        sequence=(
-            "EVQLQASGGGLVQPGGSLRLSCAASGRTLSDYAMGWFRQAPGKEREFVAAIYWSGGYAYYADSVKGR"
-            "FTISRDNAKNTVYLQMNSLKPEDTAVYYCAAATTPYTGSARFFNRYRSDYDYWGQGTQVTVSS"
-        ),
-        cdr1_range=(26, 35),
-        cdr2_range=(50, 65),
-        cdr3_range=(95, 127),
-        notes="Anti-CD38 iVHH. Longer CDR3 — good for novel targets.",
-    ),
+        cdr2_range=(50, 58),
+        cdr3_range=(96, 108),
+        notes="Top archive winner for Q9NZQ7. Length 120, mutate CDRs.",
+    )
+    for name, seq in ARCHIVE_TOP_WINNERS
 ]
 
 

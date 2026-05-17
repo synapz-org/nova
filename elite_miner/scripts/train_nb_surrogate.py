@@ -69,18 +69,50 @@ def load_labels(labels_glob: str, target: Optional[str] = None) -> pd.DataFrame:
 
 
 def stratified_split(df: pd.DataFrame, holdout_frac: float = 0.15, seed: int = 42):
-    """Stratify by length quartile × combined_score quartile."""
-    df = df.copy()
-    df["len_bucket"] = pd.qcut(df["seq_length"], q=4, duplicates="drop").astype(str)
-    df["score_bucket"] = pd.qcut(df["combined_score"], q=4, duplicates="drop").astype(str)
-    df["strat_key"] = df["len_bucket"] + "|" + df["score_bucket"]
+    """Stratify by length quartile × combined_score quartile.
 
+    Falls back to random split if stratification produces degenerate buckets
+    (e.g., when all sequences are the same length).
+    """
+    df = df.copy()
     rng = np.random.default_rng(seed)
+
+    # Try to bucket on both length and score. Either may collapse to a single
+    # bucket (or all-NaN) when its values are constant.
+    def _safe_qcut(col):
+        try:
+            r = pd.qcut(df[col], q=4, duplicates="drop").astype(str)
+            # qcut on constant column produces all 'nan' strings — useless
+            if r.nunique() <= 1:
+                return None
+            return r
+        except Exception:
+            return None
+
+    len_bucket = _safe_qcut("seq_length")
+    score_bucket = _safe_qcut("combined_score")
+
+    if len_bucket is not None and score_bucket is not None:
+        df["strat_key"] = len_bucket + "|" + score_bucket
+    elif score_bucket is not None:
+        df["strat_key"] = score_bucket
+    elif len_bucket is not None:
+        df["strat_key"] = len_bucket
+    else:
+        df["strat_key"] = "all"
+
     holdout_idx = []
     for _, group in df.groupby("strat_key"):
         n_holdout = max(1, int(len(group) * holdout_frac))
+        if n_holdout > len(group):
+            n_holdout = len(group)
         holdout_idx.extend(rng.choice(group.index.values, size=n_holdout, replace=False))
     holdout_idx = sorted(set(holdout_idx))
+
+    # Hard guarantee: at least 1 row in holdout
+    if not holdout_idx and len(df) >= 2:
+        holdout_idx = [int(rng.choice(df.index.values))]
+
     holdout_mask = df.index.isin(holdout_idx)
     return df[~holdout_mask].reset_index(drop=True), df[holdout_mask].reset_index(drop=True)
 

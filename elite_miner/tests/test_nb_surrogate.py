@@ -20,7 +20,8 @@ def _build_synthetic_labels(n_per_template: int = 8, target: str = "Q_SYNTH") ->
     """Generate sequences from each template and synthesize raw BoltzGen metrics.
 
     Synthetic labels are deterministic functions of features so we know there
-    IS a signal to learn.
+    IS a signal to learn. Higher mutation count → more sequence variance →
+    proper stratification.
     """
     vcfg = NanobodyValidityConfig.from_config({})
     rng = np.random.default_rng(0)
@@ -28,7 +29,7 @@ def _build_synthetic_labels(n_per_template: int = 8, target: str = "Q_SYNTH") ->
     for i, t in enumerate(TEMPLATES):
         gen = NanobodyGenerator(
             vcfg,
-            gen_cfg=GenerationConfig(min_mutations=1, max_mutations=3),
+            gen_cfg=GenerationConfig(min_mutations=2, max_mutations=8),
             templates=[t],
             rng=random.Random(i),
         )
