@@ -178,21 +178,22 @@ def main() -> int:
             flush=True,
         )
 
+        # Clean BoltzGen's tmp output dir before each outer iteration — its
+        # wrapper accumulates intermediate designs across calls, so the next
+        # call re-processes ALL prior sequences (1 → 3 → 5 → 10 …) and
+        # latency grows unboundedly. config/boltzgen_config.yaml has
+        # remove_files=true but the wrapper doesn't honor it.
+        import shutil
+        tmp_outputs = os.path.join(
+            BASE_DIR, "external_tools", "boltzgen",
+            "boltzgen_tmp_files", "outputs",
+        )
+        if os.path.exists(tmp_outputs):
+            shutil.rmtree(tmp_outputs, ignore_errors=True)
+
         for i, pick in enumerate(picks):
             if stop["stop"]:
                 break
-            # Clean BoltzGen's tmp output dir between iterations — its wrapper
-            # accumulates intermediate designs across calls, so the next call
-            # re-processes ALL prior sequences (5 seqs → 10 seqs → 15 …).
-            # config/boltzgen_config.yaml has `remove_files: true` but the
-            # wrapper doesn't honor it.
-            import shutil
-            tmp_outputs = os.path.join(
-                BASE_DIR, "external_tools", "boltzgen",
-                "boltzgen_tmp_files", "outputs",
-            )
-            if os.path.exists(tmp_outputs):
-                shutil.rmtree(tmp_outputs, ignore_errors=True)
             seq = pick.sequence
             pred = pick.raw.get("surrogate_pred", 0.0) if pick.raw else 0.0
             t0 = time.time()
