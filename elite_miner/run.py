@@ -349,36 +349,15 @@ class NanobodyTrack:
         #   2. PSSMGenerator: consensus + PSSM-weighted mutations (3-10 positions).
         #      Faster diversity but more risk of bad combinations.
         #   3. NanobodyGenerator: CDR-mutator from synthetic templates (fallback).
-        pssm_path = _cfg(config, "nb_pssm_path", "cache/q9nzq7_pssm.json")
-        seeds_path = _cfg(config, "nb_seeds_path", "cache/q9nzq7_top_seeds.json")
-        if pssm_path and seeds_path and os.path.exists(pssm_path) and os.path.exists(seeds_path):
-            from elite_miner.nanobody.archive_seeded_generator import (
-                ArchiveSeededGenerator, ArchiveSeededConfig,
-            )
-            self.generator = ArchiveSeededGenerator(
-                self.validity_cfg,
-                gen_cfg=ArchiveSeededConfig(
-                    min_mutations=_cfg(config, "nb_min_mutations", 1),
-                    max_mutations=_cfg(config, "nb_max_mutations", 3),
-                    pssm_path=pssm_path,
-                    seeds_path=seeds_path,
-                ),
-            )
-            bt.logging.info(f"nanobody: using ArchiveSeededGenerator (seeds={seeds_path})")
-        elif pssm_path and os.path.exists(pssm_path):
-            from elite_miner.nanobody.pssm_generator import PSSMGenerator, PSSMGenerationConfig
-            self.generator = PSSMGenerator(
-                self.validity_cfg,
-                gen_cfg=PSSMGenerationConfig(
-                    min_mutations=_cfg(config, "nb_min_mutations", 3),
-                    max_mutations=_cfg(config, "nb_max_mutations", 10),
-                    pssm_path=pssm_path,
-                ),
-            )
-            bt.logging.info(f"nanobody: using PSSM-guided generator from {pssm_path}")
-        else:
-            self.generator = NanobodyGenerator(self.validity_cfg)
-            bt.logging.info("nanobody: using CDR-mutator generator (no PSSM/seeds found)")
+        self._pssm_path = _cfg(config, "nb_pssm_path", "cache/q9nzq7_pssm.json")
+        self._seeds_path = _cfg(config, "nb_seeds_path", "cache/q9nzq7_top_seeds.json")
+        # Variant the miner is currently using. None = default config from CLI flags.
+        self.current_variant_id: Optional[str] = None
+        self._build_generator(
+            generator_choice=None,  # auto-select based on files present
+            min_mutations=_cfg(config, "nb_min_mutations", 1),
+            max_mutations=_cfg(config, "nb_max_mutations", 3),
+        )
         self.skip_unique = config.no_uniqueness_check
         # Allow disabling nb real inference independently of mol: BoltzGen refine
         # takes ~hours per epoch and blocks new-epoch submissions.
@@ -419,6 +398,64 @@ class NanobodyTrack:
             window_size=_cfg(config, "nb_diversity_window", 10),
             identity_threshold=_cfg(config, "nb_diversity_threshold", 0.95),
         )
+
+    def _build_generator(self, generator_choice: Optional[str], min_mutations: int, max_mutations: int) -> None:
+        """(Re)build self.generator. Called at __init__ and whenever an A/B variant
+        wants different mutation knobs or a different generator class.
+
+        generator_choice: "archive_seeded", "pssm", "cdr", or None (auto-select).
+        """
+        pssm_path = self._pssm_path
+        seeds_path = self._seeds_path
+        choice = generator_choice
+        if choice is None:
+            if pssm_path and seeds_path and os.path.exists(pssm_path) and os.path.exists(seeds_path):
+                choice = "archive_seeded"
+            elif pssm_path and os.path.exists(pssm_path):
+                choice = "pssm"
+            else:
+                choice = "cdr"
+
+        if choice == "archive_seeded":
+            from elite_miner.nanobody.archive_seeded_generator import (
+                ArchiveSeededGenerator, ArchiveSeededConfig,
+            )
+            self.generator = ArchiveSeededGenerator(
+                self.validity_cfg,
+                gen_cfg=ArchiveSeededConfig(
+                    min_mutations=min_mutations,
+                    max_mutations=max_mutations,
+                    pssm_path=pssm_path,
+                    seeds_path=seeds_path,
+                ),
+            )
+            bt.logging.info(f"nanobody: ArchiveSeededGenerator m={min_mutations}-{max_mutations}")
+        elif choice == "pssm":
+            from elite_miner.nanobody.pssm_generator import PSSMGenerator, PSSMGenerationConfig
+            self.generator = PSSMGenerator(
+                self.validity_cfg,
+                gen_cfg=PSSMGenerationConfig(
+                    min_mutations=min_mutations,
+                    max_mutations=max_mutations,
+                    pssm_path=pssm_path,
+                ),
+            )
+            bt.logging.info(f"nanobody: PSSMGenerator m={min_mutations}-{max_mutations}")
+        else:
+            self.generator = NanobodyGenerator(self.validity_cfg)
+            bt.logging.info("nanobody: CDR-mutator generator (no PSSM/seeds found)")
+
+    def apply_variant(self, variant) -> None:
+        """Reconfigure the nb track for an A/B variant. Idempotent — no-op if already on this variant."""
+        if variant is None or self.current_variant_id == variant.id:
+            return
+        self._build_generator(
+            generator_choice=variant.generator,
+            min_mutations=variant.min_mutations,
+            max_mutations=variant.max_mutations,
+        )
+        self.current_variant_id = variant.id
+        bt.logging.info(f"nanobody: applied variant {variant.id} ({variant.description})")
 
     def _pre_rank_scorer(self):
         if self.surrogate is None or not self.surrogate.is_ready:
@@ -569,6 +606,7 @@ async def _try_submit(state, mt, nt) -> bool:
                 landed_block=landed_block,
                 generator=type(nt.generator).__name__,
                 fast_batch_size=_cfg(cfg, "fast_batch_size_nb", 5000),
+                variant_id=nt.current_variant_id,
             )
         except Exception:
             pass
@@ -613,7 +651,16 @@ async def run_epoch(
     if rxn_id is None and molecule_track is not None:
         bt.logging.warning("epoch: no valid reaction id — molecule track disabled this epoch")
 
-    # 3) Reset tracks
+    # 3) Pick A/B variant for nb track this epoch (if enabled), then reset tracks.
+    nb_variant = None
+    if nanobody_track is not None and _cfg(config, "ab_enabled", False):
+        try:
+            from elite_miner.ab_variants import pick_variant
+            nb_variant = pick_variant()
+            nanobody_track.apply_variant(nb_variant)
+        except Exception as e:
+            bt.logging.warning(f"epoch: A/B variant pick failed: {e}")
+
     if molecule_track is not None and rxn_id is not None:
         molecule_track.reset_for_epoch(rxn_id)
     if nanobody_track is not None:
@@ -622,7 +669,8 @@ async def run_epoch(
     submitted_at_least_once = False
     # Surrogate-only fast phase: nb is cheap (5000 in ~0.6s, top-1 0.82 vs 0.80 at n=20),
     # mol scoring is slower (~3s/1000), so we go wide on nb and moderate on mol.
-    fast_batch_size_nb = _cfg(config, "fast_batch_size_nb", 5000)
+    # If A/B is active, variant overrides nb batch size.
+    fast_batch_size_nb = nb_variant.fast_batch_size_nb if nb_variant else _cfg(config, "fast_batch_size_nb", 5000)
     fast_batch_size_mol = _cfg(config, "fast_batch_size_mol", 500)
 
     # ------------------------------------------------------------------ #

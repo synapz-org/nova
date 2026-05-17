@@ -51,6 +51,10 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument("--fast_batch_size_mol", type=int, default=500,
                         help="Fast-phase surrogate-only mol candidate pool. Mol scoring is slower "
                              "(~3s/1000), top-1 plateaus around n=500.")
+    parser.add_argument("--ab_enabled", action="store_true",
+                        help="Sample a hyperparam variant from elite_miner.ab_variants.VARIANTS each "
+                             "epoch and tag submissions with the variant id. Use with the labeling "
+                             "worker to A/B-test generator configs.")
     parser.add_argument("--disable_molecule_track", action="store_true",
                         help="Disable molecule track (default: enabled)")
     parser.add_argument("--disable_nanobody_track", action="store_true",

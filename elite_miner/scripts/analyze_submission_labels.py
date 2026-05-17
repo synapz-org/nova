@@ -92,6 +92,25 @@ def main():
                     bias = (joined["real_iiptm"] - joined["predicted_iiptm"]).mean()
                     print(f"        pred mean={pred.mean():.4f}; (real - pred) mean bias={bias:+.4f}")
 
+    # Per-variant summary (A/B comparison)
+    # variant_id is in the queue but not the labels file — join by sequence.
+    if "sequence" in l.columns and not q.empty and "variant_id" in q.columns:
+        q_min = q[["sequence", "variant_id"]].drop_duplicates(subset=["sequence"])
+        l_joined = l.merge(q_min, on="sequence", how="left")
+        labeled_variants = l_joined.dropna(subset=["variant_id", "real_iiptm"])
+        if not labeled_variants.empty:
+            print()
+            print("=== by variant_id (A/B) ===")
+            for vid, grp in labeled_variants.groupby("variant_id"):
+                real = grp["real_iiptm"]
+                pred = grp["predicted_iiptm"]
+                bias = (real - pred).mean()
+                print(
+                    f"  {vid}: n={len(grp)} "
+                    f"real mean={real.mean():.4f} max={real.max():.4f} "
+                    f"pred mean={pred.mean():.4f} bias={bias:+.4f}"
+                )
+
     # Latest 10 labeled, sorted by labeled_at if present, else by index
     print()
     print("=== latest labeled submissions ===")

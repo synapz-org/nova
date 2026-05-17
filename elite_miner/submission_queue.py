@@ -44,6 +44,7 @@ def append(
     landed_block: Optional[int] = None,
     generator: Optional[str] = None,
     fast_batch_size: Optional[int] = None,
+    variant_id: Optional[str] = None,
     path: str = DEFAULT_PATH,
 ) -> None:
     """Append one nb submission record. Best-effort; never raises out of process.
@@ -62,6 +63,7 @@ def append(
             "predicted_iiptm": float(predicted_iiptm),
             "generator": generator,
             "fast_batch_size": fast_batch_size,
+            "variant_id": variant_id,
         }
         with open(path, "a") as f:
             f.write(json.dumps(row) + "\n")
