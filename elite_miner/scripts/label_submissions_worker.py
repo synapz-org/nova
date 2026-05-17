@@ -157,6 +157,18 @@ def label_one(entry: dict, clip_intervals: dict, output_dir: str) -> Optional[di
     scorer = _get_scorer(target, clip)
     subnet_cfg = _subnet_config_for(target, clip)
 
+    # Clean BoltzGen's tmp inputs/ + outputs/ before each call. Wrapper accumulates
+    # yaml input files and intermediate designs across calls, which makes each
+    # subsequent label process all prior sequences and grow latency unboundedly.
+    # See kb/gotchas/install-deps-uv-not-in-path.md for context; same wrapper bug.
+    import shutil
+    bg_tmp = os.path.join(BASE_DIR, "external_tools", "boltzgen", "boltzgen_tmp_files")
+    for sub in ("inputs", "outputs"):
+        p = os.path.join(bg_tmp, sub)
+        if os.path.exists(p):
+            shutil.rmtree(p, ignore_errors=True)
+        os.makedirs(p, exist_ok=True)
+
     t0 = time.time()
     try:
         scored = scorer.score_batch([seq], subnet_cfg)
