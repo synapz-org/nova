@@ -1278,6 +1278,182 @@ async def run_boltz_prescoring(state: Dict[str, Any], max_candidates: int = 5) -
         except Exception as _ff_err:
             bt.logging.warning(f"§FF Boltz-guided SALSA failed (non-fatal): {_ff_err}")
 
+    # §MM: Multi-round iterative Boltz-SALSA hill-climbing.
+    # After the initial Boltz pass (all_scores) and §FF (one Boltz-SALSA round),
+    # continue hill-climbing from the current best Boltz molecule while time permits.
+    # Each round: SALSA from current best → score top-3 SALSA hits with Boltz →
+    # if improved, advance seed and repeat; otherwise stop.
+    #
+    # On A100 hardware (45 s/mol, 1200 s trigger window):
+    #   Initial pass: ~270 s (6 mols)
+    #   §FF:          ~135 s (3 mols)
+    #   §MM budget:   ~795 s → up to 5 more rounds × 3 mols = 15 additional Boltz calls
+    # On RTX 3090 (150 s/mol): typically no budget remains after §FF — §MM exits immediately.
+    #
+    # Build _mm_all_scored: union of initial-pass scores (all_scores) and §FF hits
+    # already stored in boltz_cache, so the seed and baseline reflect the true epoch best.
+    _mm_all_scored: Dict[str, float] = dict(all_scores)
+    for _mm_ck, _mm_cv in boltz_cache.items():
+        if isinstance(_mm_ck, tuple) and len(_mm_ck) == 2 and _mm_ck[1] == protein:
+            _mm_sm = _mm_ck[0]
+            if _mm_sm not in _mm_all_scored and math.isfinite(_mm_cv):
+                _mm_all_scored[_mm_sm] = _mm_cv
+
+    _mm_best_score: float = max(
+        (_v for _v in _mm_all_scored.values() if math.isfinite(_v)), default=-math.inf
+    )
+    _mm_seed_smiles: Optional[str] = (
+        max(
+            (_s for _s, _v in _mm_all_scored.items() if math.isfinite(_v)),
+            key=lambda s: _mm_all_scored[s],
+            default=None,
+        )
+        if _mm_all_scored else None
+    )
+    _mm_savi_pool = state.get('savi_stream_pool')
+    _mm_max_rounds = 5
+    _mm_stop = False
+
+    if (
+        _mm_seed_smiles is not None
+        and math.isfinite(_mm_best_score)
+        and _mm_savi_pool is not None
+        and not _mm_savi_pool.empty
+    ):
+        bt.logging.info(
+            f"§MM: starting multi-round Boltz-SALSA "
+            f"(seed_score={_mm_best_score:.4f}, max_rounds={_mm_max_rounds})"
+        )
+        _mm_rounds_run = 0
+        for _mm_round_idx in range(_mm_max_rounds):
+            if _mm_stop:
+                break
+
+            # Time check before each round — skip if < 2 mol-times + 2 min remain
+            try:
+                _mm_curr_blk = await state['subtensor'].get_current_block()
+                _mm_next_ep = ((_mm_curr_blk // state['epoch_length']) + 1) * state['epoch_length']
+                _mm_remaining_s = (_mm_next_ep - _mm_curr_blk) * 12
+            except Exception:
+                break
+
+            _mm_t_mol = state.get('boltz_time_per_mol', 150.0)
+            if _mm_remaining_s < _mm_t_mol * 2 + 120:
+                bt.logging.info(
+                    f"§MM round {_mm_round_idx + 1}: "
+                    f"{_mm_remaining_s:.0f}s remaining < {_mm_t_mol * 2 + 120:.0f}s needed — stopping."
+                )
+                break
+
+            # SALSA from current best Boltz seed
+            try:
+                _mm_salsa_hits = await asyncio.to_thread(
+                    run_salsa_search,
+                    _mm_seed_smiles,
+                    _mm_savi_pool,
+                    2,   # rounds — neighbourhood exploration
+                    60,  # n_perturb
+                    3,   # top_k — cap Boltz calls per round
+                )
+            except Exception as _mm_salsa_err:
+                bt.logging.warning(f"§MM SALSA error: {_mm_salsa_err}")
+                break
+
+            if _mm_salsa_hits.empty:
+                bt.logging.info(f"§MM round {_mm_round_idx + 1}: no SALSA hits — stopping.")
+                break
+
+            _mm_improved = False
+            _mm_round_best_score = _mm_best_score
+            _mm_round_best_smiles = _mm_seed_smiles
+
+            for _, _mm_row in _mm_salsa_hits.iterrows():
+                if _mm_stop:
+                    break
+                _mm_smiles = _mm_row['product_smiles']
+                _mm_canon = get_canonical_smiles(_mm_smiles)
+                _mm_key = (_mm_canon, protein)
+
+                if _mm_key in boltz_cache:
+                    _mm_score = boltz_cache[_mm_key]
+                    bt.logging.debug(f"§MM cache hit: {_mm_score:.4f}")
+                else:
+                    # Epoch guard before GPU inference
+                    try:
+                        _mm_blk2 = await state['subtensor'].get_current_block()
+                        _mm_ep2 = ((_mm_blk2 // state['epoch_length']) + 1) * state['epoch_length']
+                        if _mm_ep2 - _mm_blk2 < 5:
+                            bt.logging.info("§MM: epoch ends in <5 blocks — stopping.")
+                            _mm_stop = True
+                            break
+                    except Exception:
+                        pass
+
+                    _mm_uid = 0
+                    _mm_vmbu = {_mm_uid: {"smiles": [_mm_smiles], "names": [_mm_row['product_name']]}}
+                    _mm_sd: Dict[str, Any] = {_mm_uid: {}}
+                    try:
+                        await asyncio.to_thread(
+                            wrapper.score_molecules_target,
+                            _mm_vmbu, _mm_sd, subnet_config, '0x' + '0' * 64,
+                        )
+                        _mm_mol_scores = wrapper.per_molecule_metric.get(_mm_uid, {})
+                        _mm_score = _mm_mol_scores.get(_mm_smiles, -math.inf)
+                        boltz_cache[_mm_key] = _mm_score
+                        _disk_cache_put(
+                            db_path, _mm_canon, protein, _mm_score,
+                            product_name=_mm_row.get('product_name'),
+                        )
+                        if wrapper.last_inference_duration > 0:
+                            state['boltz_time_per_mol'] = wrapper.last_inference_duration
+                        bt.logging.info(
+                            f"§MM [{_mm_round_idx + 1}/{_mm_max_rounds}] scored: "
+                            f"{_mm_row.get('product_name', '?')} boltz={_mm_score:.4f}"
+                        )
+                    except Exception as _mm_e:
+                        bt.logging.error(f"§MM Boltz inference error: {_mm_e}")
+                        _mm_score = -math.inf
+
+                if math.isfinite(_mm_score) and _mm_score > _mm_round_best_score:
+                    _mm_round_best_score = _mm_score
+                    _mm_round_best_smiles = _mm_smiles
+                    _mm_pname = _mm_row.get('product_name', '')
+                    if _mm_pname:
+                        _mm_orig = state['candidate_product'].split(',')
+                        state['candidate_product'] = ','.join(
+                            [_mm_pname] + [n for n in _mm_orig if n != _mm_pname]
+                        )
+                        bt.logging.info(
+                            f"§MM: new best: {_mm_pname} "
+                            f"(boltz={_mm_score:.4f} > prev={_mm_best_score:.4f})"
+                        )
+                    _mm_improved = True
+
+            # Expose §MM scores to §CC so the warm-start guard sees the full epoch best
+            for _mm_ck2, _mm_cv2 in boltz_cache.items():
+                if (
+                    isinstance(_mm_ck2, tuple)
+                    and _mm_ck2[1] == protein
+                    and _mm_ck2[0] not in all_scores
+                    and math.isfinite(_mm_cv2)
+                ):
+                    all_scores[_mm_ck2[0]] = _mm_cv2
+
+            _mm_rounds_run = _mm_round_idx + 1
+
+            if not _mm_improved:
+                bt.logging.info(f"§MM round {_mm_round_idx + 1}: no improvement — stopping.")
+                break
+
+            # Advance seed to this round's best for the next iteration
+            _mm_best_score = _mm_round_best_score
+            _mm_seed_smiles = _mm_round_best_smiles
+
+        bt.logging.info(
+            f"§MM complete: {_mm_rounds_run} round(s) run, "
+            f"final_best={_mm_best_score:.4f}"
+        )
+
     # Warm-start guard (§CC): after reordering by this epoch's Boltz scores,
     # check whether the best molecule in the persistent disk cache beats the
     # best new score.  This covers the scenario where the warm-start molecule

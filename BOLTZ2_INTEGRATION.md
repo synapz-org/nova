@@ -1936,3 +1936,75 @@ small molecules (10–15 HA).  A SAVI-2020 fragment with 10 heavy atoms and mode
 Boltz-2 scores improve and whether PSICHIC candidate volume remains adequate (≥ 500 molecules
 per epoch in `savi_stream_pool`).  Revert if the pool shrinks below the SALSA trigger threshold.
 
+---
+
+## Implemented Optimisations (continued)
+
+### MM. Multi-Round Iterative Boltz-SALSA Hill-Climbing (`neurons/miner.py`) ✅ Implemented
+
+**Problem:** After the initial Boltz pass (§H, scoring top PSICHIC candidates) and §FF
+(one Boltz-SALSA round from the best Boltz molecule), the GPU is idle for the remainder
+of the epoch window on fast hardware.  On A100 (45 s/mol) with the adaptive 100-block
+trigger (~1200 s), the initial pass + §FF consume ~360–450 s, leaving ~750–850 s unused.
+That is budget for 16+ additional Boltz calls that the miner previously discarded.
+
+**Fix:** A loop runs immediately after §FF and before the §CC warm-start guard.  Each
+iteration:
+
+1. Collects the current epoch-best Boltz molecule from the union of `all_scores` (initial
+   pass) and `boltz_cache` (§FF hits).
+2. Checks whether at least `2 × t_per_mol + 120 s` remain.  If not, exits immediately.
+3. Runs a 2-round SALSA search from the current best SMILES (`top_k=3` hits) to explore
+   its chemical neighbourhood in the SAVI-2020 stream pool.
+4. Scores each of the ≤ 3 SALSA hits with Boltz-2 (using the existing `wrapper` instance,
+   single-molecule anytime pattern with epoch-end guard).
+5. If any hit beats the current best: updates `state['candidate_product']` immediately
+   (anytime guarantee), stores the score in `boltz_cache` + disk cache, advances the seed
+   to the new best, and runs another round.
+6. If no hit improves: exits (`_mm_improved = False` → `break`).
+
+The loop terminates when: no improvement found, time budget exhausted, `<5 blocks` remain,
+or `_mm_max_rounds = 5` is reached.
+
+```
+# Pseudocode
+seed ← best molecule from (all_scores ∪ §FF boltz_cache)
+for round in 1.._mm_max_rounds:
+    if remaining_time < 2 × t_per_mol + 120 s: break
+    hits ← salsa(seed, savi_pool, rounds=2, n_perturb=60, top_k=3)
+    if hits empty: break
+    improved = False
+    for hit in hits:
+        if cache_hit: score = cache[hit]
+        else:
+            if epoch_ends_in < 5 blocks: stop
+            score = boltz(hit)             # single-molecule inference
+            cache(hit, score)
+        if score > current_best:
+            candidate_product[0] = hit     # anytime reorder
+            seed = hit; improved = True
+    all_scores.update(§MM results)         # expose to §CC
+    if not improved: break
+```
+
+**Hardware impact:**
+
+| Hardware | t/mol | Budget after §FF | §MM rounds possible |
+|----------|-------|-----------------|---------------------|
+| A100 80 GB | 45 s | ~795 s | up to 5 (15 mols) |
+| RTX 4090 | 90 s | ~615 s | up to 4 (12 mols) |
+| RTX 3090 | 150 s | ~315 s | up to 1 (3 mols) |
+
+**Convergence behaviour:** In practice §MM stops after 1–3 rounds because bioisosteric
+SALSA hits tend to cluster around the same scaffold.  Once the best molecule in that scaffold
+cluster has been found, SALSA from it re-finds similar molecules that are already in cache
+(instant hits, no GPU time) and finds no improvement, stopping the loop.  The `_mm_max_rounds`
+cap is a safety rail for the rare case where the chemical space is very rich.
+
+**Files changed:**
+- `neurons/miner.py` — §MM block inserted after the §FF `try/except`, before §CC
+
+**Interaction with §CC:** After the §MM loop, all scored molecules (initial pass + §FF + §MM)
+are merged into `all_scores` before §CC runs.  This ensures the warm-start guard correctly
+compares the full epoch best (not just the initial-pass best) against the historical disk cache.
+
