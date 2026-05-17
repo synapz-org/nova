@@ -221,7 +221,19 @@ class MoleculeTrack:
 
     def reset_for_epoch(self, rxn_id: int) -> None:
         bt.logging.info(f"molecule: epoch start rxn={rxn_id} targets={self.targets}")
-        self.searcher = CombinatorialSearcher(rxn_id)
+        # Prefer winner-biased searcher when archive analysis has produced top blocks
+        top_blocks_path = f"cache/rxn{rxn_id}_top_building_blocks.json"
+        if os.path.exists(top_blocks_path):
+            from elite_miner.molecule.weighted_searcher import WeightedCombinatorialSearcher
+            self.searcher = WeightedCombinatorialSearcher(
+                rxn_id,
+                top_blocks_path=top_blocks_path,
+                bias_strength=getattr(self.config, "mol_bias_strength", 0.7),
+            )
+            bt.logging.info(f"molecule: using winner-biased searcher (top blocks from {top_blocks_path})")
+        else:
+            self.searcher = CombinatorialSearcher(rxn_id)
+            bt.logging.info(f"molecule: using uniform searcher (no top-blocks file)")
         self.best = None
         self.candidates_scored = 0
         if not self.skip_unique:
