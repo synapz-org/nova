@@ -7,6 +7,7 @@ Before debugging, tuning, or proposing a strategy change, grep `kb/` for the rel
 - `kb/gotchas/` — non-obvious bugs and constraints. Read first when something doesn't behave like the code suggests.
 - `kb/wins/` — changes that measurably improved an outcome. Read before tuning a knob someone may already have tuned.
 - `kb/losses/` — changes we tried that didn't help. Read before running an experiment someone may have already run.
+- `kb/notes/` — observations and hypotheses too uncertain for wins/losses. Strategic signals, competitor evidence, half-formed ideas.
 - `kb/raw/` — paper summaries and external research (input only — don't add notes here).
 
 Five minutes of grepping beats five hours of rediscovery. See `kb/README.md` for the full format.

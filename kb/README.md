@@ -7,6 +7,7 @@ kb/
 ├── gotchas/   # non-obvious bugs and constraints (see kb/gotchas/README.md)
 ├── wins/      # things we tried that measurably improved outcomes
 ├── losses/    # things we tried that didn't work, with the measurement
+├── notes/     # observations / hypotheses too uncertain for wins or losses
 └── raw/       # paper summaries and external research (input, not output)
 ```
 
