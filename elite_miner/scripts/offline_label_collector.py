@@ -190,6 +190,9 @@ def main() -> int:
             p = os.path.join(bg_tmp, sub)
             if os.path.exists(p):
                 shutil.rmtree(p, ignore_errors=True)
+            # Recreate the directory — the wrapper's _write_yaml_files uses
+            # open(path, "w") which doesn't auto-create parent dirs.
+            os.makedirs(p, exist_ok=True)
 
         for i, pick in enumerate(picks):
             if stop["stop"]:
