@@ -556,6 +556,22 @@ async def _try_submit(state, mt, nt) -> bool:
         mt.record_submission(mt.best.smiles)
     if nt is not None and nt.best is not None:
         nt.record_submission(nt.best.sequence)
+        # Append to nb submission queue for the offline labeling worker.
+        # Score is stored negated (lower=better convention), so the predicted iiptm is -score.
+        try:
+            from elite_miner import submission_queue as _sq
+            cfg = state["config"]
+            _sq.append(
+                target=nt.targets[0] if nt.targets else "unknown",
+                sequence=nt.best.sequence,
+                predicted_iiptm=-nt.best.score if nt.best.score is not None else 0.0,
+                epoch=landed_block // state["epoch_length"],
+                landed_block=landed_block,
+                generator=type(nt.generator).__name__,
+                fast_batch_size=_cfg(cfg, "fast_batch_size_nb", 5000),
+            )
+        except Exception:
+            pass
     return True
 
 
