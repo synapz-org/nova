@@ -81,9 +81,21 @@ VARIANTS: list[NbVariant] = [
 
 
 def pick_variant(rng: Optional[random.Random] = None) -> NbVariant:
-    """Uniform-random pick. Replace with a smarter scheduler later (UCB1, etc)."""
+    """Weighted pick. Variants newly added or unproven are oversampled so we
+    accumulate labels for them faster than uniform random would give.
+
+    Replace with a smarter scheduler later (UCB1, Thompson sampling)."""
     r = rng or random.Random()
-    return r.choice(VARIANTS)
+    # Weight schedule: oversample labelseeded (the experimental one) until it
+    # has been picked enough times to A/B-compare confidently.
+    weights = {
+        "baseline_n5000_m13": 1,
+        "wide_n5000_m38": 1,
+        "tight_n5000_m01": 1,
+        "labelseeded_n5000_m13": 4,  # 4x sampled until we have ≥10 labels
+    }
+    w = [weights.get(v.id, 1) for v in VARIANTS]
+    return r.choices(VARIANTS, weights=w, k=1)[0]
 
 
 def get_variant(variant_id: str) -> Optional[NbVariant]:
