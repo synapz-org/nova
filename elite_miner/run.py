@@ -438,6 +438,28 @@ class NanobodyTrack:
                 ),
             )
             bt.logging.info(f"nanobody: ArchiveSeededGenerator m={min_mutations}-{max_mutations}")
+        elif choice == "label_seeded":
+            # Seeds come from sequences we've actually labeled at iiptm >= threshold,
+            # not the public archive top. Falls back to archive seeds if not enough.
+            from elite_miner.nanobody.label_seeded_generator import (
+                LabelSeededGenerator, LabelSeededConfig,
+            )
+            tgt = self.targets[0] if self.targets else "Q9NZQ7"
+            cfg = LabelSeededConfig(
+                min_mutations=min_mutations,
+                max_mutations=max_mutations,
+                pssm_path=pssm_path,
+                seeds_path=seeds_path,
+                labels_path=f"cache/offline_labels/{tgt}.parquet",
+                real_iiptm_threshold=0.80,
+                min_seeds=3,
+                target=tgt,
+            )
+            self.generator = LabelSeededGenerator(self.validity_cfg, gen_cfg=cfg)
+            bt.logging.info(
+                f"nanobody: LabelSeededGenerator m={min_mutations}-{max_mutations} "
+                f"({self.generator.info()})"
+            )
         elif choice == "pssm":
             from elite_miner.nanobody.pssm_generator import PSSMGenerator, PSSMGenerationConfig
             self.generator = PSSMGenerator(

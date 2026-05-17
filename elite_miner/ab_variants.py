@@ -69,6 +69,14 @@ VARIANTS: list[NbVariant] = [
         min_mutations=0,
         max_mutations=1,
     ),
+    NbVariant(
+        id="labelseeded_n5000_m13",
+        description="LabelSeededGenerator (mutates from sequences we've MEASURED at real iiptm >= 0.80), n=5000, 1-3 mutations. Tests if our offline-labeled winners give better seeds than the public archive top.",
+        fast_batch_size_nb=5000,
+        min_mutations=1,
+        max_mutations=3,
+        generator="label_seeded",
+    ),
 ]
 
 
