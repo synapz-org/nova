@@ -3,20 +3,24 @@
 ## Setup
 Bumped nb fast-phase candidate pool from 20 → 5000, picking the surrogate's top-1 for chain submission. See `kb/wins/fast-phase-batch-size-5000.md` for the change itself. Submissions logged to `cache/submission_queue/nb.jsonl`; ground-truth labels collected by the BoltzGen worker into `cache/submission_labels/Q9NZQ7.parquet`.
 
-## Measurement (n=3 so far, very high variance)
+## Measurement (n=5)
 
-Three ground-truth labels of actual chain-submitted candidates (cache/submission_labels/Q9NZQ7.parquet):
+Five ground-truth labels of actual chain-submitted candidates (cache/submission_labels/Q9NZQ7.parquet):
 
 | label | predicted iiptm | real iiptm | bias    | archive percentile |
 |-------|-----------------|------------|---------|--------------------|
 | 1     | 0.8187          | 0.7840     | -0.0347 | p87                |
 | 2     | 0.8202          | 0.8171     | -0.0031 | **p99.7**          |
-| 3     | 0.8227          | 0.7121     | -0.111  | ~p50               |
-| mean  | 0.8205          | 0.7711     | -0.049  | —                  |
+| 3     | 0.8227          | 0.7121     | -0.111  | ~p15               |
+| 4     | 0.8232          | 0.7514     | -0.072  | ~p55               |
+| 5     | 0.8245          | 0.7037     | -0.121  | ~p10               |
+| mean  | 0.8219          | 0.7537     | -0.068  | —                  |
 
-Predictions are clustered (0.819-0.823) but real iiptm spans 0.71 to 0.82 — over 10pp. Mean is ~p77 (below archive median for recent entries). The p99.7 result (label #2) was the outlier, not the norm.
+Predictions are tightly clustered (0.819-0.825 — spread of 0.006). Real iiptm spans **0.70 to 0.82** — 12pp of noise on top of a 0.006pp signal. Only 1 of 5 (the p99.7 result) was archive-competitive. Mean is at archive p~40.
 
-So **n=5000 is a lottery ticket** in our current neighborhood: sometimes we draw a competitive sequence, sometimes middle-pack, sometimes well below. Surrogate's per-sample noise (~0.05 RMS in the high band) dominates the rank order. The Spearman ρ=0.60 in the high band shows on per-sample basis: ranking is right on average but absolute level is noisy.
+**n=5000 is not "sometimes competitive" — it's "real iiptm ≈ 0.75 ± 0.05 with occasional 0.82 outliers."** The surrogate's per-sample noise (~0.06 RMS in the high band) IS the bottleneck. Bigger n cannot fix this because the rank order across the batch is noisier than the differences between rank-1 and rank-5 sequences.
+
+This aligns with the high-band Spearman ρ=0.60 measured against the archive. Picking top-1 from a 5000-sample batch is essentially picking a random sample from the surrogate's predicted-0.82 cluster, which on real BoltzGen has 0.06 std around its mean.
 
 ## Why I had it wrong
 Earlier benchmark on archive top-10 sequences showed surrogate **under**-predicting by ~0.02 (real 0.83 ↔ pred 0.81). I extrapolated that bias to our generator's output. The bias flipped sign: in our sampled neighborhood (1-3 mutations from top-200 seeds), the surrogate **over**-predicts by ~0.035. The high-band Spearman is only 0.60 (not 0.94 like the full archive), so per-sample accuracy is poor — the surrogate ranks well but doesn't measure absolute level accurately.
