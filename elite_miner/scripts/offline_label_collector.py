@@ -171,9 +171,10 @@ def main() -> int:
             print(f"[iter {iteration}] all top-K already labeled, regenerating", flush=True)
             continue
 
+        top_pred = (picks[0].raw or {}).get("surrogate_pred", 0.0)
         print(
             f"[iter {iteration}] gen={t_gen:.1f}s score={t_score:.1f}s "
-            f"top_pred_iiptm={picks[0].raw.get('surrogate_pred', 0):.4f}",
+            f"top_pred_iiptm={top_pred:.4f}",
             flush=True,
         )
 
