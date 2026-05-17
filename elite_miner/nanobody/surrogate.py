@@ -136,6 +136,8 @@ class NanobodySurrogateScorer:
             if i not in kept_set:
                 out.append(self.proxy.score(seq))
                 continue
-            score = float(next(pred_iter))
-            out.append(ScoredNanobody(sequence=seq, score=score, raw={"surrogate_pred": score}))
+            iiptm_pred = float(next(pred_iter))
+            # combined_score_from_metrics is `-design_iiptm` (lower=better). Surrogate
+            # predicts design_iiptm directly, so we negate to match the scoring convention.
+            out.append(ScoredNanobody(sequence=seq, score=-iiptm_pred, raw={"surrogate_pred": iiptm_pred}))
         return out
