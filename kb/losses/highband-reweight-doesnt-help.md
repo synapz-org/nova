@@ -10,8 +10,9 @@ Both models have the same architecture (LightGBM regressor) and same features (5
 |---------------------------------|------------------|------------------------------------|
 | baseline (uniform weights)      | 0.934            | **0.465**                          |
 | hb_v1 (weight_exp=2.0)          | 0.934            | **0.465**                          |
+| hb_v2 (weight_exp=4.0)          | 0.931            | **0.319** (worse — overfit)        |
 
-Identical to two decimals. Reweighting the loss didn't change the high-band rank order.
+Reweighting at exp=2 was a no-op. Pushing to exp=4 actively hurt high-band performance — the model started overfitting to the small high-band sample (sample weight max went from 1.7 → 2.3 with min 0.001, very skewed distribution).
 
 ## Why I think it didn't work
 The surrogate's feature representation is **amino-acid composition + summary statistics + a 25-d protein embedding**. That's enough to discriminate "is this a vaguely-VHH-shaped sequence at all" (global Spearman 0.93) but not enough to tell two sequences that are both 1-3 mutations from a winning seed apart. The signal that separates a real-iiptm-0.82 sequence from a real-iiptm-0.71 sequence lives in residue-level interactions and 3D structure, not in summary statistics.
