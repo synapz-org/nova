@@ -290,9 +290,9 @@ class MoleculeTrack:
         return ranked[0] if ranked else None
 
     def update_best(self, candidate: Optional[ScoredMolecule]) -> bool:
-        if candidate is None:
+        if candidate is None or candidate.score is None:
             return False
-        if self.best is None or candidate.score > self.best.score:
+        if self.best is None or self.best.score is None or candidate.score > self.best.score:
             self.best = candidate
             bt.logging.info(f"molecule: new best {candidate.name} score={candidate.score:.4f}")
             return True
@@ -473,9 +473,9 @@ class NanobodyTrack:
         return ranked[0] if ranked else None
 
     def update_best(self, candidate: Optional[ScoredNanobody]) -> bool:
-        if candidate is None:
+        if candidate is None or candidate.score is None:
             return False
-        if self.best is None or candidate.score < self.best.score:
+        if self.best is None or self.best.score is None or candidate.score < self.best.score:
             self.best = candidate
             bt.logging.info(f"nanobody: new best score={candidate.score:.4f} len={len(candidate.sequence)}")
             return True

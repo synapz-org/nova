@@ -159,5 +159,10 @@ class BoltzGenScorer:
 
 
 def rank(scored: list[ScoredNanobody]) -> list[ScoredNanobody]:
-    """Sort ascending by score (lower is better)."""
-    return sorted(scored, key=lambda s: s.score)
+    """Sort ascending by score (lower is better).
+    Treat None scores as +inf so they sink to the bottom instead of raising."""
+    import math
+    return sorted(
+        scored,
+        key=lambda s: s.score if s.score is not None else math.inf,
+    )

@@ -184,5 +184,10 @@ class Boltz2Scorer:
 
 
 def rank(scored: list[ScoredMolecule]) -> list[ScoredMolecule]:
-    """Sort descending by score (validator uses boltz_mode='max')."""
-    return sorted(scored, key=lambda s: s.score, reverse=True)
+    """Sort descending by score (validator uses boltz_mode='max').
+    Treat None scores as -inf so they sink to the bottom instead of raising."""
+    return sorted(
+        scored,
+        key=lambda s: s.score if s.score is not None else -math.inf,
+        reverse=True,
+    )
