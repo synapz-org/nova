@@ -42,6 +42,9 @@ def parse_arguments() -> argparse.Namespace:
                         help="Top-K from nb surrogate to send to real BoltzGen when --use_inference.")
     parser.add_argument("--nb_surrogate_min_spearman", type=float, default=0.0,
                         help="Refuse a nb surrogate model with holdout spearman below this threshold.")
+    parser.add_argument("--nb_disable_inference", action="store_true",
+                        help="Skip BoltzGen real inference for nanobody track (use surrogate only). "
+                             "BoltzGen takes ~hours per epoch and blocks new-epoch submissions.")
     parser.add_argument("--disable_molecule_track", action="store_true",
                         help="Disable molecule track (default: enabled)")
     parser.add_argument("--disable_nanobody_track", action="store_true",

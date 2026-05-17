@@ -380,7 +380,9 @@ class NanobodyTrack:
             self.generator = NanobodyGenerator(self.validity_cfg)
             bt.logging.info("nanobody: using CDR-mutator generator (no PSSM/seeds found)")
         self.skip_unique = config.no_uniqueness_check
-        self.use_inference = config.use_inference
+        # Allow disabling nb real inference independently of mol: BoltzGen refine
+        # takes ~hours per epoch and blocks new-epoch submissions.
+        self.use_inference = config.use_inference and not _cfg(config, "nb_disable_inference", False)
 
         # Phase 3 surrogate: when configured, replaces proxy as pre-ranker
         self.surrogate: Optional[NanobodySurrogateScorer] = None
