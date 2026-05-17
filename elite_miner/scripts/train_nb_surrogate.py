@@ -174,8 +174,19 @@ def train(args):
         n_jobs=-1,
         verbose=-1,
     )
+    # Build sample weights: iiptm**weight_exp, where iiptm = -combined_score
+    # clipped to [0, 1]. weight_exp=0 → uniform; weight_exp=2-4 emphasizes the
+    # high-band where the current model is least accurate.
+    if args.weight_exp > 0:
+        iiptm_train = np.clip(-y_train, 0.0, 1.0)
+        sample_weight = (iiptm_train ** args.weight_exp).astype(np.float32)
+        sample_weight = sample_weight / sample_weight.mean()  # keep mean 1.0
+        print(f"[nb-train] sample_weight: exp={args.weight_exp} min={sample_weight.min():.3f} max={sample_weight.max():.3f}")
+    else:
+        sample_weight = None
     model.fit(
         X_train, y_train,
+        sample_weight=sample_weight,
         eval_set=[(X_hold, y_hold)],
         callbacks=[lgb.early_stopping(stopping_rounds=args.early_stopping_rounds, verbose=False)],
     )
@@ -184,6 +195,17 @@ def train(args):
     rho = spearman(y_hold, pred_hold)
     r10 = top_k_recall(y_hold, pred_hold, frac=0.10)
     print(f"[nb-train] holdout spearman={rho:.3f} top10%-recall={r10:.3f}")
+
+    # High-band sub-metric: how does the model do at distinguishing GOOD candidates?
+    iiptm_hold = -y_hold  # convert combined_score back to iiptm
+    high_mask = iiptm_hold >= args.high_band_cutoff
+    n_hi = int(high_mask.sum())
+    if n_hi >= 5:
+        rho_hi = spearman(y_hold[high_mask], pred_hold[high_mask])
+        print(f"[nb-train] HIGH-BAND (iiptm >= {args.high_band_cutoff}): n={n_hi} spearman={rho_hi:.3f}")
+    else:
+        rho_hi = None
+        print(f"[nb-train] HIGH-BAND: n={n_hi} (too few for stable rho)")
 
     os.makedirs(args.output_dir, exist_ok=True)
     model.booster_.save_model(os.path.join(args.output_dir, "model.txt"))
@@ -217,6 +239,11 @@ def main():
     p.add_argument("--num-leaves", type=int, default=32)
     p.add_argument("--min-child-samples", type=int, default=10)
     p.add_argument("--early-stopping-rounds", type=int, default=30)
+    p.add_argument("--weight-exp", type=float, default=0.0,
+                   help="Reweight training examples by iiptm**weight_exp. 0 = no reweight (uniform). "
+                        "2-4 emphasizes the high-iiptm band where the current model is least accurate.")
+    p.add_argument("--high-band-cutoff", type=float, default=0.78,
+                   help="iiptm threshold for the high-band sub-Spearman metric.")
     args = p.parse_args()
     train(args)
 
