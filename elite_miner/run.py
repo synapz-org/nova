@@ -604,7 +604,10 @@ async def run_epoch(
         nanobody_track.reset_for_epoch()
 
     submitted_at_least_once = False
-    fast_batch_size = max(10, config.batch_size // 10)  # ~10x smaller than refine batches
+    # Surrogate-only fast phase: nb is cheap (5000 in ~0.6s, top-1 0.82 vs 0.80 at n=20),
+    # mol scoring is slower (~3s/1000), so we go wide on nb and moderate on mol.
+    fast_batch_size_nb = _cfg(config, "fast_batch_size_nb", 5000)
+    fast_batch_size_mol = _cfg(config, "fast_batch_size_mol", 500)
 
     # ------------------------------------------------------------------ #
     # Phase 1 — fast initial submit (must run quickly to win block_submitted)
@@ -614,7 +617,7 @@ async def run_epoch(
             return
         # skip real Boltz2 — use surrogate top-1 directly for fast submit
         cand = await asyncio.to_thread(
-            lambda: molecule_track.search_one_batch(batch_size=fast_batch_size, skip_inference=True)
+            lambda: molecule_track.search_one_batch(batch_size=fast_batch_size_mol, skip_inference=True)
         )
         molecule_track.update_best(cand)
 
@@ -623,7 +626,7 @@ async def run_epoch(
             return
         # skip real BoltzGen — surrogate (ρ=0.94) for fast submit
         cand = await asyncio.to_thread(
-            lambda: nanobody_track.search_one_batch(batch_size=fast_batch_size, skip_inference=True)
+            lambda: nanobody_track.search_one_batch(batch_size=fast_batch_size_nb, skip_inference=True)
         )
         nanobody_track.update_best(cand)
 
