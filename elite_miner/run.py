@@ -163,10 +163,11 @@ class MoleculeTrack:
                 min_spearman=getattr(config, "surrogate_min_spearman", 0.0),
             )
             if self.surrogate.is_ready:
-                bt.logging.info(
-                    f"molecule: surrogate ready (holdout_spearman="
-                    f"{self.surrogate.metrics.spearman_rho:.3f if self.surrogate.metrics else 'n/a'})"
+                rho_str = (
+                    f"{self.surrogate.metrics.spearman_rho:.3f}"
+                    if self.surrogate.metrics else "n/a"
                 )
+                bt.logging.info(f"molecule: surrogate ready (holdout_spearman={rho_str})")
             else:
                 bt.logging.warning(
                     f"molecule: surrogate not ready ({self.surrogate.fallback_reason}); using proxy"
