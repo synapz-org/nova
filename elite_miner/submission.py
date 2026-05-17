@@ -19,9 +19,14 @@ from bittensor.core.errors import MetadataError
 
 
 def build_message(molecule_name: Optional[str], nanobody_sequence: Optional[str]) -> str:
-    """Validator-expected format: 'molecule|nanobody'. Empty side → empty string."""
-    m = molecule_name or ""
-    n = nanobody_sequence or ""
+    """Validator-expected format: 'molecule|nanobody'.
+
+    The validator's parse_decrypted_submission rejects submissions where either
+    side of `|` is empty (`""`). Use `~` as the documented null placeholder when
+    we only have one of the two — that way the present side is still scored.
+    """
+    m = molecule_name or "~"
+    n = nanobody_sequence or "~"
     return f"{m}|{n}"
 
 
