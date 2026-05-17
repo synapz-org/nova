@@ -323,7 +323,23 @@ class NanobodyTrack:
             "sp_scan_prefix": config.sp_scan_prefix,
             "enforce_vhh_hallmarks": config.enforce_vhh_hallmarks,
         })
-        self.generator = NanobodyGenerator(self.validity_cfg)
+        # PSSM-guided generator if PSSM file is available; otherwise fall back
+        # to CDR-mutator. PSSM produces sequences in the archive-winner neighborhood.
+        pssm_path = getattr(config, "nb_pssm_path", "cache/q9nzq7_pssm.json")
+        if pssm_path and os.path.exists(pssm_path):
+            from elite_miner.nanobody.pssm_generator import PSSMGenerator, PSSMGenerationConfig
+            self.generator = PSSMGenerator(
+                self.validity_cfg,
+                gen_cfg=PSSMGenerationConfig(
+                    min_mutations=getattr(config, "nb_min_mutations", 3),
+                    max_mutations=getattr(config, "nb_max_mutations", 10),
+                    pssm_path=pssm_path,
+                ),
+            )
+            bt.logging.info(f"nanobody: using PSSM-guided generator from {pssm_path}")
+        else:
+            self.generator = NanobodyGenerator(self.validity_cfg)
+            bt.logging.info("nanobody: using CDR-mutator generator (no PSSM found)")
         self.skip_unique = config.no_uniqueness_check
         self.use_inference = config.use_inference
 
