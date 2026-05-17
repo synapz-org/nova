@@ -84,7 +84,20 @@ def _get_quicknet_timelock():
 
 
 def _get_challenge_fn():
-    _challenge = _load_submodule("_em_utils_challenge", os.path.join(BASE_DIR, "utils", "challenge.py"))
+    # challenge.py has a relative `from .reactions import get_total_reactions` inside
+    # the include_reaction branch. To make that resolve, we ALSO load utils.reactions
+    # as a sibling and register both under a synthetic `_em_utils` parent package.
+    parent_name = "_em_utils"
+    if parent_name not in _sys.modules:
+        import types
+        parent = types.ModuleType(parent_name)
+        parent.__path__ = [os.path.join(BASE_DIR, "utils")]
+        _sys.modules[parent_name] = parent
+
+    if f"{parent_name}.reactions" not in _sys.modules:
+        _load_submodule(f"{parent_name}.reactions", os.path.join(BASE_DIR, "utils", "reactions.py"))
+
+    _challenge = _load_submodule(f"{parent_name}.challenge", os.path.join(BASE_DIR, "utils", "challenge.py"))
     return _challenge.get_challenge_params_from_blockhash
 
 
