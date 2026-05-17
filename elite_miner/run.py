@@ -111,7 +111,16 @@ async def setup_bittensor(config) -> tuple[Any, int, int]:
             raise RuntimeError(
                 f"hotkey {wallet.hotkey.ss58_address} not registered on netuid {config.netuid}"
             )
-        node = SubstrateInterface(url=config.network)
+        # SubstrateInterface needs a full ws URL, not the named network shorthand.
+        # Map common names; otherwise assume caller already passed a ws:// URL.
+        _network_urls = {
+            "finney": "wss://entrypoint-finney.opentensor.ai:443",
+            "test": "wss://test.finney.opentensor.ai:443",
+            "local": "ws://127.0.0.1:9944",
+            "archive": "wss://archive.chain.opentensor.ai:443",
+        }
+        substrate_url = _network_urls.get(config.network, config.network)
+        node = SubstrateInterface(url=substrate_url)
         epoch_length = node.query("SubtensorModule", "Tempo", [config.netuid]).value + 1
         bt.logging.info(f"miner_uid={miner_uid} epoch_length={epoch_length}")
     return wallet, miner_uid, epoch_length
