@@ -28,6 +28,12 @@ if BASE_DIR not in sys.path:
 import bittensor as bt
 from substrateinterface import SubstrateInterface
 
+
+def _cfg(cfg, key: str, default):
+    """getattr-with-default that handles bittensor Config (which returns None for missing keys)."""
+    v = getattr(cfg, key, default)
+    return default if v is None else v
+
 from elite_miner.config import parse_arguments, setup_logging, subnet_config_dict
 from elite_miner.submission import build_github_path, submit, SubmissionResult
 from elite_miner.timing import EpochState, SubmissionRateLimiter, get_epoch_state
@@ -173,7 +179,7 @@ class MoleculeTrack:
             self.surrogate = SurrogateScorer(
                 model_dir=config.surrogate_model_dir,
                 target_features=tgt_feats,
-                min_spearman=getattr(config, "surrogate_min_spearman", 0.0),
+                min_spearman=_cfg(config, "surrogate_min_spearman", 0.0),
             )
             if self.surrogate.is_ready:
                 rho_str = (
@@ -197,8 +203,8 @@ class MoleculeTrack:
         self.proxy = MolProxyScorer()  # always available
         # Diversity guard: detect mode collapse across recent submissions
         self.diversity = DiversityTracker(
-            window_size=getattr(config, "diversity_window", 20),
-            similarity_threshold=getattr(config, "diversity_threshold", 0.85),
+            window_size=_cfg(config, "diversity_window", 20),
+            similarity_threshold=_cfg(config, "diversity_threshold", 0.85),
         )
 
     def _pre_rank_scorer(self):
@@ -228,7 +234,7 @@ class MoleculeTrack:
             self.searcher = WeightedCombinatorialSearcher(
                 rxn_id,
                 top_blocks_path=top_blocks_path,
-                bias_strength=getattr(self.config, "mol_bias_strength", 0.7),
+                bias_strength=_cfg(self.config, "mol_bias_strength", 0.7),
             )
             bt.logging.info(f"molecule: using winner-biased searcher (top blocks from {top_blocks_path})")
         else:
@@ -264,7 +270,7 @@ class MoleculeTrack:
         size = batch_size if batch_size is not None else self.config.batch_size
         # If surrogate is live, expand the search budget — that's the whole point
         if self.surrogate is not None and self.surrogate.is_ready and batch_size is None:
-            size = max(size, getattr(self.config, "surrogate_batch_size", size * 10))
+            size = max(size, _cfg(self.config, "surrogate_batch_size", size * 10))
 
         raw = self.searcher.generate_batch(size)
         valid = self.vfilter.filter_batch(raw)
@@ -278,7 +284,7 @@ class MoleculeTrack:
 
         if self.use_inference and not skip_inference:
             # Take top-K by pre-ranker, then run real Boltz2 to refine
-            topk = getattr(self.config, "surrogate_topk", 5)
+            topk = _cfg(self.config, "surrogate_topk", 5)
             top = mol_rank(pre_scored)[:topk]
             candidates = [(c.name, c.smiles) for c in top]
             scored = self.scorer.score_batch(candidates, self.subnet_cfg)
@@ -343,8 +349,8 @@ class NanobodyTrack:
         #   2. PSSMGenerator: consensus + PSSM-weighted mutations (3-10 positions).
         #      Faster diversity but more risk of bad combinations.
         #   3. NanobodyGenerator: CDR-mutator from synthetic templates (fallback).
-        pssm_path = getattr(config, "nb_pssm_path", "cache/q9nzq7_pssm.json")
-        seeds_path = getattr(config, "nb_seeds_path", "cache/q9nzq7_top_seeds.json")
+        pssm_path = _cfg(config, "nb_pssm_path", "cache/q9nzq7_pssm.json")
+        seeds_path = _cfg(config, "nb_seeds_path", "cache/q9nzq7_top_seeds.json")
         if pssm_path and seeds_path and os.path.exists(pssm_path) and os.path.exists(seeds_path):
             from elite_miner.nanobody.archive_seeded_generator import (
                 ArchiveSeededGenerator, ArchiveSeededConfig,
@@ -352,8 +358,8 @@ class NanobodyTrack:
             self.generator = ArchiveSeededGenerator(
                 self.validity_cfg,
                 gen_cfg=ArchiveSeededConfig(
-                    min_mutations=getattr(config, "nb_min_mutations", 1),
-                    max_mutations=getattr(config, "nb_max_mutations", 3),
+                    min_mutations=_cfg(config, "nb_min_mutations", 1),
+                    max_mutations=_cfg(config, "nb_max_mutations", 3),
                     pssm_path=pssm_path,
                     seeds_path=seeds_path,
                 ),
@@ -364,8 +370,8 @@ class NanobodyTrack:
             self.generator = PSSMGenerator(
                 self.validity_cfg,
                 gen_cfg=PSSMGenerationConfig(
-                    min_mutations=getattr(config, "nb_min_mutations", 3),
-                    max_mutations=getattr(config, "nb_max_mutations", 10),
+                    min_mutations=_cfg(config, "nb_min_mutations", 3),
+                    max_mutations=_cfg(config, "nb_max_mutations", 10),
                     pssm_path=pssm_path,
                 ),
             )
@@ -387,7 +393,7 @@ class NanobodyTrack:
             self.surrogate = NanobodySurrogateScorer(
                 model_dir=config.nb_surrogate_model_dir,
                 target_features=tgt_feats,
-                min_spearman=getattr(config, "nb_surrogate_min_spearman", 0.0),
+                min_spearman=_cfg(config, "nb_surrogate_min_spearman", 0.0),
             )
             if self.surrogate.is_ready:
                 rho = self.surrogate.metrics.spearman_rho if self.surrogate.metrics else None
@@ -408,8 +414,8 @@ class NanobodyTrack:
         self.candidates_scored = 0
         # Mode-collapse guard: pairwise sequence identity over recent submissions
         self.diversity = NanobodyDiversityTracker(
-            window_size=getattr(config, "nb_diversity_window", 10),
-            identity_threshold=getattr(config, "nb_diversity_threshold", 0.95),
+            window_size=_cfg(config, "nb_diversity_window", 10),
+            identity_threshold=_cfg(config, "nb_diversity_threshold", 0.95),
         )
 
     def _pre_rank_scorer(self):
@@ -450,7 +456,7 @@ class NanobodyTrack:
         size = batch_size if batch_size is not None else self.config.batch_size
         # If surrogate is live, expand the search budget (surrogate is cheap)
         if self.surrogate is not None and self.surrogate.is_ready and batch_size is None:
-            size = max(size, getattr(self.config, "nb_surrogate_batch_size", size * 5))
+            size = max(size, _cfg(self.config, "nb_surrogate_batch_size", size * 5))
 
         seqs = self.generator.generate_batch(size)
         if not self.skip_unique and seqs:
@@ -462,7 +468,8 @@ class NanobodyTrack:
         pre_scored = pre_ranker.score_batch(seqs)
 
         if self.use_inference and not skip_inference:
-            topk = getattr(self.config, "nb_surrogate_topk", 5)
+            # topk=2 keeps BoltzGen refine under 30 min (1 input ≈ 15 min on A100)
+            topk = _cfg(self.config, "nb_surrogate_topk", 2)
             top = nb_rank(pre_scored)[:topk]
             top_seqs = [c.sequence for c in top]
             scored = self.scorer.score_batch(top_seqs, self.subnet_cfg)
@@ -624,12 +631,12 @@ async def run_epoch(
         await fast_search_mol()
     except Exception as e:
         bt.logging.error(f"epoch: fast mol search failed: {e}")
-        bt.logging.debug(traceback.format_exc())
+        bt.logging.error(traceback.format_exc())
     try:
         await fast_search_nb()
     except Exception as e:
         bt.logging.error(f"epoch: fast nb search failed: {e}")
-        bt.logging.debug(traceback.format_exc())
+        bt.logging.error(traceback.format_exc())
 
     if await _try_submit(state, molecule_track, nanobody_track):
         submitted_at_least_once = True
@@ -660,12 +667,12 @@ async def run_epoch(
             await refine_mol()
         except Exception as e:
             bt.logging.error(f"epoch: refine mol batch {batch_idx} failed: {e}")
-            bt.logging.debug(traceback.format_exc())
+            bt.logging.error(traceback.format_exc())
         try:
             await refine_nb()
         except Exception as e:
             bt.logging.error(f"epoch: refine nb batch {batch_idx} failed: {e}")
-            bt.logging.debug(traceback.format_exc())
+            bt.logging.error(traceback.format_exc())
 
         if await _try_submit(state, molecule_track, nanobody_track):
             submitted_at_least_once = True
@@ -775,7 +782,7 @@ async def run_miner(config) -> None:
                 consecutive_errors += 1
                 wait_s = min(60, 2 ** consecutive_errors)
                 bt.logging.error(f"main loop error #{consecutive_errors}: {e}; sleeping {wait_s}s")
-                bt.logging.debug(traceback.format_exc())
+                bt.logging.error(traceback.format_exc())
                 if consecutive_errors >= 5:
                     # Try a clean reconnect
                     try:
