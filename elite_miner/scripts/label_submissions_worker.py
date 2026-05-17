@@ -157,17 +157,30 @@ def label_one(entry: dict, clip_intervals: dict, output_dir: str) -> Optional[di
     scorer = _get_scorer(target, clip)
     subnet_cfg = _subnet_config_for(target, clip)
 
-    # Clean BoltzGen's tmp inputs/ + outputs/ before each call. Wrapper accumulates
-    # yaml input files and intermediate designs across calls, which makes each
-    # subsequent label process all prior sequences and grow latency unboundedly.
-    # See kb/gotchas/install-deps-uv-not-in-path.md for context; same wrapper bug.
-    import shutil
+    # Clean accumulated BoltzGen state before each call. Wrapper writes
+    # per-sequence yamls to inputs/ and intermediate designs to outputs/.../
+    # Lightning's PredictionWriter doesn't auto-create its outdir, so we
+    # can't rmtree the top-level dir — only the per-sequence FILES.
+    import glob as _glob
     bg_tmp = os.path.join(BASE_DIR, "external_tools", "boltzgen", "boltzgen_tmp_files")
-    for sub in ("inputs", "outputs"):
-        p = os.path.join(bg_tmp, sub)
-        if os.path.exists(p):
-            shutil.rmtree(p, ignore_errors=True)
-        os.makedirs(p, exist_ok=True)
+    # 1) Clear per-sequence yaml inputs (everything in inputs/)
+    inputs_dir = os.path.join(bg_tmp, "inputs")
+    if os.path.exists(inputs_dir):
+        for f in _glob.glob(os.path.join(inputs_dir, "*")):
+            try:
+                os.remove(f)
+            except OSError:
+                pass
+    # 2) Clear intermediate design files (everything under outputs/intermediate_designs/)
+    # but keep the dir skeleton so Lightning's writer can use it.
+    intermediate = os.path.join(bg_tmp, "outputs", "intermediate_designs")
+    if os.path.exists(intermediate):
+        for f in _glob.glob(os.path.join(intermediate, "**", "*"), recursive=True):
+            if os.path.isfile(f):
+                try:
+                    os.remove(f)
+                except OSError:
+                    pass
 
     t0 = time.time()
     try:

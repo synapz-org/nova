@@ -184,15 +184,26 @@ def main() -> int:
         # prior sequences (1 → 3 → 5 → 10 …) and latency grows unboundedly.
         # config/boltzgen_config.yaml has remove_files=true but the wrapper
         # doesn't honor it.
-        import shutil
+        # Clear accumulated per-sequence files but preserve dir skeleton —
+        # Lightning's PredictionWriter doesn't auto-create its outdir, so a
+        # full rmtree leaves it expecting paths that no longer exist.
+        import glob as _glob
         bg_tmp = os.path.join(BASE_DIR, "external_tools", "boltzgen", "boltzgen_tmp_files")
-        for sub in ("inputs", "outputs"):
-            p = os.path.join(bg_tmp, sub)
-            if os.path.exists(p):
-                shutil.rmtree(p, ignore_errors=True)
-            # Recreate the directory — the wrapper's _write_yaml_files uses
-            # open(path, "w") which doesn't auto-create parent dirs.
-            os.makedirs(p, exist_ok=True)
+        inputs_dir = os.path.join(bg_tmp, "inputs")
+        if os.path.exists(inputs_dir):
+            for f in _glob.glob(os.path.join(inputs_dir, "*")):
+                try:
+                    os.remove(f)
+                except OSError:
+                    pass
+        intermediate = os.path.join(bg_tmp, "outputs", "intermediate_designs")
+        if os.path.exists(intermediate):
+            for f in _glob.glob(os.path.join(intermediate, "**", "*"), recursive=True):
+                if os.path.isfile(f):
+                    try:
+                        os.remove(f)
+                    except OSError:
+                        pass
 
         for i, pick in enumerate(picks):
             if stop["stop"]:
