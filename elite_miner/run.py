@@ -739,6 +739,14 @@ async def run_miner(config) -> None:
     bt.logging.info("entering main mining loop")
     last_epoch_block = -1
     consecutive_errors = 0
+    # Watchdog: if current_block doesn't advance for this long, force-reconnect.
+    # Bittensor's async subtensor sometimes silently leaks SSL transports and
+    # stops getting new blocks (no exception raised). Block period is ~12s,
+    # so a 5-min stall is clearly broken.
+    import time as _time
+    last_block_seen = -1
+    last_block_advance_at = _time.monotonic()
+    stall_seconds_before_reconnect = 300
 
     subtensor = await _open_subtensor(config.network)
     try:
@@ -756,6 +764,21 @@ async def run_miner(config) -> None:
                 }
 
                 epoch_state = await get_epoch_state(subtensor, epoch_length)
+                if epoch_state.current_block != last_block_seen:
+                    last_block_seen = epoch_state.current_block
+                    last_block_advance_at = _time.monotonic()
+                elif _time.monotonic() - last_block_advance_at > stall_seconds_before_reconnect:
+                    bt.logging.warning(
+                        f"watchdog: block hasn't advanced from {last_block_seen} in "
+                        f"{stall_seconds_before_reconnect}s — forcing subtensor reconnect"
+                    )
+                    try:
+                        await subtensor.close()
+                    except Exception:
+                        pass
+                    subtensor = await _open_subtensor(config.network)
+                    last_block_advance_at = _time.monotonic()
+                    continue
                 if epoch_state.last_boundary != last_epoch_block:
                     bt.logging.info(
                         f"epoch boundary: last={epoch_state.last_boundary} "
