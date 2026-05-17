@@ -323,10 +323,29 @@ class NanobodyTrack:
             "sp_scan_prefix": config.sp_scan_prefix,
             "enforce_vhh_hallmarks": config.enforce_vhh_hallmarks,
         })
-        # PSSM-guided generator if PSSM file is available; otherwise fall back
-        # to CDR-mutator. PSSM produces sequences in the archive-winner neighborhood.
+        # Generator preference (best → worst):
+        #   1. ArchiveSeededGenerator: seeds from real top winners + PSSM-weighted
+        #      mutations (1-3 positions). Stays in known-good neighborhood.
+        #   2. PSSMGenerator: consensus + PSSM-weighted mutations (3-10 positions).
+        #      Faster diversity but more risk of bad combinations.
+        #   3. NanobodyGenerator: CDR-mutator from synthetic templates (fallback).
         pssm_path = getattr(config, "nb_pssm_path", "cache/q9nzq7_pssm.json")
-        if pssm_path and os.path.exists(pssm_path):
+        seeds_path = getattr(config, "nb_seeds_path", "cache/q9nzq7_top_seeds.json")
+        if pssm_path and seeds_path and os.path.exists(pssm_path) and os.path.exists(seeds_path):
+            from elite_miner.nanobody.archive_seeded_generator import (
+                ArchiveSeededGenerator, ArchiveSeededConfig,
+            )
+            self.generator = ArchiveSeededGenerator(
+                self.validity_cfg,
+                gen_cfg=ArchiveSeededConfig(
+                    min_mutations=getattr(config, "nb_min_mutations", 1),
+                    max_mutations=getattr(config, "nb_max_mutations", 3),
+                    pssm_path=pssm_path,
+                    seeds_path=seeds_path,
+                ),
+            )
+            bt.logging.info(f"nanobody: using ArchiveSeededGenerator (seeds={seeds_path})")
+        elif pssm_path and os.path.exists(pssm_path):
             from elite_miner.nanobody.pssm_generator import PSSMGenerator, PSSMGenerationConfig
             self.generator = PSSMGenerator(
                 self.validity_cfg,
@@ -339,7 +358,7 @@ class NanobodyTrack:
             bt.logging.info(f"nanobody: using PSSM-guided generator from {pssm_path}")
         else:
             self.generator = NanobodyGenerator(self.validity_cfg)
-            bt.logging.info("nanobody: using CDR-mutator generator (no PSSM found)")
+            bt.logging.info("nanobody: using CDR-mutator generator (no PSSM/seeds found)")
         self.skip_unique = config.no_uniqueness_check
         self.use_inference = config.use_inference
 
