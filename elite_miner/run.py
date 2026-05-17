@@ -214,6 +214,14 @@ class MoleculeTrack:
         if self.surrogate is None or not self.surrogate.is_ready:
             return self.proxy
         if self.diversity.is_collapsed():
+            gen_name = type(self.searcher).__name__ if self.searcher else ""
+            if gen_name == "WeightedCombinatorialSearcher":
+                # Winner-biased mol searcher produces high-similarity molecules by design.
+                bt.logging.info(
+                    f"molecule: high similarity ({self.diversity.median_similarity():.3f}) "
+                    f"but {gen_name} is winner-biased — keeping surrogate"
+                )
+                return self.surrogate
             bt.logging.warning(
                 f"molecule: diversity collapse (median sim={self.diversity.median_similarity():.3f}) "
                 f"— falling back to proxy this batch"
@@ -460,7 +468,19 @@ class NanobodyTrack:
     def _pre_rank_scorer(self):
         if self.surrogate is None or not self.surrogate.is_ready:
             return self.proxy
+        # ArchiveSeededGenerator intentionally produces sequences ~1-3 mutations from
+        # top-200 winners — pairwise identity is high *by design*. Falling back to
+        # proxy on collapse here is worse than re-submitting near-identical winners,
+        # because proxy picks random sequences (predicted iiptm ≈ 0).
+        # We log but don't fall back when using a winner-neighborhood generator.
         if self.diversity.is_collapsed():
+            gen_name = type(self.generator).__name__
+            if gen_name == "ArchiveSeededGenerator":
+                bt.logging.info(
+                    f"nanobody: high identity ({self.diversity.median_identity():.3f}) but "
+                    f"{gen_name} is winner-neighborhood by design — keeping surrogate"
+                )
+                return self.surrogate
             bt.logging.warning(
                 f"nanobody: diversity collapse (median identity={self.diversity.median_identity():.3f}) "
                 f"— falling back to proxy this batch"
