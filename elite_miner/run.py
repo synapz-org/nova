@@ -893,6 +893,30 @@ async def run_miner(config) -> None:
                         f"epoch boundary: last={epoch_state.last_boundary} "
                         f"next={epoch_state.next_boundary} current={epoch_state.current_block}"
                     )
+                    # Deregistration guard: re-sync metagraph at each epoch boundary
+                    # and refuse to keep mining if our hotkey is no longer on the subnet.
+                    # See kb/gotchas/deregistration-loses-uid.md — yesterday this was the
+                    # difference between losing $50 of compute and catching it in 1 epoch.
+                    try:
+                        new_mg = await subtensor.metagraph(config.netuid)
+                        await new_mg.sync()
+                        if wallet.hotkey.ss58_address not in new_mg.hotkeys:
+                            bt.logging.error(
+                                f"DEREGISTRATION DETECTED: our hotkey {wallet.hotkey.ss58_address[:12]}… "
+                                f"is no longer in netuid {config.netuid} metagraph. "
+                                f"Stopping miner — re-register manually before resuming."
+                            )
+                            return  # exit run_miner cleanly
+                        # Also detect UID shift (hotkey present but at different UID)
+                        new_uid = new_mg.hotkeys.index(wallet.hotkey.ss58_address)
+                        if new_uid != miner_uid:
+                            bt.logging.warning(
+                                f"UID shift: was {miner_uid}, now {new_uid}. Updating cache."
+                            )
+                            miner_uid = new_uid
+                            state["miner_uid"] = miner_uid
+                    except Exception as e:
+                        bt.logging.warning(f"deregistration check failed (non-fatal): {e}")
                     last_epoch_block = epoch_state.last_boundary
                     await run_epoch(state, molecule_track, nanobody_track, epoch_state)
                 else:
