@@ -1,0 +1,264 @@
+NOVA: Unleashing Decentralized Intelligence to Revolutionize Drug Discovery
+Drug discovery has proven to be an exceptionally arduous endeavor—one that demands navigating an almost infinite chemical universe while managing staggering costs, lengthy timelines, and an overwhelming attrition rate. Traditional pipelines often take over a decade and billions of dollars to bring a single drug to market, with more than 90% of candidates failing during clinical trials [4]. This challenge is amplified by the sheer scale of chemical space, which is estimated to contain up to 10^60 unique molecules, yet only a minuscule fraction have been explored. Recent breakthroughs, however, have begun to turn the tide. Ultra-large virtual libraries such as the SAVI 2020 database now provide access to over 1.75 billion synthesizable compounds [1], dramatically expanding the possibilities for searching chemical space. At the same time, advances in machine learning—from improvements in QSAR models to sophisticated deep learning frameworks like PSICHIC—have markedly improved our ability to predict binding affinities with remarkable accuracy [2, 3]. Still, integrating and effectively mining such vast datasets remains a formidable challenge. NOVA rises to this challenge by using decentralized computing to accelerate a dual strategy of ML-based active learning and adaptive search through domain-specific heuristics. This new approach changes drug discovery into a scalable, efficient, and transparent optimization process—one that can overcome traditional limitations and significantly reduce the time and cost of bringing new therapeutics to patients
+
+1. Introduction
+Drug discovery is traditionally slow, expensive, and risky. Conventional pipelines can take over a decade and billions of dollars to bring a single drug to market [4]. Challenges include:
+
+Inefficiencies: Incremental chemical modifications rather than breakthrough innovations are common.
+
+Centralization: Legacy systems suffer from siloed data and limited computational scalability.
+
+High Cost and Risk: High failure rates add enormous uncertainty and expense.
+
+NOVA addresses these challenges by leveraging the decentralized power of the Bittensor network [5]. By incentivizing the use of ML-based active learning and heuristic adaptive search methods, NOVA transforms drug discovery into a scalable, efficient search process. Every participant—miner or validator—plays a role in rapidly screening a billion-sized molecular library, optimizing the search for high-affinity, synthesizable drug candidates.
+
+2. NOVA Subnet Architecture
+Overview in the Bittensor Ecosystem
+NOVA is one of several specialized subnets within the Bittensor network. While other subnets focus on tasks such as pretraining (SN9), data collection (SN13), and protein folding (SN25), NOVA is dedicated to early-stage drug discovery. 
+
+Objective: Find the best molecule in the shortest amount of time. NOVA V1 challenges miners to find a molecule from the database provided with the highest binding affinity to the protein target selected for each challenge. Over time, the challenge will evolve into a multi-parametric optimization exercise that mirrors the process of drug discovery with multiple targets and key physicochemical properties that maximize the likelihood of eventual drug approval.
+
+Its architecture comprises three major components:
+
+Miners: Deploy and execute optimized search methods over the vast chemical space of the SAVI 2020 database hunting promising molecules using for example ML-based active learning and/or heuristic adaptive search methods. Recent approaches such as PyrMD: Accelerated Chemical Space Exploration Using Active Sampling [8] and MolPAL: An Active Learning Framework for Molecular Property Prediction [10] illustrate how active sampling and iterative refinement can efficiently guide exploration. 
+
+Validators: Nodes that evaluate submitted molecules using the Deterministic Oracle.
+
+The Deterministic Oracle (PSICHIC): A state-of-the-art model that assigns a binding affinity score to each molecule, serving as the “ground truth” for the competition.
+
+Key Interactions
+
+Mining Process:
+Miners extract candidate molecules from SAVI 2020. They refine their strategies over time by using adaptive search techniques (e.g., substructure searches, heuristic filters) or, when applicable, ML-based active learning methods that are adjusted based on the Deterministic Oracle predictions [2, 3].  (See Appendix A for Miners Concept Logic).
+
+Validation Process:
+Validators score the submissions for block n at the end of block n+1 using PSICHIC, ensuring objective and transparent evaluation.  (See Appendix B for Miners Concept Logic).
+
+Reward Allocation:
+At the end of each challenge, the miner that has presented the molecule with the highest score (binding affinity to the protein) will receive the reward.  (See Appendix C for more on the reward allocation rationale).
+
+3. PSICHIC as the Deterministic Oracle
+What is PSICHIC?
+PSICHIC is an advanced prediction model that estimates protein–ligand binding affinity using minimal input—typically the protein sequence and the molecule’s representation (such as SMILES) [2]. PSICHIC’s reproducible, deterministic output predictions provide a clear, objective score, that combined with its high customizability and open-source nature, positions it as the ideal candidate as the first Deterministic Oracle.
+
+
+Role in NOVA
+
+Deterministic Evaluation:
+PSICHIC’s fixed output for any given molecule (given a fixed model version) ensures that all submissions are scored objectively.
+
+Motivating Optimized Search:
+Because the SAVI 2020 database is so large, it's not practical to evaluate every molecule by brute force in the defined time for each challenge. This forces miners to develop intelligent strategies—whether through ML-based active learning or adaptive search using heuristic methods—to hone in on the best candidates to be evaluated through PSICHIC predictions.
+
+Standard for Success:
+In each challenge, the candidate’s PSICHIC score is the definitive metric for success, making it the cornerstone of the competitive process.
+
+4. Leveraging the SAVI 2020 Database
+The SAVI Advantage
+The SAVI 2020 database is an ultra-large, synthesizable virtual library generated by applying expert-curated reaction rules to known chemical building blocks [1]. This process yields approximately 1.75 billion compounds that are:
+
+Synthesizable:
+Each molecule comes with a clear synthetic route, ensuring that computational hits can be readily synthesized and tested in the lab.
+
+Chemically Realistic:
+SAVI’s compounds are grounded in established chemical reactions, ensuring they are practical for real-world drug development, reducing the odds of spending time evaluating inaccessible chemical matter while also aiming for exceptionally high chemical diversity.
+
+Why It Matters
+
+Scalability:
+SAVI 2020 vastly expands the searchable chemical space beyond what traditional datasets offer.
+
+Practicality:
+Because every candidate was previously evaluated in terms of synthesizability, any hit identified by miners is actionable, enabling a swift transition from virtual screening to experimental validation.
+
+Democratization:
+As an open-source resource, SAVI aligns with NOVA’s decentralized ethos, providing all participants with the same high-quality foundation for innovation.
+
+5. Drug Discovery as a Search Problem
+Reframing Drug Discovery
+NOVA transforms drug discovery into a well-defined optimization challenge—finding the molecule with the highest binding affinity to a target protein. Instead of a random trial-and-error approach, the process is structured as follows:
+
+Optimization Objective:
+Maximize the binding affinity score provided by PSICHIC [2].
+
+Iterative Refinement:
+Miners use feedback from PSICHIC to refine their search strategy. This iterative process can be driven by ML-based active learning—as demonstrated in Traversing Chemical Space with Active Deep Learning [7]—or by adaptive search using creative search heuristics.
+
+Heuristic-Driven Exploration:
+Even without complex ML models, miners can use creative search heuristics—such as prioritizing molecules with known active substructures performing well under the Deterministis Oracle evaluation—to focus on the most promising regions of the chemical space. Approaches like PyrMD: Accelerated Chemical Space Exploration Using Active Sampling [8] and MolPAL: An Active Learning Framework for Molecular Property Prediction [10] provide compelling examples of how targeted sampling and iterative feedback can dramatically reduce computational costs and enhance screening efficiency.
+
+Comparable Large-Scale Searches
+This approach is similar to methods used in neural architecture search or reinforcement learning, where systems iteratively improve based on feedback. By combining active learning and adaptive search, NOVA efficiently narrows down a billion-molecule space to the most promising candidates.
+
+6. The Competitive Mining Model
+Challenge Format
+
+Per-Block Submissions:
+Miners submit candidate molecules selected from SAVI 2020, with the caveat that each submission overwrites the previous one. This will ensure that miners only submit a new molecule when they find a higher affinity score.
+
+Challenge Rounds:
+Over the challenge period (360 blocks), miners continuously refine their submissions using their chosen search strategies. Rewards will be calculated to determine the highest scoring miner.
+
+Winner-Takes-All Reward:
+At the end of each block, validators evaluate each miner’s active submission with PSICHIC [2] and rank miners based on their scores. The miner with the highest binding affinity score wins the reward. If the same molecule is submitted by two different miners or two molecules with the same binding affinity were submitted by different miners, the miner that submitted it first wins the sub-challenge.
+
+Implications
+
+Intelligent Strategy Requirement:
+With only one active submission allowed at a time and a winner-takes-all reward, miners must also focus on quality, not only quantity.
+
+Continuous Improvement:
+The competitive nature drives miners to refine their strategies iteratively, using feedback from PSICHIC to guide enhancements.
+
+Transparency and Fairness:
+Every submission is evaluated objectively, ensuring a level playing field for all participants.
+
+7. Validation Mechanism and Incentive Alignment
+Validation Workflow
+
+Miner Submissions:
+Each miner can submit up to one candidate molecule at any given time. This means that miners are incentivized to make another submission only when they find a better candidate.
+
+PSICHIC Evaluation:
+At the end of each block (~12 seconds), validators perform an evaluation of the binding affinity score of each miner’s active submission. Winner molecules and their binding affinities are presented to the community on the leaderboard, further refining the community’s search strategies and incentivizing competition.
+
+Winner Determination:
+Every 360 blocks, validators define the best miner based on the best score. Ties are solved by prioritizing who submitted the best performing molecule earlier. The candidate with the highest PSICHIC score receives the TAO reward for that chunk.
+
+Preventing Exploitation
+
+Objective, Fixed Scoring:
+By using PSICHIC as the Deterministic Oracle we ensure the elimination of subjective bias in the definition of winner molecules given its deterministic predictions.
+
+Spam/Attacks Prevention:
+Limiting submissions to one active submission at any given time incentivizes miners to focus on quality rather than indiscriminate volume of submissions.
+
+
+
+Alignment of Incentives
+
+Miner
+
+Mechanism: Winner-takes-all reward based on the highest PSICHIC scores.
+
+Outcome: Encourages the development of sophisticated search strategies using adaptive search and/or active learning.
+
+Validator
+
+Mechanism: Earn rewards for accurately processing submissions using PSICHIC.
+
+Outcome: Promotes honest, objective evaluation, as any deviation is publicly auditable.
+
+Network:
+
+Mechanism: Builds a high-quality repository of drug-target interactions.
+
+Outcome: Accelerates decentralized drug discovery and enhances overall scientific value.
+
+
+
+Future Enhancements
+
+Multi-Parameter Validation:
+Incorporate multi-target predictions and additional relevant metrics (e.g., drug-likeness, ADME/Tox, synthetic feasibility) to ensure the best candidates are viable.
+
+Reputation and Staking:
+Implement validator reputation systems and staking for miners and validators to further secure the process.
+
+Enhanced Feedback Loops:
+Use continuous validation data to refine PSICHIC, providing target-specific fine-tuned versions for specific challenges.
+
+
+
+8. TAO Token Incentive Model
+Economic Framework
+NOVA leverages alpha TAO tokens to reward innovation and efficiency:
+
+Winner-Takes-All:
+The miner with the highest PSICHIC score at the end of each challenge wins the alpha TAO reward for that chunk.
+
+Performance-Based Scaling:
+Consistently high-performing miners build reputations, unlocking higher-value challenges over time.
+
+Validator Rewards:
+Validators earn fees for fast, reliable, accurate and objective evaluation using the Deterministic Oracle, reinforcing honest processing.
+
+
+Network-Wide Impact
+
+Alignment of Interests:
+Miners and validators are incentivized to act in ways that enhance the overall quality and scientific output of the network, maximizing the potential of IP generation.
+
+Sustainable Growth:
+As more participants join, cumulative contributions drive both scientific and economic progress.
+
+Collective Knowledge:
+Each round enriches a shared repository of high-potential drug candidates, further accelerating drug discovery.
+
+9. Network Effects and Future Growth
+Scaling the Ecosystem
+
+Increased Participation:
+More miners and validators mean greater collective computational power, enabling a deeper exploration of chemical space.
+
+Cumulative Data Enrichment:
+Each validated candidate adds to the network’s repository of molecules–target interactions, refining future search and prediction strategies.
+
+Interoperability with Other Subnets:
+NOVA challenges hold potential to benefit from integration with other Bittensor subnets (e.g. SN9, SN25, SN13), creating a synergistic ecosystem that amplifies innovation.
+
+Future Directions
+
+ADME/Tox Integration:
+Expand the validation process to include additional metrics such as pharmacokinetics and toxicity. A drug may have a high binding affinity to a desired protein target but lack other properties in order to become a successful therapeutic.
+
+Wet lab validation
+Top miner submissions will be compiled in tokenized libraries, synthesized, and tested in wet labs. Results from in vitro and in vivo assays will be used to further the drug development process and used to fine tune the oracle model; thus, improving the predictive power of the subnet. 
+
+Community-Driven Innovation:
+Foster open-source collaboration to continuously refine miner algorithms and share best practices.
+
+
+
+10. Conclusion
+NOVA is a transformative platform that leverages decentralized computing, intelligent search techniques, and a robust, transparent validation process to revolutionize drug discovery. By reimagining drug discovery as an optimization problem and harnessing a billion-molecule library of synthesizable compounds, NOVA creates a dynamic ecosystem where every miner submission and every 360 blocks (~1-hour) challenge round pushes the frontier of therapeutic innovation.
+
+Through the integration of PSICHIC as a deterministic oracle [2], the strategic use of the SAVI 2020 database [1], and a competitive mining model supported by a solid TAO token incentive structure, NOVA ensures that only the most promising drug candidates move forward. This approach not only accelerates the discovery process but also bridges the gap between computational prediction and real-world experimental validation.
+
+For the blockchain community, NOVA is a powerful demonstration of how decentralized networks and tokenized incentives can drive meaningful scientific breakthroughs. For drug developers, it represents a scalable, efficient, and transparent pathway toward discovering the next generation of therapeutics.
+
+Appendix A - Miners Concept Logic
+Access and Sampling:
+
+Miners start by tapping into the SAVI 2020 database—a vast library of billions of synthesizable compounds —and select a manageable subset of molecules to work with.
+
+Initial Evaluation:
+
+The sampled molecules are evaluated using a deterministic oracle (PSICHIC), which assigns each candidate a reproducible binding affinity score. This “labels” the molecules with performance metrics.
+
+Optimized Search Process:
+
+Using either ML-based active learning or heuristic adaptive search, miners iteratively refine their selection strategy. This process hones in on promising regions of chemical space and continuously improves the candidate pool.
+
+Re-Evaluation and Decision:
+
+The refined pool is re-evaluated with the oracle to update binding affinity scores. At this decision point, miners assess whether their best candidate meets the    performance criteria:
+
+If satisfactory: The miner submits this best molecule on-chain. If not: The search process continues until a better candidate is found.
+
+Per-Block Submissions:
+
+Every block, miners have the opportunity to update their active submission with the best candidate available. This ensures that the on-chain submission is always the most promising molecule found to date.
+
+Continuous Iteration:
+
+Over the course of up to 360 blocks, this cycle of sampling, evaluation, optimization, and submission repeats. As the challenge progresses, miners’ strategies evolve—shifting from initial brute-force methods toward a more data-driven, optimized search.
+
+This iterative process ensures that miners continuously improve their submissions every block, with the overall goal of identifying high-affinity, synthesizable drug candidates efficiently and transparently.
+
+Appendix B - Validators Concept Logic
+At Block n–1, NOVA publishes the challenge and target information, signaling miners to begin their search. Then, from Block n to n+99, miners submit their candidate molecules. After each block, a deterministic oracle (such as PSICHIC) evaluates the submissions and continuously updates the leaderboard with objective binding affinity scores.
+
+Validator selects the miner with the highest score—using submission time to break ties. That miner is then awarded a winner-takes-all reward.
+
+This process drives iterative improvements in the search for promising drug candidates.s 
