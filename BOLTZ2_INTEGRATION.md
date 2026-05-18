@@ -1,5 +1,59 @@
 # Boltz-2 Miner Integration
 
+## Current Status (as of 2026-05-18)
+
+**Boltz-2 integration is complete and heavily optimised.**  The stock miner scored 0 on
+Boltz-2; this miner has been rewritten from the ground up around the scoring formula.  All
+items on the original arxiv-survey roadmap are implemented.  Two minor research-stage
+opportunities remain (§D pocket docking, FBLD fragment screening) — both are conditional
+or require empirical validation before implementing.
+
+### Implemented optimisation index
+
+| § | Name | File | Status |
+|---|------|------|--------|
+| F | Pharmacophore pre-filter | miner.py | ✅ |
+| G | Adaptive Boltz timing | miner.py, wrapper.py | ✅ |
+| H | Anytime incremental scoring | miner.py | ✅ |
+| I | PSICHIC ligand-efficiency scoring | miner.py | ✅ |
+| J | Global candidate pool (top-20 epoch-wide) | miner.py | ✅ |
+| K | Dynamic Boltz candidate budget | miner.py | ✅ |
+| L | Epoch-end guard inside Boltz loop | miner.py | ✅ |
+| M | `boltz_time_per_mol` state field | miner.py | ✅ |
+| N | SALSA hill-climbing | salsa.py, miner.py | ✅ |
+| O | GradientGA | genetic.py, miner.py | ✅ |
+| P | Validator constraint filters in pre-filter | miner.py | ✅ |
+| Q | Multi-seed SALSA (top-3 seeds) | miner.py | ✅ |
+| R | Pre-computed pool fingerprints + BulkTanimoto | salsa.py, genetic.py | ✅ |
+| S | MSA auto-fetch at startup | msa.py, miner.py | ✅ |
+| T | Forward `no_kernels`/`num_workers`/`preprocessing_threads` | wrapper.py | ✅ |
+| U | `use_potentials` inference-time potentials | wrapper.py, boltz_config.yaml | ✅ |
+| V | `step_scale` diffusion temperature | wrapper.py, boltz_config.yaml | ✅ |
+| W | `sampling_steps_affinity` tuning guide | boltz_config.yaml | documented |
+| X | Defensive Boltz wrapper (4 crash paths) | wrapper.py | ✅ |
+| Y | Dataset iterator refresh on exhaustion | miner.py | ✅ |
+| Z | MSA subsampling control | wrapper.py, boltz_config.yaml | ✅ |
+| AA | Warm epoch start from disk cache | miner.py | ✅ |
+| AB | Broader pharmacophore pre-filter (Lipinski Ro5) | miner.py | ✅ |
+| BB | Quality-first SAVI stream pool | miner.py | ✅ |
+| C | Multi-molecule MACCS diversity reordering | miner.py | ✅ (no-op until `num_molecules_boltz>1`) |
+| CC | Warm-start guard — retain cached best | miner.py | ✅ |
+| DD | FG-addition SALSA perturbation operator | salsa.py | ✅ |
+| EE | Scaffold-diverse Boltz candidate selection | miner.py | ✅ |
+| FF | Boltz-guided SALSA (second pass from Boltz winner) | miner.py | ✅ |
+| GG | Terminal atom removal SALSA operator | salsa.py | ✅ |
+| HH | SALSA threshold floor for fast hardware | miner.py | ✅ |
+| II | Ring walk (ring size ±1) SALSA operator | salsa.py | ✅ |
+| JJ | Cache-fallback synthetic pool | miner.py | ✅ |
+| KK | Post-Boltz early submission (tiebreaker) | miner.py | ✅ |
+| LL | Per-molecule Boltz component logging | miner.py | ✅ |
+| MM | Multi-round iterative Boltz-SALSA hill-climbing | miner.py | ✅ |
+| D | Binding-pocket pre-docking filter | utils/docking.py | ⏳ conditional |
+| FBLD | Fragment-Based Lead Discovery | — | ⏳ research |
+| NN | Reduced-sample screening for §MM/§FF SALSA hits | wrapper.py, miner.py | ⏳ see below |
+
+---
+
 ## Context
 
 The NOVA subnet (SN68) incentive mechanism splits rewards as follows:
@@ -1935,6 +1989,43 @@ small molecules (10–15 HA).  A SAVI-2020 fragment with 10 heavy atoms and mode
 **Next step:** Run a diagnostic: lower `max_heavy_atoms` to 20 for one epoch, observe whether
 Boltz-2 scores improve and whether PSICHIC candidate volume remains adequate (≥ 500 molecules
 per epoch in `savi_stream_pool`).  Revert if the pool shrinks below the SALSA trigger threshold.
+
+---
+
+### §NN: Reduced-Sample Boltz Screening for §FF/§MM SALSA Hits (Not Yet Implemented)
+
+**Opportunity:** §FF and §MM score each SALSA hit with the full Boltz config
+(`diffusion_samples_affinity: 3`, `sampling_steps_affinity: 100`).  This limits how many
+SALSA neighbourhoods can be explored in the available epoch window.
+
+**Proposal:** Score §FF/§MM SALSA candidates with `diffusion_samples_affinity: 1`
+(~⅓ the GPU time), then re-run the top-1 hit at full quality (3 samples) before updating
+the submission.  This allows 3× wider exploration of SALSA neighbourhoods per time budget.
+
+**A100 impact (45 s/mol at 3 samples → ~15 s/mol at 1 sample):**
+
+| Phase | Config | Candidates in budget | Notes |
+|-------|--------|---------------------|-------|
+| Initial Boltz pass | 3 samples | ~5 (unchanged) | Full quality for primary candidates |
+| §FF SALSA hits | 1 sample screen | 9 (was 3) | Wider scan; top-1 re-run at full quality |
+| §MM round hits | 1 sample screen | 9/round (was 3) | More chemical space per round |
+
+**Implementation:** Add an optional `override_samples: int = None` parameter to
+`BoltzWrapper.score_molecules_target` that temporarily overrides
+`self.config['diffusion_samples_affinity']` for that call only.  The re-run at full
+quality uses `override_samples=None` (falls back to config default).
+
+**Risk:** Score estimates from 1 sample have higher variance than 3-sample means.  A
+molecule that screens at 0.45 (1 sample) may land at 0.38 or 0.52 on re-run.  The
+re-run eliminates this for the final submission, but SALSA seeds derived from a noisy
+1-sample "best" may not be optimal.  On slow hardware (RTX 3090, 150 s/mol → 50 s at
+1 sample) the benefit is smaller and the noise risk larger.
+
+**Estimated effort:** ~40 lines in `wrapper.py` + ~20 lines in `miner.py` to thread
+the `override_samples` argument through §FF and §MM call sites.
+
+**Recommended implementation order:** After empirical validation of FBLD (to confirm
+that small molecules score better before investing in screening throughput).
 
 ---
 

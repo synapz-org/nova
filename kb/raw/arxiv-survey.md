@@ -358,15 +358,18 @@ Even a partial result (1 of 5 molecules scored) improves on the PSICHIC-only bas
 
 ## Implementation Roadmap (priority order)
 
-| Priority | Approach | Effort | Expected gain |
-|----------|----------|--------|---------------|
-| 1 | Adaptive Boltz timing | 30 lines | More PSICHIC streaming time on fast hardware |
-| 2 | Pharmacophore pre-filter | 10 lines | ~30% faster PSICHIC batches |
-| 3 | Continuous Boltz re-scoring | 80 lines | Anytime improvement vs. one-shot |
-| 4 | SALSA | 200 lines | Directed search vs. random streaming |
-| 5 | Binding-pocket docking filter | 150 lines | Conditional on pocket constraint being set |
-| 6 | GradientGA | 350 lines | Population-level optimisation |
-| 7 | FBLD (fragments) | Research | Needs empirical Boltz calibration study |
+All items 1–6 are **implemented**. Item 7 and the new §NN entry remain as future work.
+
+| Priority | Approach | Effort | Status | Expected gain |
+|----------|----------|--------|--------|---------------|
+| 1 | Adaptive Boltz timing (§G) | 30 lines | ✅ Done | More PSICHIC streaming time on fast hardware |
+| 2 | Pharmacophore pre-filter (§F/§AB) | 10 lines | ✅ Done | ~30% faster PSICHIC batches |
+| 3 | Continuous Boltz re-scoring (§H) | 80 lines | ✅ Done | Anytime improvement vs. one-shot |
+| 4 | SALSA (§N + §DD/§GG/§HH/§II/§Q/§FF/§MM) | 200+ lines | ✅ Done | Directed search + hill-climbing |
+| 5 | Binding-pocket docking filter (§D) | 150 lines | ⏳ Conditional | Only needed when `binding_pocket` set |
+| 6 | GradientGA (§O) | 350 lines | ✅ Done | Population-level optimisation |
+| 7 | FBLD (fragments) | Research | ⏳ Research | Needs empirical Boltz calibration study |
+| 8 | §NN: Reduced-sample §MM/§FF screening | 60 lines | ⏳ Planned | 3× wider SALSA exploration per epoch |
 
 All approaches share the same submission constraint: molecules must map to valid SAVI-2020
 product names. SALSA and GradientGA both solve this via nearest-neighbour SAVI-2020 lookup.
