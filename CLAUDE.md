@@ -4,6 +4,7 @@
 
 Before debugging, tuning, or proposing a strategy change, grep `kb/` for the relevant term. The kb is where we record things that took a while to figure out — both the bugs and the things that measurably worked.
 
+- `kb/post-mortems/` — what went wrong at the session level. **Read these first if you're new to the repo.** 10 minutes here saves a day.
 - `kb/gotchas/` — non-obvious bugs and constraints. Read first when something doesn't behave like the code suggests.
 - `kb/wins/` — changes that measurably improved an outcome. Read before tuning a knob someone may already have tuned.
 - `kb/losses/` — changes we tried that didn't help. Read before running an experiment someone may have already run.

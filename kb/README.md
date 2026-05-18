@@ -4,12 +4,15 @@ A working memory for this repo. Three categories, all greppable from one place.
 
 ```
 kb/
-├── gotchas/   # non-obvious bugs and constraints (see kb/gotchas/README.md)
-├── wins/      # things we tried that measurably improved outcomes
-├── losses/    # things we tried that didn't work, with the measurement
-├── notes/     # observations / hypotheses too uncertain for wins or losses
-└── raw/       # paper summaries and external research (input, not output)
+├── gotchas/      # non-obvious bugs and constraints (see kb/gotchas/README.md)
+├── wins/         # things we tried that measurably improved outcomes
+├── losses/       # things we tried that didn't work, with the measurement
+├── notes/        # observations / hypotheses too uncertain for wins or losses
+├── post-mortems/ # what went wrong at the session level, root-caused honestly
+└── raw/          # paper summaries and external research (input, not output)
 ```
+
+**If you're new to this repo, start with `post-mortems/` and `gotchas/` first.** Those are the traps. Reading them takes 10 minutes and may save you a day.
 
 ## When to read kb/
 
