@@ -152,24 +152,31 @@ properties:
         
         return yaml_content
 
-    def score_molecules_target(self, valid_molecules_by_uid: dict, score_dict: dict, subnet_config: dict, final_block_hash: str) -> None:
+    def score_molecules_target(self, valid_molecules_by_uid: dict, score_dict: dict, subnet_config: dict, final_block_hash: str, fast: bool = False) -> None:
         # Preprocess data
         self.subnet_config = subnet_config
 
         self.preprocess_data_for_boltz(valid_molecules_by_uid, score_dict, final_block_hash)
 
+        # §NN: fast=True uses reduced sampling for cheap pre-screening in §FF/§MM.
+        # Full inference params are preserved for adaptive timing and cache storage.
+        _s_steps     = 50 if fast else self.config['sampling_steps']
+        _s_steps_aff = 50 if fast else self.config['sampling_steps_affinity']
+        _d_samp_aff  = 1  if fast else self.config['diffusion_samples_affinity']
+
         # Run Boltz2 for unique molecules
-        bt.logging.info("Running Boltz2")
+        _mode_tag = "[FAST] " if fast else ""
+        bt.logging.info(f"Running Boltz2 {_mode_tag}")
         _t0 = time.time()
         try:
             predict(
                 data = self.input_dir,
                 out_dir = self.output_dir,
                 recycling_steps = self.config['recycling_steps'],
-                sampling_steps = self.config['sampling_steps'],
+                sampling_steps = _s_steps,
                 diffusion_samples = self.config['diffusion_samples'],
-                sampling_steps_affinity = self.config['sampling_steps_affinity'],
-                diffusion_samples_affinity = self.config['diffusion_samples_affinity'],
+                sampling_steps_affinity = _s_steps_aff,
+                diffusion_samples_affinity = _d_samp_aff,
                 output_format = self.config['output_format'],
                 seed = 68,
                 affinity_mw_correction = self.config['affinity_mw_correction'],
@@ -182,8 +189,12 @@ properties:
                 subsample_msa = self.config.get('subsample_msa', True),
                 num_subsampled_msa = self.config.get('num_subsampled_msa', 1024),
             )
-            self.last_inference_duration = time.time() - _t0
-            bt.logging.info(f"Boltz2 predictions complete in {self.last_inference_duration:.1f}s")
+            _elapsed = time.time() - _t0
+            if not fast:
+                # Only update adaptive timing from full-inference runs so the
+                # trigger-block calculation stays calibrated to full-quality cost.
+                self.last_inference_duration = _elapsed
+            bt.logging.info(f"Boltz2 {_mode_tag}predictions complete in {_elapsed:.1f}s")
 
         except Exception as e:
             bt.logging.error(f"Error running Boltz2: {e}")

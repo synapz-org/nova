@@ -358,7 +358,7 @@ Even a partial result (1 of 5 molecules scored) improves on the PSICHIC-only bas
 
 ## Implementation Roadmap (priority order)
 
-All items 1–6 are **implemented**. Item 7 and the new §NN entry remain as future work.
+All items 1–7 are **implemented**, including §NN. Item 7 (FBLD) remains as future research.
 
 | Priority | Approach | Effort | Status | Expected gain |
 |----------|----------|--------|--------|---------------|
@@ -369,7 +369,7 @@ All items 1–6 are **implemented**. Item 7 and the new §NN entry remain as fut
 | 5 | Binding-pocket docking filter (§D) | 150 lines | ⏳ Conditional | Only needed when `binding_pocket` set |
 | 6 | GradientGA (§O) | 350 lines | ✅ Done | Population-level optimisation |
 | 7 | FBLD (fragments) | Research | ⏳ Research | Needs empirical Boltz calibration study |
-| 8 | §NN: Reduced-sample §MM/§FF screening | 60 lines | ⏳ Planned | 3× wider SALSA exploration per epoch |
+| 8 | §NN: Reduced-sample §MM/§FF screening | 60 lines | ✅ Done | ~2× more §MM rounds per epoch budget |
 
 All approaches share the same submission constraint: molecules must map to valid SAVI-2020
 product names. SALSA and GradientGA both solve this via nearest-neighbour SAVI-2020 lookup.

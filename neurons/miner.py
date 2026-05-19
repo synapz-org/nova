@@ -1213,56 +1213,89 @@ async def run_boltz_prescoring(state: Dict[str, Any], max_candidates: int = 5) -
                 )
                 if not ff_salsa_hits.empty:
                     bt.logging.info(
-                        f"§FF: {len(ff_salsa_hits)} Boltz-guided SALSA hits -- scoring with Boltz..."
+                        f"§FF: {len(ff_salsa_hits)} Boltz-guided SALSA hits -- §NN two-phase screening..."
                     )
                     _ff_best_score = max(
                         (v for v in all_scores.values() if math.isfinite(v)), default=-math.inf
                     )
+
+                    # §NN Phase 1: fast-screen all hits (cache hits reuse full score; misses use
+                    # fast Boltz with reduced sampling steps so we can screen more hits cheaply).
+                    # Fast scores are NOT stored in the persistent cache — only full scores are.
+                    _ff_screen: Dict[str, float] = {}  # smiles -> score (cached full or fast)
+                    _ff_rows: Dict[str, Any] = {}      # smiles -> row for later lookup
                     for _, _ff_row in ff_salsa_hits.iterrows():
                         _ff_smiles = _ff_row['product_smiles']
                         _ff_canon = get_canonical_smiles(_ff_smiles)
                         _ff_key = (_ff_canon, protein)
-
+                        _ff_rows[_ff_smiles] = _ff_row
                         if _ff_key in boltz_cache:
-                            _ff_score = boltz_cache[_ff_key]
-                            bt.logging.debug(f"§FF cache hit: {_ff_score:.4f}")
+                            _ff_screen[_ff_smiles] = boltz_cache[_ff_key]
+                            bt.logging.debug(f"§FF §NN cache hit: {boltz_cache[_ff_key]:.4f}")
                         else:
-                            # Epoch guard before each GPU inference
                             try:
                                 _curr_blk2 = await state['subtensor'].get_current_block()
                                 _next_ep2 = ((_curr_blk2 // state['epoch_length']) + 1) * state['epoch_length']
                                 if _next_ep2 - _curr_blk2 < 5:
-                                    bt.logging.info("§FF: epoch ends in <5 blocks -- stopping.")
+                                    bt.logging.info("§FF §NN: epoch ends in <5 blocks -- stopping.")
                                     break
                             except Exception:
                                 pass
-                            _ff_uid = 0
-                            _ff_vmbu = {_ff_uid: {"smiles": [_ff_smiles], "names": [_ff_row['product_name']]}}
-                            _ff_sd = {_ff_uid: {}}
+                            _ff_uid_s = 0
+                            _ff_vmbu_s = {_ff_uid_s: {"smiles": [_ff_smiles], "names": [_ff_row['product_name']]}}
+                            _ff_sd_s = {_ff_uid_s: {}}
                             try:
                                 await asyncio.to_thread(
                                     wrapper.score_molecules_target,
-                                    _ff_vmbu, _ff_sd, subnet_config, '0x' + '0' * 64,
+                                    _ff_vmbu_s, _ff_sd_s, subnet_config, '0x' + '0' * 64, True,
                                 )
-                                _ff_mol_scores = wrapper.per_molecule_metric.get(_ff_uid, {})
-                                _ff_score = _ff_mol_scores.get(_ff_smiles, -math.inf)
-                                boltz_cache[_ff_key] = _ff_score
-                                _disk_cache_put(
-                                    db_path, _ff_canon, protein, _ff_score,
-                                    product_name=_ff_row.get('product_name'),
-                                )
-                                bt.logging.info(
-                                    f"§FF scored: {_ff_row.get('product_name', '?')} "
-                                    f"boltz={_ff_score:.4f}"
-                                )
+                                _ff_screen[_ff_smiles] = wrapper.per_molecule_metric.get(_ff_uid_s, {}).get(_ff_smiles, -math.inf)
+                            except Exception as _ff_es:
+                                bt.logging.error(f"§FF §NN fast-screen error: {_ff_es}")
+                                _ff_screen[_ff_smiles] = -math.inf
+
+                    # §NN Phase 2: full-score only the best fast-screened candidate.
+                    _ff_winner = max(
+                        (_s for _s, _v in _ff_screen.items() if math.isfinite(_v)),
+                        key=lambda _s: _ff_screen[_s],
+                        default=None,
+                    )
+                    if _ff_winner is not None:
+                        _ff_w_row = _ff_rows[_ff_winner]
+                        _ff_w_canon = get_canonical_smiles(_ff_winner)
+                        _ff_w_key = (_ff_w_canon, protein)
+                        if _ff_w_key in boltz_cache:
+                            _ff_score = boltz_cache[_ff_w_key]
+                        else:
+                            try:
+                                _curr_blk3 = await state['subtensor'].get_current_block()
+                                _next_ep3 = ((_curr_blk3 // state['epoch_length']) + 1) * state['epoch_length']
+                                if _next_ep3 - _curr_blk3 >= 5:
+                                    _ff_uid_f = 0
+                                    _ff_vmbu_f = {_ff_uid_f: {"smiles": [_ff_winner], "names": [_ff_w_row['product_name']]}}
+                                    _ff_sd_f = {_ff_uid_f: {}}
+                                    await asyncio.to_thread(
+                                        wrapper.score_molecules_target,
+                                        _ff_vmbu_f, _ff_sd_f, subnet_config, '0x' + '0' * 64,
+                                    )
+                                    _ff_score = wrapper.per_molecule_metric.get(_ff_uid_f, {}).get(_ff_winner, -math.inf)
+                                    boltz_cache[_ff_w_key] = _ff_score
+                                    _disk_cache_put(db_path, _ff_w_canon, protein, _ff_score,
+                                                    product_name=_ff_w_row.get('product_name'))
+                                    bt.logging.info(
+                                        f"§FF §NN full-scored winner: {_ff_w_row.get('product_name', '?')} "
+                                        f"boltz={_ff_score:.4f} (screened {len(_ff_screen)} hits)"
+                                    )
+                                else:
+                                    _ff_score = -math.inf
                             except Exception as _ff_e:
-                                bt.logging.error(f"§FF Boltz inference error: {_ff_e}")
+                                bt.logging.error(f"§FF §NN full-score error: {_ff_e}")
                                 _ff_score = -math.inf
 
                         if math.isfinite(_ff_score) and _ff_score > _ff_best_score:
                             _ff_prev_score = _ff_best_score
                             _ff_best_score = _ff_score
-                            _ff_pname = _ff_row.get('product_name', '')
+                            _ff_pname = _ff_w_row.get('product_name', '')
                             if _ff_pname:
                                 _orig = state['candidate_product'].split(',')
                                 if _ff_pname in _orig:
@@ -1272,7 +1305,7 @@ async def run_boltz_prescoring(state: Dict[str, Any], max_candidates: int = 5) -
                                 else:
                                     state['candidate_product'] = ','.join([_ff_pname] + _orig)
                                 bt.logging.info(
-                                    f"§FF: new best from Boltz-guided SALSA -- "
+                                    f"§FF §NN: new best from Boltz-guided SALSA -- "
                                     f"{_ff_pname} (boltz={_ff_score:.4f} > prev={_ff_prev_score:.4f})"
                                 )
         except Exception as _ff_err:
@@ -1367,64 +1400,100 @@ async def run_boltz_prescoring(state: Dict[str, Any], max_candidates: int = 5) -
             _mm_round_best_score = _mm_best_score
             _mm_round_best_smiles = _mm_seed_smiles
 
+            # §NN Phase 1: fast-screen each round's SALSA hits.
+            # Cache hits reuse the stored full score; misses run fast Boltz (no cache store).
+            _mm_screen: Dict[str, float] = {}  # smiles -> score
+            _mm_row_map: Dict[str, Any] = {}   # smiles -> row
             for _, _mm_row in _mm_salsa_hits.iterrows():
                 if _mm_stop:
                     break
                 _mm_smiles = _mm_row['product_smiles']
                 _mm_canon = get_canonical_smiles(_mm_smiles)
                 _mm_key = (_mm_canon, protein)
-
+                _mm_row_map[_mm_smiles] = _mm_row
                 if _mm_key in boltz_cache:
-                    _mm_score = boltz_cache[_mm_key]
-                    bt.logging.debug(f"§MM cache hit: {_mm_score:.4f}")
+                    _mm_screen[_mm_smiles] = boltz_cache[_mm_key]
+                    bt.logging.debug(f"§MM §NN cache hit: {boltz_cache[_mm_key]:.4f}")
                 else:
-                    # Epoch guard before GPU inference
                     try:
                         _mm_blk2 = await state['subtensor'].get_current_block()
                         _mm_ep2 = ((_mm_blk2 // state['epoch_length']) + 1) * state['epoch_length']
                         if _mm_ep2 - _mm_blk2 < 5:
-                            bt.logging.info("§MM: epoch ends in <5 blocks — stopping.")
+                            bt.logging.info("§MM §NN: epoch ends in <5 blocks — stopping.")
                             _mm_stop = True
                             break
                     except Exception:
                         pass
-
-                    _mm_uid = 0
-                    _mm_vmbu = {_mm_uid: {"smiles": [_mm_smiles], "names": [_mm_row['product_name']]}}
-                    _mm_sd: Dict[str, Any] = {_mm_uid: {}}
+                    _mm_uid_s = 0
+                    _mm_vmbu_s = {_mm_uid_s: {"smiles": [_mm_smiles], "names": [_mm_row['product_name']]}}
+                    _mm_sd_s: Dict[str, Any] = {_mm_uid_s: {}}
                     try:
                         await asyncio.to_thread(
                             wrapper.score_molecules_target,
-                            _mm_vmbu, _mm_sd, subnet_config, '0x' + '0' * 64,
+                            _mm_vmbu_s, _mm_sd_s, subnet_config, '0x' + '0' * 64, True,
                         )
-                        _mm_mol_scores = wrapper.per_molecule_metric.get(_mm_uid, {})
-                        _mm_score = _mm_mol_scores.get(_mm_smiles, -math.inf)
-                        boltz_cache[_mm_key] = _mm_score
-                        _disk_cache_put(
-                            db_path, _mm_canon, protein, _mm_score,
-                            product_name=_mm_row.get('product_name'),
-                        )
-                        if wrapper.last_inference_duration > 0:
-                            state['boltz_time_per_mol'] = wrapper.last_inference_duration
-                        bt.logging.info(
-                            f"§MM [{_mm_round_idx + 1}/{_mm_max_rounds}] scored: "
-                            f"{_mm_row.get('product_name', '?')} boltz={_mm_score:.4f}"
-                        )
+                        _mm_screen[_mm_smiles] = wrapper.per_molecule_metric.get(_mm_uid_s, {}).get(_mm_smiles, -math.inf)
+                    except Exception as _mm_es:
+                        bt.logging.error(f"§MM §NN fast-screen error: {_mm_es}")
+                        _mm_screen[_mm_smiles] = -math.inf
+
+            if _mm_stop:
+                break
+
+            # §NN Phase 2: full-score only the round's best fast-screened candidate.
+            _mm_round_winner = max(
+                (_s for _s, _v in _mm_screen.items() if math.isfinite(_v)),
+                key=lambda _s: _mm_screen[_s],
+                default=None,
+            )
+            if _mm_round_winner is not None:
+                _mm_w_row = _mm_row_map[_mm_round_winner]
+                _mm_w_canon = get_canonical_smiles(_mm_round_winner)
+                _mm_w_key = (_mm_w_canon, protein)
+                if _mm_w_key in boltz_cache:
+                    _mm_score = boltz_cache[_mm_w_key]
+                else:
+                    try:
+                        _mm_blk3 = await state['subtensor'].get_current_block()
+                        _mm_ep3 = ((_mm_blk3 // state['epoch_length']) + 1) * state['epoch_length']
+                        if _mm_ep3 - _mm_blk3 < 5:
+                            bt.logging.info("§MM §NN: epoch ends in <5 blocks — stopping.")
+                            _mm_stop = True
+                            _mm_score = -math.inf
+                        else:
+                            _mm_uid_f = 0
+                            _mm_vmbu_f = {_mm_uid_f: {"smiles": [_mm_round_winner], "names": [_mm_w_row['product_name']]}}
+                            _mm_sd_f: Dict[str, Any] = {_mm_uid_f: {}}
+                            await asyncio.to_thread(
+                                wrapper.score_molecules_target,
+                                _mm_vmbu_f, _mm_sd_f, subnet_config, '0x' + '0' * 64,
+                            )
+                            _mm_score = wrapper.per_molecule_metric.get(_mm_uid_f, {}).get(_mm_round_winner, -math.inf)
+                            boltz_cache[_mm_w_key] = _mm_score
+                            _disk_cache_put(db_path, _mm_w_canon, protein, _mm_score,
+                                            product_name=_mm_w_row.get('product_name'))
+                            if wrapper.last_inference_duration > 0:
+                                state['boltz_time_per_mol'] = wrapper.last_inference_duration
+                            bt.logging.info(
+                                f"§MM §NN [{_mm_round_idx + 1}/{_mm_max_rounds}] full-scored winner: "
+                                f"{_mm_w_row.get('product_name', '?')} boltz={_mm_score:.4f} "
+                                f"(screened {len(_mm_screen)} hits)"
+                            )
                     except Exception as _mm_e:
-                        bt.logging.error(f"§MM Boltz inference error: {_mm_e}")
+                        bt.logging.error(f"§MM §NN full-score error: {_mm_e}")
                         _mm_score = -math.inf
 
                 if math.isfinite(_mm_score) and _mm_score > _mm_round_best_score:
                     _mm_round_best_score = _mm_score
-                    _mm_round_best_smiles = _mm_smiles
-                    _mm_pname = _mm_row.get('product_name', '')
+                    _mm_round_best_smiles = _mm_round_winner
+                    _mm_pname = _mm_w_row.get('product_name', '')
                     if _mm_pname:
                         _mm_orig = state['candidate_product'].split(',')
                         state['candidate_product'] = ','.join(
                             [_mm_pname] + [n for n in _mm_orig if n != _mm_pname]
                         )
                         bt.logging.info(
-                            f"§MM: new best: {_mm_pname} "
+                            f"§MM §NN: new best: {_mm_pname} "
                             f"(boltz={_mm_score:.4f} > prev={_mm_best_score:.4f})"
                         )
                     _mm_improved = True

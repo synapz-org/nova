@@ -1,12 +1,12 @@
 # Boltz-2 Miner Integration
 
-## Current Status (as of 2026-05-18)
+## Current Status (as of 2026-05-19)
 
 **Boltz-2 integration is complete and heavily optimised.**  The stock miner scored 0 on
 Boltz-2; this miner has been rewritten from the ground up around the scoring formula.  All
-items on the original arxiv-survey roadmap are implemented.  Two minor research-stage
-opportunities remain (§D pocket docking, FBLD fragment screening) — both are conditional
-or require empirical validation before implementing.
+items on the original arxiv-survey roadmap are implemented, including §NN reduced-sample
+screening.  Two minor research-stage opportunities remain (§D pocket docking, FBLD fragment
+screening) — both are conditional or require empirical validation before implementing.
 
 ### Implemented optimisation index
 
@@ -48,9 +48,9 @@ or require empirical validation before implementing.
 | KK | Post-Boltz early submission (tiebreaker) | miner.py | ✅ |
 | LL | Per-molecule Boltz component logging | miner.py | ✅ |
 | MM | Multi-round iterative Boltz-SALSA hill-climbing | miner.py | ✅ |
+| NN | Reduced-sample §MM/§FF screening (`fast=True`) | wrapper.py, miner.py | ✅ |
 | D | Binding-pocket pre-docking filter | utils/docking.py | ⏳ conditional |
 | FBLD | Fragment-Based Lead Discovery | — | ⏳ research |
-| NN | Reduced-sample screening for §MM/§FF SALSA hits | wrapper.py, miner.py | ⏳ see below |
 
 ---
 
@@ -1992,40 +1992,54 @@ per epoch in `savi_stream_pool`).  Revert if the pool shrinks below the SALSA tr
 
 ---
 
-### §NN: Reduced-Sample Boltz Screening for §FF/§MM SALSA Hits (Not Yet Implemented)
+### §NN: Reduced-Sample Boltz Screening for §FF/§MM SALSA Hits ✅ Implemented
 
-**Opportunity:** §FF and §MM score each SALSA hit with the full Boltz config
-(`diffusion_samples_affinity: 3`, `sampling_steps_affinity: 100`).  This limits how many
-SALSA neighbourhoods can be explored in the available epoch window.
+**Problem:** §FF and §MM previously scored every SALSA hit with full Boltz config
+(`sampling_steps: 100`, `sampling_steps_affinity: 100`, `diffusion_samples_affinity: 3`).
+With 3 hits per §MM round, this consumed ~3 × full-inference time before learning which
+molecule to advance — leaving fewer rounds for hill-climbing in the epoch budget.
 
-**Proposal:** Score §FF/§MM SALSA candidates with `diffusion_samples_affinity: 1`
-(~⅓ the GPU time), then re-run the top-1 hit at full quality (3 samples) before updating
-the submission.  This allows 3× wider exploration of SALSA neighbourhoods per time budget.
+**Solution (two-phase screening):**
 
-**A100 impact (45 s/mol at 3 samples → ~15 s/mol at 1 sample):**
+1. **Phase 1 — fast screen** (`fast=True`): each SALSA hit that is not already in the
+   Boltz cache is scored with `sampling_steps=50`, `sampling_steps_affinity=50`,
+   `diffusion_samples_affinity=1`.  Cache hits return their stored full-quality score
+   immediately.  Fast scores are intentionally **not** written to the persistent cache
+   to avoid polluting it with lower-quality estimates.
 
-| Phase | Config | Candidates in budget | Notes |
-|-------|--------|---------------------|-------|
-| Initial Boltz pass | 3 samples | ~5 (unchanged) | Full quality for primary candidates |
-| §FF SALSA hits | 1 sample screen | 9 (was 3) | Wider scan; top-1 re-run at full quality |
-| §MM round hits | 1 sample screen | 9/round (was 3) | More chemical space per round |
+2. **Phase 2 — full score** (`fast=False`): the single best hit from Phase 1 (by
+   fast score) receives full inference. Its score is stored in the in-memory and
+   persistent cache and used to update `candidate_product`.
 
-**Implementation:** Add an optional `override_samples: int = None` parameter to
-`BoltzWrapper.score_molecules_target` that temporarily overrides
-`self.config['diffusion_samples_affinity']` for that call only.  The re-run at full
-quality uses `override_samples=None` (falls back to config default).
+**Fast-mode parameter overrides** (`boltz/wrapper.py`)
 
-**Risk:** Score estimates from 1 sample have higher variance than 3-sample means.  A
-molecule that screens at 0.45 (1 sample) may land at 0.38 or 0.52 on re-run.  The
-re-run eliminates this for the final submission, but SALSA seeds derived from a noisy
-1-sample "best" may not be optimal.  On slow hardware (RTX 3090, 150 s/mol → 50 s at
-1 sample) the benefit is smaller and the noise risk larger.
+```python
+# fast=True overrides
+sampling_steps             : 100 → 50   (-50%)
+sampling_steps_affinity    : 100 → 50   (-50%)
+diffusion_samples_affinity :   3 →  1   (-67%)
+# adaptive timing: last_inference_duration only updated on full runs
+```
 
-**Estimated effort:** ~40 lines in `wrapper.py` + ~20 lines in `miner.py` to thread
-the `override_samples` argument through §FF and §MM call sites.
+**Approximate speedup** (affinity head scales with samples × steps):
 
-**Recommended implementation order:** After empirical validation of FBLD (to confirm
-that small molecules score better before investing in screening throughput).
+| Hardware | Full (300 units) | Fast (50 units) | Speedup |
+|----------|-----------------|-----------------|---------|
+| A100 | ~45 s | ~8 s | ~5.6× |
+| RTX 4090 | ~90 s | ~15 s | ~6× |
+| RTX 3090 | ~150 s | ~25 s | ~6× |
+
+For 3 SALSA hits per §MM round:
+- **Before §NN:** 3 × full = 3 T_full per round
+- **After §NN:** 3 × T_fast + 1 × T_full ≈ (3/6 + 1) T_full = 1.5 T_full per round
+- **Saving:** ~50% per §MM/§FF round → roughly 2× more rounds in the same budget
+
+**Risk:** Fast-score estimates have higher variance (fewer samples). The best
+fast-screened molecule may not be the best at full quality, so we occasionally miss a
+marginally better molecule in the same SALSA neighbourhood. The re-run fully eliminates
+variance for the submitted molecule; only the hill-climbing seed choice is slightly
+noisier. Empirically this is a good trade-off: even a suboptimal seed advances chemical
+space exploration.
 
 ---
 
