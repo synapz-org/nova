@@ -519,7 +519,7 @@ async def run_psichic_model_loop(state: Dict[str, Any]) -> None:
                     state['global_candidate_pool'] = combined_pool.head(20).reset_index(drop=True)
 
                 # ---------------------------------------------------------------
-                # SAVI stream pool: accumulates the top-5000 PSICHIC-scored
+                # SAVI stream pool: accumulates the top-10000 PSICHIC-scored
                 # molecules seen this epoch, sorted by combined_score.
                 # Keeping the highest-quality molecules (rather than the first
                 # seen) ensures SALSA/GA nearest-neighbor search operates on the
@@ -537,7 +537,7 @@ async def run_psichic_model_loop(state: Dict[str, Any]) -> None:
                         )
                         _pool_combined.drop_duplicates(subset=['product_name'], inplace=True)
                         _pool_combined.sort_values('combined_score', ascending=False, inplace=True)
-                        state['savi_stream_pool'] = _pool_combined.head(5000).reset_index(drop=True)
+                        state['savi_stream_pool'] = _pool_combined.head(10000).reset_index(drop=True)
 
                 if not top_molecules.empty:
                     entropy = compute_maccs_entropy(top_molecules['product_smiles'].tolist())
@@ -607,7 +607,7 @@ async def run_psichic_model_loop(state: Dict[str, Any]) -> None:
                                     _seed_smiles,
                                     salsa_pool,
                                     3,   # rounds
-                                    60,  # n_perturb
+                                    200, # n_perturb — allows ring walk + terminal removal to contribute
                                     5,   # top_k
                                 )
                                 if not _hits.empty:
@@ -1208,7 +1208,7 @@ async def run_boltz_prescoring(state: Dict[str, Any], max_candidates: int = 5) -
                     _ff_best_smiles,
                     _savi_pool_ff,
                     2,   # rounds (fewer -- time is limited)
-                    60,  # n_perturb
+                    200, # n_perturb — full operator coverage (ring walk + terminal removal)
                     3,   # top_k
                 )
                 if not ff_salsa_hits.empty:
@@ -1385,7 +1385,7 @@ async def run_boltz_prescoring(state: Dict[str, Any], max_candidates: int = 5) -
                     _mm_seed_smiles,
                     _mm_savi_pool,
                     2,   # rounds — neighbourhood exploration
-                    60,  # n_perturb
+                    200, # n_perturb — full operator coverage (ring walk + terminal removal)
                     3,   # top_k — cap Boltz calls per round
                 )
             except Exception as _mm_salsa_err:

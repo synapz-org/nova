@@ -370,6 +370,7 @@ All items 1–7 are **implemented**, including §NN. Item 7 (FBLD) remains as fu
 | 6 | GradientGA (§O) | 350 lines | ✅ Done | Population-level optimisation |
 | 7 | FBLD (fragments) | Research | ⏳ Research | Needs empirical Boltz calibration study |
 | 8 | §NN: Reduced-sample §MM/§FF screening | 60 lines | ✅ Done | ~2× more §MM rounds per epoch budget |
+| 9 | §PP: Full-coverage SALSA perturbations (n_perturb 60→200) + SAVI pool 5k→10k | 4 lines | ✅ Done | Ring walk + terminal removal now contribute to every SALSA call |
 
 All approaches share the same submission constraint: molecules must map to valid SAVI-2020
 product names. SALSA and GradientGA both solve this via nearest-neighbour SAVI-2020 lookup.

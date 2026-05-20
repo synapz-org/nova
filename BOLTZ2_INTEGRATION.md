@@ -1,6 +1,6 @@
 # Boltz-2 Miner Integration
 
-## Current Status (as of 2026-05-19)
+## Current Status (as of 2026-05-20)
 
 **Boltz-2 integration is complete and heavily optimised.**  The stock miner scored 0 on
 Boltz-2; this miner has been rewritten from the ground up around the scoring formula.  All
@@ -49,6 +49,7 @@ screening) — both are conditional or require empirical validation before imple
 | LL | Per-molecule Boltz component logging | miner.py | ✅ |
 | MM | Multi-round iterative Boltz-SALSA hill-climbing | miner.py | ✅ |
 | NN | Reduced-sample §MM/§FF screening (`fast=True`) | wrapper.py, miner.py | ✅ |
+| PP | Full-coverage SALSA perturbations (n_perturb 60→200) + larger SAVI pool (5k→10k) | miner.py | ✅ |
 | D | Binding-pocket pre-docking filter | utils/docking.py | ⏳ conditional |
 | FBLD | Fragment-Based Lead Discovery | — | ⏳ research |
 
@@ -1989,6 +1990,70 @@ small molecules (10–15 HA).  A SAVI-2020 fragment with 10 heavy atoms and mode
 **Next step:** Run a diagnostic: lower `max_heavy_atoms` to 20 for one epoch, observe whether
 Boltz-2 scores improve and whether PSICHIC candidate volume remains adequate (≥ 500 molecules
 per epoch in `savi_stream_pool`).  Revert if the pool shrinks below the SALSA trigger threshold.
+
+---
+
+### §PP: Full-Coverage SALSA Perturbations + Larger SAVI Pool ✅ Implemented
+
+**Problem — n_perturb=60 silently disables ring walk and terminal removal:**
+
+`generate_perturbations` runs four operators in sequence and exits early when `n_max`
+results are accumulated.  For a typical 20-HA drug-like molecule the operators produce
+approximately:
+
+| Operator | Probes produced | Slots used at n_perturb=60 |
+|----------|-----------------|---------------------------|
+| Bioisosteric substitution | 40–60 | 40–60 → fills budget |
+| FG addition | 25–50 | 0–20 remaining slots |
+| Terminal removal | 3–6 | 0 (budget already hit) |
+| Ring walk (§II) | 4–18 | 0 (budget already hit) |
+
+With `n_perturb=60`, **ring walk and terminal removal generate 0 probes for almost
+every molecule** — the budget is consumed by bioisostere substitution alone.  This
+means §FF and §MM explore only bioisosteric and limited FG-addition variants of the
+best Boltz molecule, entirely missing ring-size variants and molecules one atom smaller
+(the denominator optimisation that terminal removal targets).
+
+**Fix 1 — Increase n_perturb from 60 to 200 in all SALSA call sites:**
+
+```python
+# Before (all three sites):
+run_salsa_search(..., n_perturb=60, ...)
+
+# After:
+run_salsa_search(..., n_perturb=200, ...)  # all 4 operators contribute
+```
+
+At n_perturb=200, for the same 20-HA molecule:
+- Bioisosteres (40–60) + FG additions (25–50) + Terminal removal (3–6) + Ring walk (4–18) = 72–134 probes.
+- All operators fully represented.  For 35-HA molecules (up to ~180 probes), still fits within 200.
+
+**Runtime cost:** Each probe requires one BulkTanimotoSimilarity call against the pool
+(~0.1 ms on a pre-computed FP list).  200 probes × 0.1 ms = 20 ms per round; 2–3 rounds
+= 40–60 ms total.  Current cost at n_perturb=60: ~6–18 ms.  Delta: **≤42 ms** — negligible
+vs. Boltz inference (45–150 s/mol).
+
+**Call sites updated** (`neurons/miner.py`):
+1. Main SALSA (§Q multi-seed) — 3 rounds, 200 perturbations, top-5 hits
+2. §FF Boltz-guided SALSA — 2 rounds, 200 perturbations, top-3 hits
+3. §MM iterative hill-climbing — 2 rounds, 200 perturbations, top-3 hits
+
+**Fix 2 — Increase savi_stream_pool cap from 5000 to 10000:**
+
+`savi_stream_pool` accumulates the top-N PSICHIC-scored molecules during the epoch.
+When §FF and §MM fire (inside the Boltz window, potentially 1–2 hours into the epoch),
+the pool may have far more than 5000 molecules available.  Capping at 10000 ensures:
+- Larger Tanimoto neighbourhood for ring-walk and terminal-removal probes, which map
+  to molecules differing from the seed by ring size or one atom — sparser regions
+  where 5000 molecules is often insufficient coverage.
+- Both the `_pool_combined.head()` cap and the comment updated from 5000 → 10000.
+
+**Memory cost:** 10000 rows × 5 columns ≈ 4 MB vs 2 MB.  Negligible.
+
+**Zero regression risk:** The n_perturb change widens the search but all submitted
+molecules still come from `savi_pool_df` (valid SAVI-2020 product names).  The pool
+cap change has no effect on §N/§Q (which fires early when the pool is <1000 molecules)
+and only benefits §FF/§MM which run later.
 
 ---
 
