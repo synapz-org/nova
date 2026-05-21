@@ -1358,9 +1358,13 @@ async def run_boltz_prescoring(state: Dict[str, Any], max_candidates: int = 5) -
             f"(seed_score={_mm_best_score:.4f}, max_rounds={_mm_max_rounds})"
         )
         _mm_rounds_run = 0
+        _mm_tried_seeds: set = set()  # prevent cycling when basin-hopping
         for _mm_round_idx in range(_mm_max_rounds):
             if _mm_stop:
                 break
+
+            # Mark current seed as tried so §QQ basin-hopping skips it next time.
+            _mm_tried_seeds.add(_mm_seed_smiles)
 
             # Time check before each round — skip if < 2 mol-times + 2 min remain
             try:
@@ -1511,12 +1515,33 @@ async def run_boltz_prescoring(state: Dict[str, Any], max_candidates: int = 5) -
             _mm_rounds_run = _mm_round_idx + 1
 
             if not _mm_improved:
-                bt.logging.info(f"§MM round {_mm_round_idx + 1}: no improvement — stopping.")
-                break
-
-            # Advance seed to this round's best for the next iteration
-            _mm_best_score = _mm_round_best_score
-            _mm_seed_smiles = _mm_round_best_smiles
+                # §QQ Basin-hopping: instead of stopping on the first no-improvement
+                # round, try the next-best scored molecule not yet used as a seed.
+                # Uses all_scores (updated above with §MM results) so molecules
+                # discovered during §MM itself can serve as alternative seeds.
+                _mm_next_seed = max(
+                    (_s for _s, _v in all_scores.items()
+                     if _s not in _mm_tried_seeds and math.isfinite(_v)),
+                    key=lambda _s: all_scores[_s],
+                    default=None,
+                )
+                if _mm_next_seed is None:
+                    bt.logging.info(
+                        f"§MM round {_mm_round_idx + 1}: no improvement; "
+                        f"all {len(_mm_tried_seeds)} seed(s) exhausted — stopping."
+                    )
+                    break
+                bt.logging.info(
+                    f"§MM round {_mm_round_idx + 1}: no improvement from current seed; "
+                    f"§QQ basin-hopping to next-best "
+                    f"(score={all_scores[_mm_next_seed]:.4f})."
+                )
+                _mm_seed_smiles = _mm_next_seed
+                # _mm_best_score unchanged — basin-hop doesn't claim an improvement
+            else:
+                # Advance seed to this round's best for the next iteration
+                _mm_best_score = _mm_round_best_score
+                _mm_seed_smiles = _mm_round_best_smiles
 
         bt.logging.info(
             f"§MM complete: {_mm_rounds_run} round(s) run, "

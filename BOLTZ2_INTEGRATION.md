@@ -50,6 +50,7 @@ screening) — both are conditional or require empirical validation before imple
 | MM | Multi-round iterative Boltz-SALSA hill-climbing | miner.py | ✅ |
 | NN | Reduced-sample §MM/§FF screening (`fast=True`) | wrapper.py, miner.py | ✅ |
 | PP | Full-coverage SALSA perturbations (n_perturb 60→200) + larger SAVI pool (5k→10k) | miner.py | ✅ |
+| QQ | §MM basin-hopping — multi-seed restart on convergence | miner.py | ✅ |
 | D | Binding-pocket pre-docking filter | utils/docking.py | ⏳ conditional |
 | FBLD | Fragment-Based Lead Discovery | — | ⏳ research |
 
@@ -1314,7 +1315,7 @@ and if any score better than the current best, the submission is immediately upd
 ```
 best_boltz_smiles ← argmax(all_scores)   # from main Boltz loop above
 if epoch_remaining > 2 × time_per_mol + 120s:
-    ff_hits ← run_salsa_search(best_boltz_smiles, savi_stream_pool, rounds=2, n_perturb=60, top_k=3)
+    ff_hits ← run_salsa_search(best_boltz_smiles, savi_stream_pool, rounds=2, n_perturb=200, top_k=3)
     for hit in ff_hits:
         check epoch guard → break if < 5 blocks remain
         score = cache_lookup(hit) or boltz_inference(hit)
@@ -2141,7 +2142,7 @@ or `_mm_max_rounds = 5` is reached.
 seed ← best molecule from (all_scores ∪ §FF boltz_cache)
 for round in 1.._mm_max_rounds:
     if remaining_time < 2 × t_per_mol + 120 s: break
-    hits ← salsa(seed, savi_pool, rounds=2, n_perturb=60, top_k=3)
+    hits ← salsa(seed, savi_pool, rounds=2, n_perturb=200, top_k=3)
     if hits empty: break
     improved = False
     for hit in hits:
@@ -2177,4 +2178,97 @@ cap is a safety rail for the rare case where the chemical space is very rich.
 **Interaction with §CC:** After the §MM loop, all scored molecules (initial pass + §FF + §MM)
 are merged into `all_scores` before §CC runs.  This ensures the warm-start guard correctly
 compares the full epoch best (not just the initial-pass best) against the historical disk cache.
+
+---
+
+## Implemented Optimisations (continued)
+
+### QQ. §MM Basin-Hopping — Multi-Seed Restart on Convergence (`neurons/miner.py`) ✅ Implemented
+
+**Problem:** §MM stops as soon as a round finds no improvement.  In practice this happens
+quickly: SALSA from molecule A finds molecules D, E, F; if none beat A, the loop exits.  But
+the epoch budget on A100 hardware may still have 500–700 s remaining after that first no-improve
+round — budget for 10+ additional Boltz calls that were previously discarded.
+
+The root cause is single-seed convergence: once SALSA has mapped the bioisosteric neighbourhood
+of A and all mapped-back SAVI-2020 molecules are already cached (returning instantly), there is
+nothing new to score from A.  But the 2nd- and 3rd-best molecules from the initial Boltz pass
+(B, C in `all_scores`) may occupy completely different chemical regions whose SAVI-2020
+neighbourhood has not been explored at all.
+
+**Fix:** When §MM finds no improvement, instead of stopping immediately it performs a
+*basin-hop*: selects the next-best scored molecule from `all_scores` that has not yet been
+used as a SALSA seed, and continues the loop from that new seed.  Only when all available
+seeds are exhausted (or `_mm_max_rounds` is reached) does the loop stop.
+
+```python
+# _mm_tried_seeds tracks which SMILES have already been used as §MM seeds.
+_mm_tried_seeds: set = set()
+
+for _mm_round_idx in range(_mm_max_rounds):
+    _mm_tried_seeds.add(_mm_seed_smiles)   # mark before running
+    
+    # ... SALSA + Boltz scoring ...
+    
+    if not _mm_improved:
+        # Basin-hop: find next-best seed not yet tried
+        _mm_next_seed = max(
+            (s for s, v in all_scores.items()
+             if s not in _mm_tried_seeds and isfinite(v)),
+            key=lambda s: all_scores[s],
+            default=None,
+        )
+        if _mm_next_seed is None:
+            break   # all seeds exhausted
+        _mm_seed_smiles = _mm_next_seed
+        # _mm_best_score unchanged — the hop doesn't claim an improvement
+    else:
+        _mm_best_score = _mm_round_best_score
+        _mm_seed_smiles = _mm_round_best_smiles
+```
+
+**Why `all_scores`?**  `all_scores` is updated inside the §MM loop (the "Expose §MM scores to
+§CC" block adds newly cached molecules).  Basin-hopping therefore can also use molecules first
+discovered by §MM itself — not just the initial-pass candidates — as new seeds.
+
+**Example walkthrough (A100, 1200 s budget):**
+
+```
+Initial pass: scores [A=0.40, B=0.35, C=0.30] (~270 s)
+§FF: SALSA from A → D=0.42  (new best, ~100 s)
+§MM round 1: SALSA from D → no improvement
+  → Basin-hop to B (next-best, score=0.35)
+§MM round 2: SALSA from B → E=0.38  (no improvement vs 0.42)
+  → Basin-hop to C (next-best, score=0.30)
+§MM round 3: SALSA from C → no improvement
+  → Basin-hop: no seeds left → stop
+Final: candidate_product[0] = D (boltz=0.42)
+```
+
+Without §QQ, §MM stopped after round 1 and left B, C unexplored.  With §QQ, all three
+initial-pass molecules serve as seeds, tripling the chemical diversity explored by §MM.
+
+**Hardware impact:**
+
+| Hardware | §MM rounds w/o §QQ | §MM rounds w/ §QQ | Extra Boltz calls |
+|----------|--------------------|-------------------|-------------------|
+| A100 80 GB | 1–2 | up to 5 (all seeds) | 3–9 extra |
+| RTX 4090 | 1 | 2–3 | 3–6 extra |
+| RTX 3090 | 0–1 | 1–2 | 0–3 extra |
+
+**Zero regression risk:**
+- If §MM found improvement every round (seed advances naturally), `_mm_tried_seeds` still
+  grows and prevents cycling, but the improvement-advance path is unchanged.
+- If `all_scores` only contains one molecule (rare early-epoch scenario), the basin-hop
+  finds `_mm_next_seed = None` and the loop stops immediately — identical to old behaviour.
+- `_mm_max_rounds = 5` still caps the total rounds.  The loop terminates in at most 5 rounds
+  regardless of how many basin-hops occur.
+
+**Files changed:**
+- `neurons/miner.py` — `_mm_tried_seeds` initialisation before the loop; `.add()` at the
+  start of each round; `if not _mm_improved` block replaced with basin-hop logic (§QQ).
+
+**Also fixed in this commit:**
+- `BOLTZ2_INTEGRATION.md` §FF and §MM pseudocode: corrected stale `n_perturb=60` → `200`
+  (§PP updated the actual call sites but missed these two pseudocode lines).
 
