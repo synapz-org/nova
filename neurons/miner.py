@@ -1672,7 +1672,7 @@ async def run_miner(config: argparse.Namespace) -> None:
         'candidate_product': None,
         'candidate_molecules': None,
         'global_candidate_pool': None,   # top-20 molecules across all chunks, by ligand efficiency
-        'savi_stream_pool': None,        # all PSICHIC-scored molecules this epoch (capped at 5000)
+        'savi_stream_pool': None,        # all PSICHIC-scored molecules this epoch (capped at 10000)
         'salsa_run_this_epoch': False,   # prevent duplicate SALSA runs per epoch
         'ga_run_this_epoch': False,      # prevent duplicate GradientGA runs per epoch
         'best_score': float('-inf'),

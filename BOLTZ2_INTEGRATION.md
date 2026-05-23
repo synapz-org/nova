@@ -1,6 +1,6 @@
 # Boltz-2 Miner Integration
 
-## Current Status (as of 2026-05-20)
+## Current Status (as of 2026-05-23)
 
 **Boltz-2 integration is complete and heavily optimised.**  The stock miner scored 0 on
 Boltz-2; this miner has been rewritten from the ground up around the scoring formula.  All
@@ -1991,6 +1991,95 @@ small molecules (10–15 HA).  A SAVI-2020 fragment with 10 heavy atoms and mode
 **Next step:** Run a diagnostic: lower `max_heavy_atoms` to 20 for one epoch, observe whether
 Boltz-2 scores improve and whether PSICHIC candidate volume remains adequate (≥ 500 molecules
 per epoch in `savi_stream_pool`).  Revert if the pool shrinks below the SALSA trigger threshold.
+
+---
+
+### §RR: Confidence-Weighted Molecule Selection (Research Stage)
+
+**Observation:** `§LL` logs `ligand_iptm` and `confidence_score` for every Boltz-2 GPU
+inference, but these values currently have no effect on which molecule is submitted.
+
+**Motivation:** Boltz-2 affinity predictions with very low `ligand_iptm` (< 0.3) indicate
+that the model is uncertain about the ligand's position in the predicted complex.  These
+predictions have higher stochasticity — the validator re-running the same molecule may get
+a substantially different score.  Preferring high-confidence predictions improves the
+correlation between the miner's measured score and the validator's measured score.
+
+**Proposed implementation:**
+
+After each Boltz inference, compute an `effective_score` for *ordering only* (not cached):
+
+```python
+_eff_score = score
+_li = _comps.get('ligand_iptm')
+_cs = _comps.get('confidence_score')
+if math.isfinite(score) and _li is not None and _cs is not None:
+    _conf = (_li + _cs) / 2
+    if _conf < 0.3:
+        _eff_score = score * (0.5 + _conf / 0.6)
+        bt.logging.info(f"  [§RR] Low-confidence prediction penalised: {score:.4f} → {_eff_score:.4f}")
+```
+
+Use `_eff_score` in `all_scores` for submission ordering; store true `score` in both cache
+layers so §CC and §MM comparisons use the unmodified validator-aligned value.
+
+**Risk:** Threshold calibration is uncertain without empirical data.  Aggressive penalisation
+could cause the miner to prefer a lower-raw-score but high-confidence molecule and lose to a
+competitor whose high-confidence molecule genuinely binds better.  Requires A/B validation
+across multiple epochs before deployment.
+
+**Current status:** Not implemented.  Confidence values are logged (§LL) but not used in
+selection.  Implement only after collecting per-epoch `ligand_iptm` / `confidence_score`
+distributions for the current target.
+
+---
+
+### §SS: ChEMBL Known-Active Warm-Start (Research Stage)
+
+**Motivation:** SAVI-2020 streaming samples uniformly at random from a 283M-compound space.
+For well-studied targets (e.g., SERT P31652 — the serotonin transporter), thousands of
+validated actives exist in ChEMBL with IC50 < 100 nM.  Seeding the initial `global_candidate_pool`
+from these known actives could dramatically accelerate the search:
+
+- PSICHIC scores high for molecules structurally similar to known actives
+- SALSA/GA hill-climb within validated chemical space from epoch start
+- Boltz-2 evaluates candidates whose scaffold is known to bind the target
+
+**Implementation sketch:**
+
+At miner startup (after config load, before PSICHIC loop):
+
+```python
+# 1. Query ChEMBL REST API for target UniProt ID
+chembl_url = f"https://www.ebi.ac.uk/chembl/api/data/activity.json"
+params = {"target_chembl_id": chembl_target_id, "pchembl_value__gte": 7.0, "limit": 100}
+# pchembl_value ≥ 7.0 → IC50/Ki ≤ 100 nM
+
+# 2. Extract SMILES from ChEMBL response
+
+# 3. Run PSICHIC on known actives to get combined_scores (filter by _pharma_ok etc.)
+
+# 4. Map each to nearest SAVI-2020 equivalent once savi_stream_pool is ≥ 500 molecules
+#    (because nearest-NN lookup needs the SAVI pool to be populated)
+
+# 5. Inject top-N ChEMBL-nearest SAVI molecules into global_candidate_pool
+```
+
+**Key constraint:** Steps 3–4 cannot run until `savi_stream_pool` has ≥ 500 molecules
+(the NN search requires a populated pool).  ChEMBL molecules cannot be submitted directly —
+they must map to SAVI-2020 product names.
+
+**Open questions:**
+1. ChEMBL → UniProt → ChEMBL target ID mapping (need to resolve UniProt IDs like P31652
+   to ChEMBL target IDs like CHEMBL226).
+2. What if the weekly target has sparse ChEMBL data (< 10 actives with pChEMBL ≥ 7)?
+   Need graceful fallback.
+3. ChEMBL actives may not be in SAVI-2020 (different synthesis routes). Nearest-NN
+   Tanimoto distance could be > 0.3, yielding poor mapping quality.
+
+**Estimated effort:** ~120 lines across `utils/chembl.py` + integration in `neurons/miner.py`.
+Conditional on the current target having ≥ 10 ChEMBL actives.  Potential upside: 2–5× faster
+convergence to a high-scoring scaffold in the first 30 minutes of each epoch.
 
 ---
 
