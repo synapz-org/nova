@@ -43,6 +43,7 @@ from utils.molecules import is_boltz_safe_smiles, get_canonical_smiles
 from utils.msa import ensure_msa
 from utils.salsa import run_salsa_search
 from utils.genetic import run_gradient_ga
+from utils.chembl import get_chembl_seeds
 from PSICHIC.wrapper import PsichicWrapper
 from boltz.wrapper import BoltzWrapper
 from btdr import QuicknetBittensorDrandTimelock
@@ -594,10 +595,27 @@ async def run_psichic_model_loop(state: Dict[str, Any]) -> None:
                         # Runtime: ~3 x 180 ms = ~540 ms CPU -- negligible vs Boltz.
                         _n_seeds = min(3, len(state['global_candidate_pool']))
                         _seeds = state['global_candidate_pool'].head(_n_seeds)['product_smiles'].tolist()
+                        # §SS: extend with up to 3 ChEMBL known actives as additional seeds.
+                        # These are validated binders fetched at startup; each is used as a
+                        # SALSA starting point and the NN lookup maps perturbations back to
+                        # valid SAVI-2020 molecules.  Falls back silently if none are available.
+                        _chembl_ok = [
+                            s for s in state.get('chembl_seeds', [])
+                            if Chem.MolFromSmiles(s) is not None and s not in _seeds
+                        ][:3]
+                        if _chembl_ok:
+                            _seeds = _seeds + _chembl_ok
+                            bt.logging.info(
+                                f"[SS] Adding {len(_chembl_ok)} ChEMBL active(s) as extra SALSA seed(s)."
+                            )
+                        _seed_desc = (
+                            f"{_n_seeds} PSICHIC + {len(_chembl_ok)} ChEMBL"
+                            if _chembl_ok else f"{_n_seeds} PSICHIC"
+                        )
                         bt.logging.info(
                             f"SALSA: triggering with {salsa_pool_size}-molecule pool, "
                             f"{blocks_until_epoch} blocks remaining (threshold={salsa_threshold}), "
-                            f"{_n_seeds} seed(s)..."
+                            f"{len(_seeds)} seed(s) ({_seed_desc})..."
                         )
                         try:
                             _all_salsa = []
@@ -1675,6 +1693,7 @@ async def run_miner(config: argparse.Namespace) -> None:
         'savi_stream_pool': None,        # all PSICHIC-scored molecules this epoch (capped at 10000)
         'salsa_run_this_epoch': False,   # prevent duplicate SALSA runs per epoch
         'ga_run_this_epoch': False,      # prevent duplicate GradientGA runs per epoch
+        'chembl_seeds': [],              # §SS: ChEMBL known actives, fetched at startup
         'best_score': float('-inf'),
         'boltz_prescored': False,
         'last_submitted_product': None,
@@ -1721,6 +1740,22 @@ async def run_miner(config: argparse.Namespace) -> None:
             bt.logging.warning(f"[MSA] Could not retrieve sequence for {config.weekly_target} -- skipping MSA fetch.")
     except Exception as _msa_exc:
         bt.logging.warning(f"[MSA] MSA check failed (non-fatal): {_msa_exc}")
+
+    # §SS: Pre-fetch ChEMBL known actives for the weekly target in the background.
+    # When SALSA fires (~15-30 min into the epoch), these actives are used as
+    # additional seeds alongside the PSICHIC-ranked candidates.  ChEMBL actives
+    # are validated binders (pChEMBL >= 7.0 → IC50 ≤ 100 nM), so they guide
+    # SALSA's nearest-neighbour search toward chemically relevant SAVI-2020
+    # molecules without requiring any PSICHIC calls on the actives themselves.
+    async def _chembl_fetch_bg(target: str) -> None:
+        try:
+            _seeds_c = await asyncio.to_thread(get_chembl_seeds, target)
+            state['chembl_seeds'] = _seeds_c
+            bt.logging.info(f"[SS] ChEMBL: loaded {len(_seeds_c)} actives for {target}")
+        except Exception as _ce:
+            bt.logging.warning(f"[SS] ChEMBL fetch failed (non-fatal): {_ce}")
+
+    asyncio.create_task(_chembl_fetch_bg(config.weekly_target))
 
     bt.logging.info("Entering main miner loop...")
 
@@ -1842,6 +1877,12 @@ async def run_miner(config: argparse.Namespace) -> None:
                 state['boltz_prescored'] = False
                 state['last_submitted_product'] = None
                 state['shutdown_event'] = asyncio.Event()
+
+                # §SS: refresh ChEMBL seeds for the new epoch target.
+                # In practice the weekly target rarely changes mid-session, so
+                # this is mostly a no-op; the background task is cheap anyway.
+                state['chembl_seeds'] = []
+                asyncio.create_task(_chembl_fetch_bg(config.weekly_target))
 
                 # Warm-start (§AA): seed candidate_product from disk cache so
                 # there is always a valid Boltz-validated submission available

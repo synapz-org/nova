@@ -5,8 +5,9 @@
 **Boltz-2 integration is complete and heavily optimised.**  The stock miner scored 0 on
 Boltz-2; this miner has been rewritten from the ground up around the scoring formula.  All
 items on the original arxiv-survey roadmap are implemented, including §NN reduced-sample
-screening.  Two minor research-stage opportunities remain (§D pocket docking, FBLD fragment
-screening) — both are conditional or require empirical validation before implementing.
+screening and §SS ChEMBL known-active warm-start.  Three minor opportunities remain
+(§D pocket docking, FBLD fragment screening, §RR confidence-weighted selection) — all are
+conditional or require empirical validation before implementing.
 
 ### Implemented optimisation index
 
@@ -51,8 +52,10 @@ screening) — both are conditional or require empirical validation before imple
 | NN | Reduced-sample §MM/§FF screening (`fast=True`) | wrapper.py, miner.py | ✅ |
 | PP | Full-coverage SALSA perturbations (n_perturb 60→200) + larger SAVI pool (5k→10k) | miner.py | ✅ |
 | QQ | §MM basin-hopping — multi-seed restart on convergence | miner.py | ✅ |
+| SS | ChEMBL known-active warm-start (extra SALSA seeds) | utils/chembl.py, miner.py | ✅ |
 | D | Binding-pocket pre-docking filter | utils/docking.py | ⏳ conditional |
 | FBLD | Fragment-Based Lead Discovery | — | ⏳ research |
+| RR | Confidence-weighted molecule selection | miner.py | ⏳ research |
 
 ---
 
@@ -1635,6 +1638,9 @@ is unchanged.
 | `neurons/miner.py` | §FF Boltz-guided SALSA second pass — seeded from best Boltz molecule; epoch-guarded per-hit Boltz scoring; immediate submission update on improvement |
 | `neurons/miner.py` | §C `_reorder_for_diversity` helper; call site at end of `run_boltz_prescoring` when `num_molecules_boltz > 1` |
 | `neurons/miner.py` | §JJ `_disk_cache_get_candidates` helper; hoisted `protein`/`db_path` before empty-pool guard; synthetic cache-fallback pool in `run_boltz_prescoring` |
+| `utils/chembl.py` | New: `uniprot_to_chembl_target`, `fetch_chembl_actives`, `get_chembl_seeds` (§SS) |
+| `utils/__init__.py` | Export `get_chembl_seeds` (§SS) |
+| `neurons/miner.py` | `chembl_seeds` state field; `_chembl_fetch_bg` coroutine; `create_task` at startup + epoch boundary; `_chembl_ok` extension to SALSA seed list (§SS) |
 | `BOLTZ2_INTEGRATION.md` | This file |
 
 ---
@@ -2360,4 +2366,71 @@ initial-pass molecules serve as seeds, tripling the chemical diversity explored 
 **Also fixed in this commit:**
 - `BOLTZ2_INTEGRATION.md` §FF and §MM pseudocode: corrected stale `n_perturb=60` → `200`
   (§PP updated the actual call sites but missed these two pseudocode lines).
+
+---
+
+## Implemented Optimisations (continued)
+
+### SS. ChEMBL Known-Active Warm-Start (`utils/chembl.py`, `neurons/miner.py`) ✅ Implemented
+
+**Motivation:** SAVI-2020 streaming samples uniformly at random from a 283M-compound space.
+For well-studied targets (e.g., SERT P31645 — serotonin transporter), thousands of validated
+actives exist in ChEMBL with IC50 < 100 nM.  The PSICHIC pre-filter explores this space
+blindly; ChEMBL actives are known to bind and should be used to guide the search from the start.
+
+**Implementation strategy:** ChEMBL actives are used as **additional SALSA seeds** rather than
+being submitted directly (they are not SAVI-2020 product names).  Each ChEMBL SMILES is passed
+to `run_salsa_search` alongside the normal PSICHIC-ranked seeds; SALSA's perturbation + nearest-
+neighbour lookup maps chemical perturbations of the known active back to the nearest SAVI-2020
+molecules in `savi_stream_pool`.  This is risk-free: submitted molecules are always valid SAVI-2020
+product names with real PSICHIC scores.
+
+**Algorithm (§SS integration with §N/§Q SALSA trigger):**
+
+```
+Startup (background asyncio task):
+  target_id ← ChEMBL API: UniProt → ChEMBL target ID
+  seeds_c   ← ChEMBL API: activities with pChEMBL ≥ 7.0 (IC50 ≤ 100 nM)
+  state['chembl_seeds'] = seeds_c
+
+When SALSA fires (savi_stream_pool ≥ 500):
+  _seeds (PSICHIC top-3) + _chembl_ok (up to 3 ChEMBL actives)
+  for each seed in _seeds ∪ _chembl_ok:
+      hits ← run_salsa_search(seed, savi_pool, rounds=3, n_perturb=200, top_k=5)
+  merge and inject top hits into global_candidate_pool
+```
+
+**API calls used:**
+
+| Endpoint | Purpose |
+|----------|---------|
+| `GET /target.json?target_components__accession=P31645` | UniProt → ChEMBL target ID |
+| `GET /activity.json?target_chembl_id=...&pchembl_value__gte=7.0&assay_type=B` | Binding actives |
+
+Both calls are wrapped in `try/except` — any API failure silently produces an empty seed list.
+
+**Startup timing:** The background fetch (`_chembl_fetch_bg`) launches immediately after MSA fetch.
+For typical drug targets the two API calls complete in 2–10 seconds.  SALSA fires ~15–30 minutes
+later; the seeds are almost always ready by then.  If the fetch is still pending (slow API),
+SALSA runs normally with only PSICHIC seeds — zero regression.
+
+**Zero regression risk:**
+- ChEMBL seeds are RDKit-validated (`Chem.MolFromSmiles` check) before use.
+- Duplicates with PSICHIC seeds are filtered (`s not in _seeds`).
+- The seed list is capped at 3 ChEMBL seeds (up to 6 total seeds: 3 PSICHIC + 3 ChEMBL).
+- At epoch boundary, `state['chembl_seeds']` is reset to `[]` and the fetch re-launches
+  (usually a no-op since the weekly target rarely changes mid-session).
+
+**Expected benefit:** For well-studied targets (SERT, DAT, GPCR kinases), ChEMBL has 100–1000
+validated actives.  Their nearest SAVI-2020 neighbours are chemically closer to known binders
+than random streaming molecules, so SALSA explores a more relevant chemical neighbourhood from
+the start.  On targets with sparse ChEMBL data (< 5 actives), the fetch produces few or no seeds
+and the fallback to PSICHIC-only seeds is seamless.
+
+**Files changed:**
+- `utils/chembl.py` — new: `uniprot_to_chembl_target`, `fetch_chembl_actives`, `get_chembl_seeds`
+- `utils/__init__.py` — export `get_chembl_seeds`
+- `neurons/miner.py` — import `get_chembl_seeds`; `chembl_seeds: []` in initial state; nested
+  `_chembl_fetch_bg` coroutine; `asyncio.create_task` at startup and epoch boundary;
+  `_chembl_ok` seed extension in SALSA trigger block
 

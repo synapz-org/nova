@@ -15,3 +15,4 @@ from .reactions import get_total_reactions, is_reaction_allowed
 from .salsa import run_salsa_search, generate_perturbations, nearest_pool_molecules, precompute_pool_fps
 from .genetic import run_gradient_ga, brics_crossover, tournament_select
 from .msa import ensure_msa, fetch_msa, msa_exists
+from .chembl import get_chembl_seeds
