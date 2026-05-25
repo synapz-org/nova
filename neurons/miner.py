@@ -1566,6 +1566,23 @@ async def run_boltz_prescoring(state: Dict[str, Any], max_candidates: int = 5) -
             f"final_best={_mm_best_score:.4f}"
         )
 
+    # Merge §FF / §MM scores into all_scores before the §CC guard.
+    # The §MM loop exposes boltz_cache → all_scores at the end of each complete
+    # round, but if §MM exits before round 0 (time check fails immediately) or
+    # the §MM block is never entered, §FF scores stay in boltz_cache but never
+    # reach all_scores.  Without this merge, best_new below would exclude the
+    # §FF winner, making the §CC guard incorrectly promote a disk-cached
+    # molecule over a better §FF molecule found this epoch.
+    for _pre_cc_k, _pre_cc_v in boltz_cache.items():
+        if (
+            isinstance(_pre_cc_k, tuple)
+            and len(_pre_cc_k) == 2
+            and _pre_cc_k[1] == protein
+            and _pre_cc_k[0] not in all_scores
+            and math.isfinite(_pre_cc_v)
+        ):
+            all_scores[_pre_cc_k[0]] = _pre_cc_v
+
     # Warm-start guard (§CC): after reordering by this epoch's Boltz scores,
     # check whether the best molecule in the persistent disk cache beats the
     # best new score.  This covers the scenario where the warm-start molecule

@@ -1,13 +1,14 @@
 # Boltz-2 Miner Integration
 
-## Current Status (as of 2026-05-23)
+## Current Status (as of 2026-05-25)
 
 **Boltz-2 integration is complete and heavily optimised.**  The stock miner scored 0 on
 Boltz-2; this miner has been rewritten from the ground up around the scoring formula.  All
 items on the original arxiv-survey roadmap are implemented, including §NN reduced-sample
-screening and §SS ChEMBL known-active warm-start.  Three minor opportunities remain
-(§D pocket docking, FBLD fragment screening, §RR confidence-weighted selection) — all are
-conditional or require empirical validation before implementing.
+screening and §SS ChEMBL known-active warm-start.  A §CC bug fix was applied (2026-05-25):
+§FF scores were not included in `all_scores` when §MM exited with no time for any rounds,
+causing §CC to potentially promote a stale disk-cached molecule over the §FF winner.
+Three research/conditional items remain (§D, FBLD, §RR).
 
 ### Implemented optimisation index
 
@@ -38,7 +39,7 @@ conditional or require empirical validation before implementing.
 | AB | Broader pharmacophore pre-filter (Lipinski Ro5) | miner.py | ✅ |
 | BB | Quality-first SAVI stream pool | miner.py | ✅ |
 | C | Multi-molecule MACCS diversity reordering | miner.py | ✅ (no-op until `num_molecules_boltz>1`) |
-| CC | Warm-start guard — retain cached best | miner.py | ✅ |
+| CC | Warm-start guard — retain cached best; §FF/§MM merge fix | miner.py | ✅ |
 | DD | FG-addition SALSA perturbation operator | salsa.py | ✅ |
 | EE | Scaffold-diverse Boltz candidate selection | miner.py | ✅ |
 | FF | Boltz-guided SALSA (second pass from Boltz winner) | miner.py | ✅ |
