@@ -1,14 +1,15 @@
 # Boltz-2 Miner Integration
 
-## Current Status (as of 2026-05-25)
+## Current Status (as of 2026-05-26)
 
 **Boltz-2 integration is complete and heavily optimised.**  The stock miner scored 0 on
 Boltz-2; this miner has been rewritten from the ground up around the scoring formula.  All
 items on the original arxiv-survey roadmap are implemented, including §NN reduced-sample
-screening and §SS ChEMBL known-active warm-start.  A §CC bug fix was applied (2026-05-25):
-§FF scores were not included in `all_scores` when §MM exited with no time for any rounds,
-causing §CC to potentially promote a stale disk-cached molecule over the §FF winner.
-Three research/conditional items remain (§D, FBLD, §RR).
+screening, §SS ChEMBL known-active warm-start, and §RR confidence-weighted ordering
+(2026-05-26).  A §CC bug fix was applied (2026-05-25): §FF scores were not included in
+`all_scores` when §MM exited with no time for any rounds, causing §CC to potentially
+promote a stale disk-cached molecule over the §FF winner.
+Two conditional/research items remain (§D, FBLD).
 
 ### Implemented optimisation index
 
@@ -53,10 +54,10 @@ Three research/conditional items remain (§D, FBLD, §RR).
 | NN | Reduced-sample §MM/§FF screening (`fast=True`) | wrapper.py, miner.py | ✅ |
 | PP | Full-coverage SALSA perturbations (n_perturb 60→200) + larger SAVI pool (5k→10k) | miner.py | ✅ |
 | QQ | §MM basin-hopping — multi-seed restart on convergence | miner.py | ✅ |
+| RR | Confidence-weighted molecule ordering | miner.py | ✅ |
 | SS | ChEMBL known-active warm-start (extra SALSA seeds) | utils/chembl.py, miner.py | ✅ |
 | D | Binding-pocket pre-docking filter | utils/docking.py | ⏳ conditional |
 | FBLD | Fragment-Based Lead Discovery | — | ⏳ research |
-| RR | Confidence-weighted molecule selection | miner.py | ⏳ research |
 
 ---
 
@@ -1642,6 +1643,7 @@ is unchanged.
 | `utils/chembl.py` | New: `uniprot_to_chembl_target`, `fetch_chembl_actives`, `get_chembl_seeds` (§SS) |
 | `utils/__init__.py` | Export `get_chembl_seeds` (§SS) |
 | `neurons/miner.py` | `chembl_seeds` state field; `_chembl_fetch_bg` coroutine; `create_task` at startup + epoch boundary; `_chembl_ok` extension to SALSA seed list (§SS) |
+| `neurons/miner.py` | §RR: `_rr_eff_scores` dict; `_rr_score` computation after §LL; cache-hit fallback; `_reorder_submission(_rr_eff_scores)` |
 | `BOLTZ2_INTEGRATION.md` | This file |
 
 ---
@@ -2001,43 +2003,69 @@ per epoch in `savi_stream_pool`).  Revert if the pool shrinks below the SALSA tr
 
 ---
 
-### §RR: Confidence-Weighted Molecule Selection (Research Stage)
+### §RR: Confidence-Weighted Molecule Ordering ✅ Implemented (2026-05-26)
 
-**Observation:** `§LL` logs `ligand_iptm` and `confidence_score` for every Boltz-2 GPU
-inference, but these values currently have no effect on which molecule is submitted.
+**Motivation:** Boltz-2 affinity predictions with very low `ligand_iptm` (< 0.25) *and*
+very low `confidence_score` (< 0.30) indicate the model is genuinely uncertain about the
+ligand's binding mode.  These predictions have higher stochasticity — the validator re-running
+the same molecule may get a substantially different score.  Preferring high-confidence
+predictions improves the correlation between the miner's measured score and the
+validator's measured score, without changing any cached values.
 
-**Motivation:** Boltz-2 affinity predictions with very low `ligand_iptm` (< 0.3) indicate
-that the model is uncertain about the ligand's position in the predicted complex.  These
-predictions have higher stochasticity — the validator re-running the same molecule may get
-a substantially different score.  Preferring high-confidence predictions improves the
-correlation between the miner's measured score and the validator's measured score.
+**Implementation:**
 
-**Proposed implementation:**
+Two additions to `run_boltz_prescoring` in `neurons/miner.py`:
 
-After each Boltz inference, compute an `effective_score` for *ordering only* (not cached):
+1. `_rr_eff_scores: Dict[str, float]` — parallel to `all_scores`; holds confidence-adjusted
+   ordering scores for GPU inference results; equals `all_scores[smiles]` for cache hits
+   (no confidence data available).
+
+2. After the §LL logging block, compute `_rr_score` for GPU inference results:
 
 ```python
-_eff_score = score
-_li = _comps.get('ligand_iptm')
-_cs = _comps.get('confidence_score')
-if math.isfinite(score) and _li is not None and _cs is not None:
-    _conf = (_li + _cs) / 2
-    if _conf < 0.3:
-        _eff_score = score * (0.5 + _conf / 0.6)
-        bt.logging.info(f"  [§RR] Low-confidence prediction penalised: {score:.4f} → {_eff_score:.4f}")
+_rr_score = score  # default: no penalty
+if math.isfinite(score):
+    _li = _comps.get('ligand_iptm')
+    _cs = _comps.get('confidence_score')
+    if isinstance(_li, (int, float)) and isinstance(_cs, (int, float)):
+        if _li < 0.25 and _cs < 0.30:
+            # Scale factor: 0.50 when (li,cs)=(0,0) → ~0.96 at threshold boundary.
+            _rr_factor = 0.50 + (_li + _cs) / 1.10
+            _rr_score = score * _rr_factor
+            bt.logging.info(
+                f"  [§RR] Low-conf penalty "
+                f"(ligand_iptm={_li:.3f}, conf={_cs:.3f}): "
+                f"ordering {score:.4f} -> {_rr_score:.4f}"
+            )
+_rr_eff_scores[smiles] = _rr_score
 ```
 
-Use `_eff_score` in `all_scores` for submission ordering; store true `score` in both cache
-layers so §CC and §MM comparisons use the unmodified validator-aligned value.
+`_reorder_submission` is called with `_rr_eff_scores` (not `all_scores`).  `all_scores`
+retains the unmodified true Boltz scores for §CC warm-start comparisons and §MM hill-climbing.
 
-**Risk:** Threshold calibration is uncertain without empirical data.  Aggressive penalisation
-could cause the miner to prefer a lower-raw-score but high-confidence molecule and lose to a
-competitor whose high-confidence molecule genuinely binds better.  Requires A/B validation
-across multiple epochs before deployment.
+**Threshold rationale — why both conditions required:**
 
-**Current status:** Not implemented.  Confidence values are logged (§LL) but not used in
-selection.  Implement only after collecting per-epoch `ligand_iptm` / `confidence_score`
-distributions for the current target.
+- `ligand_iptm < 0.25` alone: ligand pose uncertain but protein backbone may be correct;
+  affinity estimate may still be calibrated.
+- `confidence_score < 0.30` alone: low overall structure confidence but can occur on short
+  proteins with high ligand iptm; affinity predictions often remain reliable.
+- Both < threshold simultaneously: model is uncertain about both global structure and
+  ligand placement — the binding mode prediction is genuinely unreliable.
+
+The penalty is deliberately mild (factor 0.50–0.96 × score, not zero).  A molecule with
+a very high raw score that is also very low confidence should still be preferred over a
+low-raw-score molecule.
+
+**What is not affected:**
+- Cache writes: `all_scores[smiles] = score` stores the true value in both cache layers.
+- §CC warm-start guard: uses `all_scores` for `best_new` — correct validator-aligned comparison.
+- §MM hill-climbing: uses `_mm_all_scored` derived from `all_scores` — unpenalised.
+- §FF: runs independently with its own per-molecule scoring logic (no §RR interaction needed).
+
+**Files changed:**
+- `neurons/miner.py` — `_rr_eff_scores` dict initialisation; `_rr_score` computation block
+  after §LL logging; `if smiles not in _rr_eff_scores` cache-hit fallback;
+  `_reorder_submission(_rr_eff_scores)` call site.
 
 ---
 

@@ -1074,6 +1074,9 @@ async def run_boltz_prescoring(state: Dict[str, Any], max_candidates: int = 5) -
 
     # Accumulate scores as we go; allows immediate reorder after each hit.
     all_scores: Dict[str, float] = {}
+    # §RR: confidence-adjusted ordering scores (same as all_scores except for very low-
+    # confidence GPU inference results; never written to cache or used by §CC/§MM).
+    _rr_eff_scores: Dict[str, float] = {}
 
     def _reorder_submission(scores: Dict[str, float]) -> None:
         """Put the best Boltz-scored molecule first in state['candidate_product']."""
@@ -1161,6 +1164,29 @@ async def run_boltz_prescoring(state: Dict[str, Any], max_candidates: int = 5) -
                         f"ligand_iptm={_fv(_comps.get('ligand_iptm'))}"
                     )
 
+                    # §RR: Confidence-weighted ordering for GPU inference results only.
+                    # Molecules where BOTH ligand_iptm < 0.25 AND confidence_score < 0.30
+                    # have genuinely uncertain binding modes; their validator re-run score
+                    # is more likely to differ substantially from the miner measurement.
+                    # Apply a modest ordering penalty so high-confidence molecules are
+                    # preferred when scores are close.  The true score is always cached
+                    # unmodified (§CC and §MM must compare validator-aligned values).
+                    _rr_score = score  # default: no penalty
+                    if math.isfinite(score):
+                        _li = _comps.get('ligand_iptm')
+                        _cs = _comps.get('confidence_score')
+                        if isinstance(_li, (int, float)) and isinstance(_cs, (int, float)):
+                            if _li < 0.25 and _cs < 0.30:
+                                # Scale factor: 0.50 when (li,cs)=(0,0) → ~0.96 at threshold.
+                                _rr_factor = 0.50 + (_li + _cs) / 1.10
+                                _rr_score = score * _rr_factor
+                                bt.logging.info(
+                                    f"  [§RR] Low-conf penalty "
+                                    f"(ligand_iptm={_li:.3f}, conf={_cs:.3f}): "
+                                    f"ordering {score:.4f} -> {_rr_score:.4f}"
+                                )
+                    _rr_eff_scores[smiles] = _rr_score
+
                     # Persist to both cache layers (product_name enables warm-start §AA)
                     boltz_cache[key] = score
                     _pname = row.get('product_name')
@@ -1184,10 +1210,16 @@ async def run_boltz_prescoring(state: Dict[str, Any], max_candidates: int = 5) -
                     score = -math.inf
 
         all_scores[smiles] = score
+        # For cache hits _rr_eff_scores entry was not set in the GPU-inference block above.
+        # Default to the true score (no confidence data available for cached results).
+        if smiles not in _rr_eff_scores:
+            _rr_eff_scores[smiles] = score
 
         # Reorder submission immediately -- anytime guarantee: if epoch ends
         # after this molecule, the best Boltz score seen so far is at position 0.
-        _reorder_submission(all_scores)
+        # §RR: use confidence-adjusted scores for ordering; all_scores keeps true values
+        # for §CC warm-start guard and §MM comparisons.
+        _reorder_submission(_rr_eff_scores)
 
     # Final summary
     valid_scores = {s: v for s, v in all_scores.items() if v != -math.inf}
