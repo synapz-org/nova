@@ -1,6 +1,6 @@
 # Boltz-2 Miner Integration
 
-## Current Status (as of 2026-05-26)
+## Current Status (as of 2026-05-27)
 
 **Boltz-2 integration is complete and heavily optimised.**  The stock miner scored 0 on
 Boltz-2; this miner has been rewritten from the ground up around the scoring formula.  All
@@ -9,6 +9,14 @@ screening, §SS ChEMBL known-active warm-start, and §RR confidence-weighted ord
 (2026-05-26).  A §CC bug fix was applied (2026-05-25): §FF scores were not included in
 `all_scores` when §MM exited with no time for any rounds, causing §CC to potentially
 promote a stale disk-cached molecule over the §FF winner.
+
+Two §MM improvements added 2026-05-27:
+- `_mm_max_rounds` raised 5 → 10: A100/RTX 4090 hardware was hitting the cap before the
+  time-guard fired; raising it allows 2–3 extra SALSA-Boltz rounds per epoch on fast GPUs.
+- `stream_random_chunk_from_dataset` now caches the SAVI-2020 file list (one HuggingFace
+  API call per process lifetime) and samples files without replacement per epoch, ensuring
+  maximum chemical diversity across the epoch's streaming cycles.
+
 Two conditional/research items remain (§D, FBLD).
 
 ### Implemented optimisation index
@@ -56,6 +64,7 @@ Two conditional/research items remain (§D, FBLD).
 | QQ | §MM basin-hopping — multi-seed restart on convergence | miner.py | ✅ |
 | RR | Confidence-weighted molecule ordering | miner.py | ✅ |
 | SS | ChEMBL known-active warm-start (extra SALSA seeds) | utils/chembl.py, miner.py | ✅ |
+| TT | §MM max-rounds 5→10 + SAVI file-list cache + without-replacement sampling | miner.py | ✅ |
 | D | Binding-pocket pre-docking filter | utils/docking.py | ⏳ conditional |
 | FBLD | Fragment-Based Lead Discovery | — | ⏳ research |
 
@@ -1972,6 +1981,63 @@ train/test gap.
 
 ---
 
+## Implemented Optimisations (continued)
+
+### TT. §MM Max-Rounds Increase + SAVI File-List Cache (`neurons/miner.py`) ✅ Implemented (2026-05-27)
+
+Two small but compounding improvements applied together:
+
+**TT.1 — `_mm_max_rounds` raised from 5 to 10**
+
+On A100 hardware (45 s/mol) the §MM time-guard fires after ~7 rounds, not 5, because the
+available epoch budget (after initial scoring + §FF) is ~795 s:
+
+```
+Budget available for §MM ≈ 1200 s − (6 × 45) − (3 × 8 + 45) s = ~795 s
+Per-round cost: 3 × 8 s (fast) + 45 s (full) ≈ 69 s
+Rounds before time-guard: 795 / 69 ≈ 11.5 → cap was the binding constraint at 5
+```
+
+Raising to 10 allows 2–3 additional Boltz-SALSA rounds on A100/RTX 4090:
+
+| Hardware | Rounds w/ cap=5 | Rounds w/ cap=10 | Extra Boltz calls |
+|----------|-----------------|------------------|-------------------|
+| A100 80 GB | 5 (cap-limited) | ~7–8 (time-limited) | +2–3 rounds × 3 = 6–9 |
+| RTX 4090 | 4–5 (cap-limited) | ~5–6 (time-limited) | +1–2 rounds × 3 = 3–6 |
+| RTX 3090 | 0–1 (time-limited) | 0–1 (unchanged) | 0 |
+
+**Zero regression risk:** The time-guard (`remaining_s < 2×t_per_mol + 120s`) is the real
+safety valve.  Increasing the cap only adds rounds when time permits — it never overruns the
+epoch boundary.
+
+**TT.2 — SAVI-2020 file-list cache + without-replacement epoch sampling**
+
+`stream_random_chunk_from_dataset` previously called `list_repo_files` on every invocation
+— once per outer-loop cycle in `run_psichic_model_loop`.  While typically only 1–3 cycles
+per epoch, each call is an HTTP round-trip to HuggingFace (50–500 ms depending on network).
+
+**Fix — file list caching:**  The result of `list_repo_files` is stored in module-level
+`_SAVI_FILE_CACHE` (keyed by repo URL) after the first call.  All subsequent invocations
+within the same process lifetime reuse the cached list.
+
+**Fix — without-replacement sampling per epoch:**  A module-level `_SAVI_SEEN_FILES` dict
+tracks which CSV files have been selected this epoch.  When the outer loop re-enters
+`stream_random_chunk_from_dataset`, it samples only from unseen files.  When all files are
+exhausted, the seen-set resets and a new cycle begins.  `_SAVI_SEEN_FILES` is cleared at
+each epoch boundary in `run_miner()` so the new epoch starts fresh.
+
+**Effect:** Successive outer-loop cycles now stream from distinct SAVI-2020 files, exposing
+the PSICHIC+SALSA search to the widest possible chemical space variety per epoch — and
+eliminating the (low-probability but non-zero) risk of re-scoring molecules from the same
+file twice.  The one-time API call cost amortises to zero across all subsequent epochs.
+
+**Files changed:**
+- `neurons/miner.py` — `_SAVI_FILE_CACHE`, `_SAVI_SEEN_FILES` module-level dicts;
+  updated `stream_random_chunk_from_dataset`; `_mm_max_rounds = 10`;
+  `_SAVI_SEEN_FILES.pop(...)` in epoch-boundary reset.
+
+---
+
 ## Remaining Optimisation Opportunities
 
 ### §D: Binding-Pocket Pre-Docking Filter (Conditional, Not Yet Implemented)
@@ -1991,15 +2057,35 @@ The scoring formula's `heavy_atom_count` denominator creates a structural incent
 small molecules (10–15 HA).  A SAVI-2020 fragment with 10 heavy atoms and moderate binding
 (`apb=0.6, apv=-5`) scores `(0.6+5)/10 = 0.56` — beating most drug-like molecules.
 
+**Why this matters:** The disk cache logs per-molecule Boltz components (`§LL`).  After a few
+epochs, miners can inspect the heavy-atom distribution of cached molecules and compare
+high-scoring vs. average molecules.  If high scorers cluster below 20 HA, FBLD is worth
+pursuing.
+
 **Open questions:**
 1. Is Boltz-2 well-calibrated for fragment-sized molecules (MW < 200 Da)?  Training data is
    dominated by drug-like compounds (200–500 Da).
 2. What fraction of SAVI-2020 molecules fall below 15 HA?  Setting `max_heavy_atoms: 15` may
-   starve PSICHIC of candidates.
+   starve PSICHIC of candidates and prevent SALSA from reaching its 500-molecule trigger.
 
-**Next step:** Run a diagnostic: lower `max_heavy_atoms` to 20 for one epoch, observe whether
-Boltz-2 scores improve and whether PSICHIC candidate volume remains adequate (≥ 500 molecules
-per epoch in `savi_stream_pool`).  Revert if the pool shrinks below the SALSA trigger threshold.
+**Concrete diagnostic (two-epoch test):**
+
+*Epoch A (control):* keep `max_heavy_atoms: 35` (default).  At epoch end, record:
+- `savi_stream_pool` size
+- Best Boltz score and its heavy atom count
+- Mean HA of top-10 pool molecules
+
+*Epoch B (probe):* temporarily set `max_heavy_atoms: 20` in `config.yaml`.  Record:
+- Does `savi_stream_pool` still reach ≥ 500 molecules? (SALSA trigger)
+- Best Boltz score and its HA
+- Compare best score in epoch A vs. B
+
+If B > A and pool ≥ 500, permanently lower the ceiling.
+If pool < 500 in B, fragments are too sparse in SAVI-2020 — abandon FBLD.
+
+**Caution:** Do NOT run epoch B on a high-competition target without first confirming that
+SAVI-2020 has sufficient sub-20-HA molecules.  A silently undersized pool means the miner
+submits only warm-start cache entries — a significant competitive disadvantage.
 
 ---
 

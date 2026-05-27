@@ -338,9 +338,18 @@ async def setup_bittensor_objects(config: argparse.Namespace) -> Tuple[Any, Any,
 # 4. DATA SETUP
 # ----------------------------------------------------------------------------
 
+_SAVI_FILE_CACHE: dict = {}   # repo_url -> sorted list of CSV filenames (populated once)
+_SAVI_SEEN_FILES: dict = {}   # repo_url -> set of files used this epoch (reset externally)
+
+
 def stream_random_chunk_from_dataset(dataset_repo: str, chunk_size: int) -> Any:
     """
     Streams a random chunk from the specified Hugging Face dataset repo.
+
+    File list is cached after the first call to avoid repeated HuggingFace API
+    requests.  Within each epoch, files are sampled without replacement so that
+    successive outer-loop cycles explore distinct regions of SAVI-2020 chemical
+    space.  When all files have been seen the seen-set resets and a new cycle begins.
 
     Args:
         dataset_repo (str): Hugging Face dataset repository path (user/repo).
@@ -349,9 +358,21 @@ def stream_random_chunk_from_dataset(dataset_repo: str, chunk_size: int) -> Any:
     Returns:
         Any: A batched (chunked) dataset iterator.
     """
-    files = list_repo_files(dataset_repo, repo_type='dataset')
-    files = [file for file in files if file.endswith('.csv')]
-    random_file = random.choice(files)
+    if dataset_repo not in _SAVI_FILE_CACHE:
+        all_files = list_repo_files(dataset_repo, repo_type='dataset')
+        _SAVI_FILE_CACHE[dataset_repo] = sorted(
+            f for f in all_files if f.endswith('.csv')
+        )
+
+    files = _SAVI_FILE_CACHE[dataset_repo]
+
+    seen = _SAVI_SEEN_FILES.setdefault(dataset_repo, set())
+    available = [f for f in files if f not in seen]
+    if not available:
+        seen.clear()
+        available = files
+    random_file = random.choice(available)
+    seen.add(random_file)
 
     dataset_dict = load_dataset(
         dataset_repo,
@@ -1394,7 +1415,10 @@ async def run_boltz_prescoring(state: Dict[str, Any], max_candidates: int = 5) -
         if _mm_all_scored else None
     )
     _mm_savi_pool = state.get('savi_stream_pool')
-    _mm_max_rounds = 5
+    # 10 rounds: on A100 the time guard fires after ~7 rounds anyway; on RTX 3090
+    # it fires after 0-1 rounds.  The higher cap lets fast hardware fully utilise
+    # the epoch budget without artificially stopping early.
+    _mm_max_rounds = 10
     _mm_stop = False
 
     if (
@@ -1926,6 +1950,10 @@ async def run_miner(config: argparse.Namespace) -> None:
                 state['boltz_prescored'] = False
                 state['last_submitted_product'] = None
                 state['shutdown_event'] = asyncio.Event()
+
+                # Reset SAVI-2020 file-sampling seen-set so the new epoch
+                # starts a fresh without-replacement cycle over all CSV files.
+                _SAVI_SEEN_FILES.pop(state['hugging_face_dataset_repo'], None)
 
                 # §SS: refresh ChEMBL seeds for the new epoch target.
                 # In practice the weekly target rarely changes mid-session, so
