@@ -629,10 +629,39 @@ async def run_psichic_model_loop(state: Dict[str, Any]) -> None:
                             bt.logging.info(
                                 f"[SS] Adding {len(_chembl_ok)} ChEMBL active(s) as extra SALSA seed(s)."
                             )
-                        _seed_desc = (
-                            f"{_n_seeds} PSICHIC + {len(_chembl_ok)} ChEMBL"
-                            if _chembl_ok else f"{_n_seeds} PSICHIC"
-                        )
+
+                        # §UU: extend with up to 3 prior-epoch Boltz-validated seeds from disk cache.
+                        # In epoch 2+ on the same weekly target, the disk cache holds molecules that
+                        # have already been scored by the actual Boltz-2 oracle — far better seeds
+                        # than PSICHIC-ranked candidates alone.  Silently ignored on the first epoch
+                        # (empty cache) and when `binding_pocket` changes (different protein key).
+                        _uu_db_path = state.get('boltz_cache_db', BOLTZ_CACHE_DB)
+                        _uu_protein = state['config'].weekly_target
+                        _uu_cached = _disk_cache_get_candidates(_uu_db_path, _uu_protein, limit=5)
+                        _uu_seeds = []
+                        for _uu_row in _uu_cached:
+                            _uu_sm = _uu_row.get('product_smiles', '')
+                            if (
+                                _uu_sm
+                                and _uu_sm not in _seeds
+                                and Chem.MolFromSmiles(_uu_sm) is not None
+                                and is_boltz_safe_smiles(_uu_sm)[0]
+                            ):
+                                _uu_seeds.append(_uu_sm)
+                            if len(_uu_seeds) >= 3:
+                                break
+                        if _uu_seeds:
+                            _seeds = _seeds + _uu_seeds
+                            bt.logging.info(
+                                f"[UU] Adding {len(_uu_seeds)} prior-epoch Boltz-validated seed(s) to SALSA."
+                            )
+
+                        _seed_parts = [f"{_n_seeds} PSICHIC"]
+                        if _chembl_ok:
+                            _seed_parts.append(f"{len(_chembl_ok)} ChEMBL")
+                        if _uu_seeds:
+                            _seed_parts.append(f"{len(_uu_seeds)} Boltz-cache")
+                        _seed_desc = " + ".join(_seed_parts)
                         bt.logging.info(
                             f"SALSA: triggering with {salsa_pool_size}-molecule pool, "
                             f"{blocks_until_epoch} blocks remaining (threshold={salsa_threshold}), "

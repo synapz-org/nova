@@ -1,6 +1,6 @@
 # Boltz-2 Miner Integration
 
-## Current Status (as of 2026-05-27)
+## Current Status (as of 2026-05-29)
 
 **Boltz-2 integration is complete and heavily optimised.**  The stock miner scored 0 on
 Boltz-2; this miner has been rewritten from the ground up around the scoring formula.  All
@@ -16,6 +16,11 @@ Two §MM improvements added 2026-05-27:
 - `stream_random_chunk_from_dataset` now caches the SAVI-2020 file list (one HuggingFace
   API call per process lifetime) and samples files without replacement per epoch, ensuring
   maximum chemical diversity across the epoch's streaming cycles.
+
+§UU added 2026-05-29: prior-epoch Boltz-validated molecules from the disk cache are now
+used as additional SALSA seeds alongside PSICHIC and ChEMBL seeds.  In epoch 2+ on the
+same weekly target this lets SALSA explore the chemical neighbourhood of already-validated
+binders immediately, before PSICHIC streaming has had time to re-discover the same region.
 
 Two conditional/research items remain (§D, FBLD).
 
@@ -65,8 +70,80 @@ Two conditional/research items remain (§D, FBLD).
 | RR | Confidence-weighted molecule ordering | miner.py | ✅ |
 | SS | ChEMBL known-active warm-start (extra SALSA seeds) | utils/chembl.py, miner.py | ✅ |
 | TT | §MM max-rounds 5→10 + SAVI file-list cache + without-replacement sampling | miner.py | ✅ |
+| UU | Prior-epoch Boltz-cache seeds for SALSA | miner.py | ✅ |
 | D | Binding-pocket pre-docking filter | utils/docking.py | ⏳ conditional |
 | FBLD | Fragment-Based Lead Discovery | — | ⏳ research |
+
+---
+
+## §UU — Prior-Epoch Boltz-Cache Seeds for SALSA (`neurons/miner.py`)
+
+SALSA seed selection previously used (in order of priority): top-3 PSICHIC candidates from
+`global_candidate_pool`, up to 3 ChEMBL known actives (§SS).
+
+**Problem:** In epoch 2+ on the same weekly target, the disk cache may hold molecules that
+have already been validated by the Boltz-2 oracle with scores significantly higher than the
+current PSICHIC rankings.  These are far better seeds for SALSA than freshly-streamed
+molecules.  Prior to §UU, these cached molecules were only used as a fallback submission
+(via `_apply_warm_start`) — never as SALSA starting points.
+
+**Fix:** After the §SS block, `_disk_cache_get_candidates(db_path, protein, limit=5)` fetches
+the top-5 Boltz-validated molecules for the current weekly target.  Up to 3 that are:
+- Not already in `_seeds`
+- Valid RDKit molecule
+- Boltz-safe SMILES
+
+are appended as additional SALSA seeds.  On the first epoch (empty cache) or after a weekly
+target rotation (different protein key → cache miss), the block is a no-op.
+
+**Expected benefit:** When the miner has run for ≥2 epochs on the same target, SALSA
+immediately explores the neighbourhood of the best Boltz-validated lead from prior epochs.
+This reduces the time to convergence: rather than discovering the same high-scoring chemical
+region from scratch via PSICHIC streaming, SALSA starts from a Boltz-confirmed optimum and
+explores radial deformations around it.
+
+---
+
+## Remaining Research Directions
+
+### FBLD — Fragment-Based Lead Discovery
+
+The Boltz-2 scoring formula `(apb − apv) / heavy_atom_count` strongly rewards small
+potent binders.  A fragment with 10 HA binding at the same energy as a 25 HA drug-like
+molecule scores 2.5× higher.  The `min_heavy_atoms: 10` filter already admits the smallest
+SAVI-2020 products.
+
+**Open question:** Are Boltz-2 affinity predictions calibrated for molecules < 15 HA?
+Boltz-2 was trained primarily on drug-like co-crystals (200–500 Da); fragment predictions
+may have high variance.
+
+**Experiment to run:** Over 10–20 epochs, record per-molecule `affinity_probability_binary`
+and `affinity_pred_value` split by heavy atom count bucket (10–15, 15–20, 20–25, 25–35).
+If the 10–15 bucket shows consistently high scores, bias SALSA/PSICHIC toward smaller molecules.
+
+**Risk:** If Boltz-2 systematically overestimates small-molecule affinity (training bias),
+submitting fragment-sized leads could actually hurt ranking because the validator re-run
+might disagree.  Requires empirical validation before changing the submission strategy.
+
+### §D — Binding-Pocket Pre-Docking Filter
+
+Active only when `config.binding_pocket` is non-null (currently `null` for P31652).
+When the weekly target rotates to a protein with a known binding pocket, a fast AutoDock
+Vina docking pre-filter could eliminate PSICHIC candidates that fail the pocket constraint
+before Boltz-2 inference, saving GPU time and improving submission quality.
+
+Estimated effort: ~150 lines in `utils/docking.py`.  Priority: low (only relevant when
+`binding_pocket` is set by the subnet operator).
+
+### Large-Scale SAVI-2020 Indexing
+
+The SALSA Tanimoto search covers only the ~10,000 molecules in `savi_stream_pool` — less
+than 0.004% of SAVI-2020's 283 M compounds.  Pre-downloading a representative subset
+(e.g., 5 M reactions from 10–35 HA products) and building a local LSH/ball-tree FP index
+would let SALSA find high-quality nearest-neighbours across a 500× larger search space.
+
+Estimated effort: High (several GB download, index construction, FAISS/pynndescent
+integration).  Not yet attempted.
 
 ---
 
