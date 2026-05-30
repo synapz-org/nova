@@ -1618,25 +1618,59 @@ async def run_boltz_prescoring(state: Dict[str, Any], max_candidates: int = 5) -
             _mm_rounds_run = _mm_round_idx + 1
 
             if not _mm_improved:
-                # §QQ Basin-hopping: instead of stopping on the first no-improvement
+                # §QQ/§VV Basin-hopping: instead of stopping on the first no-improvement
                 # round, try the next-best scored molecule not yet used as a seed.
+                # §VV adds scaffold awareness: prefer candidates with a Murcko scaffold
+                # not yet explored by any §MM seed, so hops cross chemical space rather
+                # than revisiting the same structural region.
                 # Uses all_scores (updated above with §MM results) so molecules
                 # discovered during §MM itself can serve as alternative seeds.
+                from rdkit.Chem import MurckoScaffold as _Murcko
+
+                def _get_scaffold_smi(smi: str) -> str:
+                    m = Chem.MolFromSmiles(smi)
+                    if not m:
+                        return smi
+                    try:
+                        sc = _Murcko.GetScaffoldForMol(m)
+                        return Chem.MolToSmiles(sc) if sc else smi
+                    except Exception:
+                        return smi
+
+                _mm_tried_scaffolds: set = {_get_scaffold_smi(s) for s in _mm_tried_seeds}
+
+                # First pass: prefer a candidate with an unseen Murcko scaffold.
                 _mm_next_seed = max(
-                    (_s for _s, _v in all_scores.items()
-                     if _s not in _mm_tried_seeds and math.isfinite(_v)),
+                    (
+                        _s for _s, _v in all_scores.items()
+                        if _s not in _mm_tried_seeds
+                        and math.isfinite(_v)
+                        and _get_scaffold_smi(_s) not in _mm_tried_scaffolds
+                    ),
                     key=lambda _s: all_scores[_s],
                     default=None,
                 )
+                _mm_hop_novel = _mm_next_seed is not None
+
+                # Fallback: any untried seed (even from an already-explored scaffold).
+                if _mm_next_seed is None:
+                    _mm_next_seed = max(
+                        (_s for _s, _v in all_scores.items()
+                         if _s not in _mm_tried_seeds and math.isfinite(_v)),
+                        key=lambda _s: all_scores[_s],
+                        default=None,
+                    )
+
                 if _mm_next_seed is None:
                     bt.logging.info(
                         f"§MM round {_mm_round_idx + 1}: no improvement; "
                         f"all {len(_mm_tried_seeds)} seed(s) exhausted — stopping."
                     )
                     break
+                _hop_tag = "novel scaffold" if _mm_hop_novel else "same scaffold"
                 bt.logging.info(
                     f"§MM round {_mm_round_idx + 1}: no improvement from current seed; "
-                    f"§QQ basin-hopping to next-best "
+                    f"§QQ/§VV basin-hop ({_hop_tag}) "
                     f"(score={all_scores[_mm_next_seed]:.4f})."
                 )
                 _mm_seed_smiles = _mm_next_seed

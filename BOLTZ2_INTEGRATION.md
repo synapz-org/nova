@@ -1,6 +1,6 @@
 # Boltz-2 Miner Integration
 
-## Current Status (as of 2026-05-29)
+## Current Status (as of 2026-05-30)
 
 **Boltz-2 integration is complete and heavily optimised.**  The stock miner scored 0 on
 Boltz-2; this miner has been rewritten from the ground up around the scoring formula.  All
@@ -21,6 +21,12 @@ Two §MM improvements added 2026-05-27:
 used as additional SALSA seeds alongside PSICHIC and ChEMBL seeds.  In epoch 2+ on the
 same weekly target this lets SALSA explore the chemical neighbourhood of already-validated
 binders immediately, before PSICHIC streaming has had time to re-discover the same region.
+
+§VV added 2026-05-30: §QQ basin-hopping in §MM is now scaffold-aware.  When the current
+§MM seed fails to improve, the hop preferentially selects a candidate with a Murcko scaffold
+not yet explored by any prior seed in this round, maximising chemical diversity across
+basin-hopping iterations.  Falls back to the plain next-best if no scaffold-novel candidate
+is available.
 
 Two conditional/research items remain (§D, FBLD).
 
@@ -71,6 +77,7 @@ Two conditional/research items remain (§D, FBLD).
 | SS | ChEMBL known-active warm-start (extra SALSA seeds) | utils/chembl.py, miner.py | ✅ |
 | TT | §MM max-rounds 5→10 + SAVI file-list cache + without-replacement sampling | miner.py | ✅ |
 | UU | Prior-epoch Boltz-cache seeds for SALSA | miner.py | ✅ |
+| VV | Scaffold-diverse §QQ basin-hopping in §MM | miner.py | ✅ |
 | D | Binding-pocket pre-docking filter | utils/docking.py | ⏳ conditional |
 | FBLD | Fragment-Based Lead Discovery | — | ⏳ research |
 
@@ -101,6 +108,35 @@ immediately explores the neighbourhood of the best Boltz-validated lead from pri
 This reduces the time to convergence: rather than discovering the same high-scoring chemical
 region from scratch via PSICHIC streaming, SALSA starts from a Boltz-confirmed optimum and
 explores radial deformations around it.
+
+---
+
+## §VV — Scaffold-Diverse §QQ Basin-Hopping in §MM (`neurons/miner.py`)
+
+The §QQ basin-hopping logic in the §MM multi-round hill-climbing loop previously picked the
+next-best scored molecule (by Boltz score) when the current seed showed no improvement.
+This is greedy-optimal for score but ignores chemical diversity: if multiple high-scoring
+molecules share a Murcko scaffold, §QQ would iterate over them sequentially, spending several
+rounds in the same structural region before reaching a genuinely novel scaffold.
+
+**Fix:** Before selecting the basin-hop target, §VV computes the set of Murcko scaffolds
+already explored by all prior §MM seeds (`_mm_tried_scaffolds`).  The hop selection then
+runs in two passes:
+
+1. **Novel-scaffold pass** — pick the highest-scoring molecule whose Murcko scaffold is
+   not in `_mm_tried_scaffolds`.  This forces the hop into a chemically distinct region.
+2. **Fallback** — if no scaffold-novel candidate exists (pool is chemically homogeneous),
+   fall back to the plain next-best, preserving §QQ's original behaviour.
+
+The log message tags each hop as `"novel scaffold"` or `"same scaffold"` so the effect is
+visible in training runs.
+
+**Expected benefit:** When §MM has explored a local optimum and all top-scored molecules
+share one scaffold, §VV directs the next hop to a structurally different basin rather than
+a closely related analogue.  On epochs where SALSA converges quickly to one chemical region
+and initial Boltz prescoring selects scaffold-diverse candidates (§EE), §VV ensures the §QQ
+hops traverse distinct scaffolds in priority order — maximising the probability that one hop
+discovers a genuinely superior binding mode before the time guard fires.
 
 ---
 
@@ -144,6 +180,42 @@ would let SALSA find high-quality nearest-neighbours across a 500× larger searc
 
 Estimated effort: High (several GB download, index construction, FAISS/pynndescent
 integration).  Not yet attempted.
+
+### §WW — Stochastic Mean Estimation for Top Candidate
+
+Boltz-2 is a diffusion model and its affinity predictions have per-run variance: the same
+molecule can score differently across runs with different random seeds.  The validator uses a
+fixed seed (68) for their re-run, so the miner score and validator score can diverge by
+stochastic noise.
+
+**Proposal:** For the final-round top candidate (after §MM converges), run Boltz-2 with
+2–3 additional seeds (e.g., 68, 42, 123) and report the average as the effective score for
+submission decisions.  If the mean is lower than the single-seed estimate, consider whether
+the second-best candidate has a more stable (lower-variance) score.
+
+**Implementation:** Add a `score_molecule_multi_seed(smiles, seeds=[68,42,123])` method to
+`BoltzWrapper` that runs 3 inference calls and averages the scores.  Only call this when time
+allows (≥ 3 × `boltz_time_per_mol` remaining after §MM).  Cache each individual seed result
+separately so the disk cache benefits from future epochs.
+
+**Risk:** Adds 2× GPU time for the final molecule.  On slow hardware (RTX 3090) there may
+be zero time remaining after §MM.  Guard strictly behind a remaining-time check.
+
+Estimated effort: ~60 lines in wrapper.py + miner.py.
+
+### §XX — Tautomer Enumeration for Borderline Candidates
+
+After finding the best SAVI-2020 molecule via SALSA/§MM, use RDKit's `MolStandardize`
+tautomer enumeration to generate canonical tautomers of the winner.  For each tautomer that
+passes `is_boltz_safe_smiles` and has ≤35 HA, check the disk cache and optionally run Boltz.
+Tautomers can have different H-bond donor/acceptor profiles and logically different poses,
+potentially scoring differently under Boltz-2's affinity head.
+
+**Submission constraint:** The tautomer SMILES is unlikely to be a SAVI-2020 product name.
+Use the nearest-SAVI-2020-neighbour lookup (already used in SALSA) to find a submittable
+molecule close to the best-scoring tautomer.
+
+Estimated effort: ~40 lines in miner.py; requires `rdkit.Chem.MolStandardize`.
 
 ---
 
