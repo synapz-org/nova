@@ -1685,6 +1685,143 @@ async def run_boltz_prescoring(state: Dict[str, Any], max_candidates: int = 5) -
             f"final_best={_mm_best_score:.4f}"
         )
 
+    # §XX — Tautomer Enumeration for Borderline Candidates.
+    # After §MM converges, enumerate RDKit canonical tautomers of the epoch's
+    # best-scoring molecule.  Tautomers share the same molecular formula but differ
+    # in bond order and proton placement, producing distinct Morgan fingerprints that
+    # map to *different* SAVI-2020 neighbours than the bioisosteric probes used by
+    # SALSA.  This explores the H-bond donor/acceptor neighbourhood of the best
+    # binder without any PSICHIC cost.  Only fires when ≥ 1 mol-time + 60 s of
+    # runway remain after §MM.
+    _xx_savi_pool = state.get('savi_stream_pool')
+    _xx_best_smiles = (
+        max(all_scores, key=lambda s: all_scores.get(s, -math.inf), default=None)
+        if all_scores else None
+    )
+    _xx_best_epoch = max(
+        (v for v in all_scores.values() if math.isfinite(v)), default=-math.inf
+    )
+    if (
+        _xx_best_smiles is not None
+        and math.isfinite(_xx_best_epoch)
+        and _xx_savi_pool is not None
+        and not _xx_savi_pool.empty
+    ):
+        try:
+            _xx_blk0 = await state['subtensor'].get_current_block()
+            _xx_ep0 = ((_xx_blk0 // state['epoch_length']) + 1) * state['epoch_length']
+            _xx_t_mol = state.get('boltz_time_per_mol', 150.0)
+            if (_xx_ep0 - _xx_blk0) * 12 > _xx_t_mol + 60:
+                from rdkit.Chem.MolStandardize import rdMolStandardize as _rdMSt
+                from utils.salsa import nearest_pool_molecules, precompute_pool_fps
+
+                _xx_mol = Chem.MolFromSmiles(_xx_best_smiles)
+                if _xx_mol is not None:
+                    _xx_enumerator = _rdMSt.TautomerEnumerator()
+                    _xx_tautomers = _xx_enumerator.Enumerate(_xx_mol)
+                    _xx_seed_canon = Chem.MolToSmiles(_xx_mol)
+
+                    _xx_novel: list = []
+                    for _xx_t in _xx_tautomers:
+                        if _xx_t is None:
+                            continue
+                        _xx_t_smi = Chem.MolToSmiles(_xx_t)
+                        if _xx_t_smi == _xx_seed_canon:
+                            continue
+                        _ok, _ = is_boltz_safe_smiles(_xx_t_smi)
+                        if not _ok:
+                            continue
+                        _xx_ha = get_heavy_atom_count(_xx_t_smi)
+                        if _xx_ha is None or _xx_ha < 10 or _xx_ha > 35:
+                            continue
+                        _xx_novel.append(_xx_t_smi)
+
+                    if _xx_novel:
+                        bt.logging.info(
+                            f"§XX: {len(_xx_novel)} novel tautomers of epoch best — "
+                            f"mapping to SAVI-2020 neighbours"
+                        )
+                        _xx_valid_pool, _xx_pool_fps = precompute_pool_fps(_xx_savi_pool)
+                        _xx_seen_neighbours: set = set()
+
+                        for _xx_t_smi in _xx_novel[:6]:  # cap Boltz calls
+                            try:
+                                _xx_blk1 = await state['subtensor'].get_current_block()
+                                _xx_ep1 = ((_xx_blk1 // state['epoch_length']) + 1) * state['epoch_length']
+                                if (_xx_ep1 - _xx_blk1) * 12 < _xx_t_mol + 30:
+                                    break
+                            except Exception:
+                                pass
+
+                            _xx_near = nearest_pool_molecules(
+                                _xx_t_smi, _xx_valid_pool, top_k=1, pool_fps=_xx_pool_fps
+                            )
+                            if _xx_near.empty:
+                                continue
+                            _xx_n_row = _xx_near.iloc[0]
+                            _xx_n_smi = _xx_n_row['product_smiles']
+                            _xx_n_pname = _xx_n_row.get('product_name', '')
+                            if _xx_n_pname in _xx_seen_neighbours:
+                                continue
+                            _xx_seen_neighbours.add(_xx_n_pname)
+
+                            _xx_n_canon = get_canonical_smiles(_xx_n_smi)
+                            _xx_n_key = (_xx_n_canon, protein)
+
+                            if _xx_n_key in boltz_cache:
+                                _xx_n_score = boltz_cache[_xx_n_key]
+                            else:
+                                _xx_disk_s = _disk_cache_get(db_path, _xx_n_canon, protein)
+                                if _xx_disk_s is not None:
+                                    boltz_cache[_xx_n_key] = _xx_disk_s
+                                    _xx_n_score = _xx_disk_s
+                                else:
+                                    _xx_uid = 0
+                                    _xx_vmbu = {
+                                        _xx_uid: {"smiles": [_xx_n_smi], "names": [_xx_n_pname]}
+                                    }
+                                    _xx_sd: Dict[str, Any] = {_xx_uid: {}}
+                                    try:
+                                        await asyncio.to_thread(
+                                            wrapper.score_molecules_target,
+                                            _xx_vmbu, _xx_sd, subnet_config,
+                                            '0x' + '0' * 64,
+                                        )
+                                        _xx_n_score = wrapper.per_molecule_metric.get(
+                                            _xx_uid, {}
+                                        ).get(_xx_n_smi, -math.inf)
+                                        boltz_cache[_xx_n_key] = _xx_n_score
+                                        _disk_cache_put(
+                                            db_path, _xx_n_canon, protein, _xx_n_score,
+                                            product_name=_xx_n_pname or None,
+                                        )
+                                        if wrapper.last_inference_duration > 0:
+                                            state['boltz_time_per_mol'] = wrapper.last_inference_duration
+                                        bt.logging.info(
+                                            f"§XX: tautomer SAVI neighbour "
+                                            f"{_xx_n_pname!r} scored boltz={_xx_n_score:.4f}"
+                                        )
+                                    except Exception as _xx_be:
+                                        bt.logging.error(f"§XX Boltz error: {_xx_be}")
+                                        _xx_n_score = -math.inf
+
+                            all_scores[_xx_n_canon] = _xx_n_score
+                            if math.isfinite(_xx_n_score) and _xx_n_score > _xx_best_epoch:
+                                _xx_prev_epoch = _xx_best_epoch
+                                _xx_best_epoch = _xx_n_score
+                                if _xx_n_pname:
+                                    _xx_orig = state['candidate_product'].split(',')
+                                    state['candidate_product'] = ','.join(
+                                        [_xx_n_pname] + [n for n in _xx_orig if n != _xx_n_pname]
+                                    )
+                                    bt.logging.info(
+                                        f"§XX: new epoch best from tautomer search — "
+                                        f"{_xx_n_pname} "
+                                        f"(boltz={_xx_n_score:.4f} > prev={_xx_prev_epoch:.4f})"
+                                    )
+        except Exception as _xx_err:
+            bt.logging.warning(f"§XX tautomer search failed (non-fatal): {_xx_err}")
+
     # Merge §FF / §MM scores into all_scores before the §CC guard.
     # The §MM loop exposes boltz_cache → all_scores at the end of each complete
     # round, but if §MM exits before round 0 (time check fails immediately) or

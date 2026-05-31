@@ -28,6 +28,15 @@ not yet explored by any prior seed in this round, maximising chemical diversity 
 basin-hopping iterations.  Falls back to the plain next-best if no scaffold-novel candidate
 is available.
 
+§XX added 2026-05-31: tautomer enumeration of the epoch's best-Boltz molecule.
+After §MM converges, RDKit `TautomerEnumerator` generates canonical tautomers of the
+winning SMILES.  Each novel tautomer (same formula, different H/bond pattern) is used
+as a Tanimoto probe to find its nearest SAVI-2020 neighbour.  If time allows, those
+neighbours are scored with Boltz and the best is promoted to position 0 if it beats the
+current epoch best.  Tautomers occupy a different region of fingerprint space than the
+bioisosteric perturbations used by SALSA, exposing SAVI-2020 molecules with different
+H-bond donor/acceptor profiles.
+
 Two conditional/research items remain (§D, FBLD).
 
 ### Implemented optimisation index
@@ -78,6 +87,7 @@ Two conditional/research items remain (§D, FBLD).
 | TT | §MM max-rounds 5→10 + SAVI file-list cache + without-replacement sampling | miner.py | ✅ |
 | UU | Prior-epoch Boltz-cache seeds for SALSA | miner.py | ✅ |
 | VV | Scaffold-diverse §QQ basin-hopping in §MM | miner.py | ✅ |
+| XX | Tautomer enumeration after §MM — SAVI-2020 nearest neighbours of tautomers | miner.py | ✅ |
 | D | Binding-pocket pre-docking filter | utils/docking.py | ⏳ conditional |
 | FBLD | Fragment-Based Lead Discovery | — | ⏳ research |
 
@@ -137,6 +147,50 @@ a closely related analogue.  On epochs where SALSA converges quickly to one chem
 and initial Boltz prescoring selects scaffold-diverse candidates (§EE), §VV ensures the §QQ
 hops traverse distinct scaffolds in priority order — maximising the probability that one hop
 discovers a genuinely superior binding mode before the time guard fires.
+
+---
+
+## §XX — Tautomer Enumeration After §MM (`neurons/miner.py`)
+
+SALSA's perturbation operators (bioisosteric substitution, FG addition/removal, ring walk)
+explore chemical space by changing *heavy-atom connectivity* around the seed molecule.
+They do not change the protonation state or bond-order alternation of the core scaffold —
+keto vs. enol, imine vs. enamine, pyridine-N-oxide vs. zwitterion, etc.  These
+tautomeric forms can have substantially different H-bond donor/acceptor patterns and
+therefore different Boltz-2 affinity predictions.
+
+**Mechanism:** After §MM converges (or after the initial Boltz pass if §MM had no time
+budget), §XX:
+
+1. Calls RDKit `MolStandardize.TautomerEnumerator.Enumerate()` on the epoch's best
+   SMILES (from `all_scores`).
+2. Filters tautomers by `is_boltz_safe_smiles`, 10–35 heavy atoms (same as the main
+   pipeline), and excludes the original SMILES (canonical form).
+3. For each novel tautomer (up to 6, in generation order), finds its nearest SAVI-2020
+   neighbour via Tanimoto similarity over the `savi_stream_pool` (reusing
+   `precompute_pool_fps` + `nearest_pool_molecules` from `utils/salsa.py`).
+4. Deduplicates neighbours by product_name to avoid redundant Boltz calls.
+5. For each unseen neighbour, checks in-memory then disk cache; on miss, runs a full
+   Boltz-2 inference call (time-guarded: ≥ 1 mol-time + 30 s remaining).
+6. If any tautomer's SAVI neighbour beats the current epoch best, promotes it to
+   position 0 in `state['candidate_product']` and updates `all_scores` so the §CC
+   warm-start guard sees the true epoch maximum.
+
+**Why tautomers reach different SAVI-2020 molecules than SALSA:**
+Morgan fingerprints encode bond orders and implicit hydrogen counts.  A keto/enol
+tautomer pair produces different radius-2 circular environments and different bit
+patterns, so their Tanimoto nearest neighbours in the 10 000-molecule SAVI pool are
+different.  This is a complementary search direction: SALSA explores by atom mutation
+and size change; §XX explores by electronic-form change.
+
+**Time guard:** §XX fires only when `(epoch_blocks_remaining × 12) > boltz_time_per_mol + 60`,
+so it never pushes the miner past the epoch boundary.  Each candidate has an inner guard
+(`remaining > boltz_time_per_mol + 30`) to stop mid-pass.
+
+**Expected benefit:** On typical §MM runs that use 6–8 rounds, the tautomer probe adds
+at most 3–4 additional Boltz calls targeting a structurally distinct region. On hardware
+where §MM exhausts the budget quickly (RTX 3090, ~150 s/mol), §XX usually has no time
+and exits immediately — no regression.
 
 ---
 
@@ -202,20 +256,6 @@ separately so the disk cache benefits from future epochs.
 be zero time remaining after §MM.  Guard strictly behind a remaining-time check.
 
 Estimated effort: ~60 lines in wrapper.py + miner.py.
-
-### §XX — Tautomer Enumeration for Borderline Candidates
-
-After finding the best SAVI-2020 molecule via SALSA/§MM, use RDKit's `MolStandardize`
-tautomer enumeration to generate canonical tautomers of the winner.  For each tautomer that
-passes `is_boltz_safe_smiles` and has ≤35 HA, check the disk cache and optionally run Boltz.
-Tautomers can have different H-bond donor/acceptor profiles and logically different poses,
-potentially scoring differently under Boltz-2's affinity head.
-
-**Submission constraint:** The tautomer SMILES is unlikely to be a SAVI-2020 product name.
-Use the nearest-SAVI-2020-neighbour lookup (already used in SALSA) to find a submittable
-molecule close to the best-scoring tautomer.
-
-Estimated effort: ~40 lines in miner.py; requires `rdkit.Chem.MolStandardize`.
 
 ---
 
