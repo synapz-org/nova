@@ -1,6 +1,6 @@
 # Boltz-2 Miner Integration
 
-## Current Status (as of 2026-05-30)
+## Current Status (as of 2026-06-01)
 
 **Boltz-2 integration is complete and heavily optimised.**  The stock miner scored 0 on
 Boltz-2; this miner has been rewritten from the ground up around the scoring formula.  All
@@ -36,6 +36,14 @@ neighbours are scored with Boltz and the best is promoted to position 0 if it be
 current epoch best.  Tautomers occupy a different region of fingerprint space than the
 bioisosteric perturbations used by SALSA, exposing SAVI-2020 molecules with different
 H-bond donor/acceptor profiles.
+
+§WW added 2026-06-01: multi-seed stability estimation for the top-2 candidates.  After §XX,
+if ≥ 4 mol-times remain in the epoch, Boltz-2 is run with 2 additional seeds (42 and 123)
+on the top-2 candidates by `all_scores`.  The candidate with the best MEAN score across all
+seeds is placed at position 0.  On A100 hardware this adds at most 2 extra Boltz calls per
+epoch; on RTX 3090 the time guard fires immediately and §WW is a no-op.  Alternate-seed
+scores are not written to disk cache — the validator uses seed=68 and §CC comparisons must
+remain seed-68 consistent.
 
 Two conditional/research items remain (§D, FBLD).
 
@@ -88,6 +96,7 @@ Two conditional/research items remain (§D, FBLD).
 | UU | Prior-epoch Boltz-cache seeds for SALSA | miner.py | ✅ |
 | VV | Scaffold-diverse §QQ basin-hopping in §MM | miner.py | ✅ |
 | XX | Tautomer enumeration after §MM — SAVI-2020 nearest neighbours of tautomers | miner.py | ✅ |
+| WW | Multi-seed stability estimation for top-2 candidates | wrapper.py, miner.py | ✅ |
 | D | Binding-pocket pre-docking filter | utils/docking.py | ⏳ conditional |
 | FBLD | Fragment-Based Lead Discovery | — | ⏳ research |
 
@@ -191,6 +200,49 @@ so it never pushes the miner past the epoch boundary.  Each candidate has an inn
 at most 3–4 additional Boltz calls targeting a structurally distinct region. On hardware
 where §MM exhausts the budget quickly (RTX 3090, ~150 s/mol), §XX usually has no time
 and exits immediately — no regression.
+
+---
+
+## §WW — Multi-Seed Stability Estimation for Top-2 Candidates (`neurons/miner.py`, `boltz/wrapper.py`)
+
+Boltz-2 is a stochastic diffusion model.  The same molecule can score differently on each
+run due to random noise in the diffusion trajectory.  The validator always uses seed=68 for
+their re-run, so the miner's seed-68 score is the best predictor of the validator's result.
+However, for the submission ORDER decision (which molecule goes to position 0), a single-seed
+score is a noisy estimate.  If two candidates have scores within ~0.02 of each other, the
+seed-68 winner might actually be the weaker binder by any stable measure.
+
+**Mechanism:** After §XX (the last Boltz hill-climbing step), §WW:
+
+1. Checks remaining epoch time: requires `≥ 4 × boltz_time_per_mol + 60 s`.
+2. Identifies the top-2 candidates by `all_scores` (which includes §FF, §MM, §XX results).
+3. For each candidate, runs Boltz-2 inference with 2 additional seeds (42 and 123).
+   - Seed 68 score is already in `all_scores` — no redundant GPU call.
+   - Each extra-seed call is time-guarded (`< boltz_time_per_mol + 30 s` remaining → stop).
+4. Computes the mean score across available seeds for each candidate.
+5. If the mean changes the ordering, swaps position 0 to the higher-mean candidate.
+
+**Cache behaviour:** Extra-seed scores are intentionally NOT written to disk cache.
+The disk cache stores seed-68 scores for §CC and warm-start comparisons; writing averaged or
+alternate-seed values would create inconsistencies with future validator re-runs.
+
+**Adaptive degradation:**
+- On RTX 3090 (150 s/mol), `4 × 150 + 60 = 660 s ≈ 55 blocks` are needed.  After §MM
+  exhausts its budget, there are typically < 55 blocks left → §WW is a no-op.  Zero regression.
+- On A100 (45 s/mol), `4 × 45 + 60 = 240 s ≈ 20 blocks`.  After a typical §MM run
+  (~7 rounds × 45 s = 315 s used), the remaining ~350 s (29 blocks) is enough for a full
+  §WW pass on both candidates.
+- The inner time guard fires if the epoch ends before all 4 calls complete; partial estimates
+  (e.g., 1 extra seed per candidate) are still used for the ordering decision.
+
+**wrapper.py change:** `score_molecules_target` gains a `seed: int = 68` keyword argument,
+forwarded directly to `predict()`.  The `base_seed` and `_seed_for_record` logic are unchanged
+(they control output file paths, not inference stochasticity).
+
+**Expected benefit:** On A100 hardware, §WW runs ~2 extra Boltz calls per epoch (the inner
+time guard stops early on slow hardware).  For submission decisions within the top-2, a 3-seed
+mean estimate reduces ordering noise by `1/√3 ≈ 42%`.  This is most useful when two candidates
+are within ~0.03 boltz_score of each other — a margin that seed variance can easily flip.
 
 ---
 

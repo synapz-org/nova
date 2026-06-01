@@ -1822,6 +1822,124 @@ async def run_boltz_prescoring(state: Dict[str, Any], max_candidates: int = 5) -
         except Exception as _xx_err:
             bt.logging.warning(f"§XX tautomer search failed (non-fatal): {_xx_err}")
 
+    # §WW — Multi-seed stability estimation for top-2 candidates.
+    # Boltz-2 is a stochastic diffusion model; the same molecule can score
+    # differently across random seeds.  The validator always uses seed=68, so
+    # single-seed estimates are the ground truth for absolute scores.  However,
+    # for the submission ORDER decision (which mol goes at position 0), knowing
+    # which top-2 candidate is more STABLE across seeds is more reliable than a
+    # single noisy estimate.  After §XX, if ≥ 4 mol-times remain, run seeds 42
+    # and 123 on the top-2 candidates; put the one with the best MEAN at pos 0.
+    # Alternate-seed scores are NOT written to disk cache — the validator uses
+    # seed=68 and §CC must compare against seed-68 baselines.
+    _ww_valid_all = {s: v for s, v in all_scores.items() if math.isfinite(v)}
+    if len(_ww_valid_all) >= 2:
+        try:
+            _ww_blk = await state['subtensor'].get_current_block()
+            _ww_ep = ((_ww_blk // state['epoch_length']) + 1) * state['epoch_length']
+            _ww_remaining = (_ww_ep - _ww_blk) * 12
+            _ww_t_mol = state.get('boltz_time_per_mol', 150.0)
+            if _ww_remaining >= _ww_t_mol * 4 + 60:
+                bt.logging.info(
+                    f"§WW: {_ww_remaining:.0f}s remaining — multi-seed stability check on top-2..."
+                )
+                # Build SMILES→product_name lookup from all scored molecule pools
+                _ww_name_lookup: Dict[str, str] = {}
+                for _ww_frame in (candidates, state.get('global_candidate_pool'), state.get('savi_stream_pool')):
+                    if _ww_frame is None or _ww_frame.empty:
+                        continue
+                    if 'product_smiles' not in _ww_frame.columns or 'product_name' not in _ww_frame.columns:
+                        continue
+                    for _, _ww_r in _ww_frame.iterrows():
+                        _ww_ps = str(_ww_r.get('product_smiles', ''))
+                        _ww_pn = str(_ww_r.get('product_name', ''))
+                        if _ww_ps and _ww_pn:
+                            _ww_name_lookup.setdefault(_ww_ps, _ww_pn)
+                            _ww_can = get_canonical_smiles(_ww_ps)
+                            if _ww_can:
+                                _ww_name_lookup.setdefault(_ww_can, _ww_pn)
+
+                _ww_extra_seeds = [42, 123]
+                _ww_top2 = sorted(_ww_valid_all.items(), key=lambda kv: kv[1], reverse=True)[:2]
+                _ww_mean: Dict[str, float] = {}
+                _ww_stop_early = False
+
+                for _ww_sm, _ww_seed68_score in _ww_top2:
+                    if _ww_stop_early:
+                        break
+                    _ww_pname = (
+                        _ww_name_lookup.get(_ww_sm)
+                        or _ww_name_lookup.get(get_canonical_smiles(_ww_sm), '')
+                    )
+                    if not _ww_pname:
+                        bt.logging.debug(f"§WW: no product_name for SMILES — using seed-68 score only.")
+                        _ww_mean[_ww_sm] = _ww_seed68_score
+                        continue
+
+                    _ww_mol_scores = [_ww_seed68_score]
+                    for _ww_seed in _ww_extra_seeds:
+                        try:
+                            _ww_blk2 = await state['subtensor'].get_current_block()
+                            _ww_ep2 = ((_ww_blk2 // state['epoch_length']) + 1) * state['epoch_length']
+                            if (_ww_ep2 - _ww_blk2) * 12 < _ww_t_mol + 30:
+                                bt.logging.info("§WW: time guard fired — stopping early.")
+                                _ww_stop_early = True
+                                break
+                        except Exception:
+                            pass
+                        _ww_uid = 0
+                        _ww_vmbu = {_ww_uid: {"smiles": [_ww_sm], "names": [_ww_pname]}}
+                        _ww_sd2: Dict[str, Any] = {_ww_uid: {}}
+                        try:
+                            await asyncio.to_thread(
+                                wrapper.score_molecules_target,
+                                _ww_vmbu, _ww_sd2, subnet_config, '0x' + '0' * 64, False, _ww_seed,
+                            )
+                            _ww_s = wrapper.per_molecule_metric.get(_ww_uid, {}).get(_ww_sm, -math.inf)
+                            if math.isfinite(_ww_s):
+                                _ww_mol_scores.append(_ww_s)
+                            bt.logging.info(
+                                f"§WW: {_ww_pname} seed={_ww_seed} score={_ww_s:.4f}"
+                            )
+                        except Exception as _ww_se:
+                            bt.logging.error(f"§WW seed={_ww_seed} inference error: {_ww_se}")
+
+                    _ww_mean[_ww_sm] = sum(_ww_mol_scores) / len(_ww_mol_scores)
+                    bt.logging.info(
+                        f"§WW: {_ww_pname} mean={_ww_mean[_ww_sm]:.4f} "
+                        f"({len(_ww_mol_scores)} seed(s): {[f'{s:.4f}' for s in _ww_mol_scores]})"
+                    )
+
+                # Reorder pos-0 based on mean scores if top-2 both have estimates
+                if len(_ww_mean) >= 2:
+                    _ww_best_sm = max(_ww_mean, key=_ww_mean.get)
+                    _ww_best_pname = (
+                        _ww_name_lookup.get(_ww_best_sm)
+                        or _ww_name_lookup.get(get_canonical_smiles(_ww_best_sm), '')
+                    )
+                    if _ww_best_pname:
+                        _ww_orig = (state.get('candidate_product') or '').split(',')
+                        if _ww_orig and _ww_orig[0] != _ww_best_pname:
+                            state['candidate_product'] = ','.join(
+                                [_ww_best_pname] + [n for n in _ww_orig if n != _ww_best_pname]
+                            )
+                            _ww_prev = _ww_orig[0] if _ww_orig else '?'
+                            _ww_prev_mean = next(
+                                (v for s, v in _ww_mean.items() if s != _ww_best_sm), -math.inf
+                            )
+                            bt.logging.info(
+                                f"§WW: pos-0 swapped → {_ww_best_pname} "
+                                f"(mean={_ww_mean[_ww_best_sm]:.4f}) over "
+                                f"{_ww_prev} (mean={_ww_prev_mean:.4f})"
+                            )
+                        else:
+                            bt.logging.info(
+                                f"§WW: pos-0 confirmed ({_ww_best_pname}); "
+                                f"mean-score agrees with seed-68 ordering."
+                            )
+        except Exception as _ww_err:
+            bt.logging.warning(f"§WW multi-seed check failed (non-fatal): {_ww_err}")
+
     # Merge §FF / §MM scores into all_scores before the §CC guard.
     # The §MM loop exposes boltz_cache → all_scores at the end of each complete
     # round, but if §MM exits before round 0 (time check fails immediately) or

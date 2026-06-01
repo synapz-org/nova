@@ -152,7 +152,7 @@ properties:
         
         return yaml_content
 
-    def score_molecules_target(self, valid_molecules_by_uid: dict, score_dict: dict, subnet_config: dict, final_block_hash: str, fast: bool = False) -> None:
+    def score_molecules_target(self, valid_molecules_by_uid: dict, score_dict: dict, subnet_config: dict, final_block_hash: str, fast: bool = False, seed: int = 68) -> None:
         # Preprocess data
         self.subnet_config = subnet_config
 
@@ -178,7 +178,7 @@ properties:
                 sampling_steps_affinity = _s_steps_aff,
                 diffusion_samples_affinity = _d_samp_aff,
                 output_format = self.config['output_format'],
-                seed = 68,
+                seed = seed,
                 affinity_mw_correction = self.config['affinity_mw_correction'],
                 override = self.config['override'],
                 no_kernels = self.config.get('no_kernels', False),
