@@ -44,6 +44,7 @@ from utils.msa import ensure_msa
 from utils.salsa import run_salsa_search
 from utils.genetic import run_gradient_ga
 from utils.chembl import get_chembl_seeds
+from utils.surrogate import fit_surrogate, rank_pool_by_surrogate
 from PSICHIC.wrapper import PsichicWrapper
 from boltz.wrapper import BoltzWrapper
 from btdr import QuicknetBittensorDrandTimelock
@@ -342,7 +343,7 @@ _SAVI_FILE_CACHE: dict = {}   # repo_url -> sorted list of CSV filenames (popula
 _SAVI_SEEN_FILES: dict = {}   # repo_url -> set of files used this epoch (reset externally)
 
 
-def stream_random_chunk_from_dataset(dataset_repo: str, chunk_size: int) -> Any:
+def stream_random_chunk_from_dataset(dataset_repo: str, chunk_size: int, rxn_bias: Optional[str] = None) -> Any:
     """
     Streams a random chunk from the specified Hugging Face dataset repo.
 
@@ -371,7 +372,15 @@ def stream_random_chunk_from_dataset(dataset_repo: str, chunk_size: int) -> Any:
     if not available:
         seen.clear()
         available = files
-    random_file = random.choice(available)
+    # §YY: 2× weight for files whose path contains the winning reaction class.
+    # Biases the sampling toward the chemical family that produced the best
+    # Boltz-validated molecule in prior epochs.  Falls back to uniform when
+    # rxn_bias is None (first epoch) or no file matches the class string.
+    if rxn_bias:
+        _yy_weights = [2.0 if rxn_bias in f else 1.0 for f in available]
+        random_file = random.choices(available, weights=_yy_weights, k=1)[0]
+    else:
+        random_file = random.choice(available)
     seen.add(random_file)
 
     dataset_dict = load_dataset(
@@ -434,7 +443,8 @@ async def run_psichic_model_loop(state: Dict[str, Any]) -> None:
             # spinning on an empty iterator.
             dataset_iter = stream_random_chunk_from_dataset(
                 dataset_repo=state['hugging_face_dataset_repo'],
-                chunk_size=state['chunk_size']
+                chunk_size=state['chunk_size'],
+                rxn_bias=state.get('best_boltz_rxn_class'),
             )
             for chunk in dataset_iter:
                 if state['shutdown_event'].is_set():
@@ -611,6 +621,26 @@ async def run_psichic_model_loop(state: Dict[str, Any]) -> None:
                         and not state['global_candidate_pool'].empty
                     ):
                         state['salsa_run_this_epoch'] = True
+
+                        # §ZZ: Re-rank global_candidate_pool by mini-surrogate before
+                        # selecting SALSA seeds.  When ≥ 40 Boltz scores are cached for
+                        # this protein (typically epoch 3+), the Ridge surrogate on 20
+                        # RDKit descriptors re-orders candidates with a Boltz-calibrated
+                        # signal so SALSA explores the most promising chemical region
+                        # first.  Falls back silently to PSICHIC ranking on cache miss.
+                        try:
+                            _zz_seed_model = fit_surrogate(
+                                state.get('boltz_cache_db', BOLTZ_CACHE_DB),
+                                state['config'].weekly_target,
+                            )
+                            if _zz_seed_model is not None and not state['global_candidate_pool'].empty:
+                                state['global_candidate_pool'] = rank_pool_by_surrogate(
+                                    state['global_candidate_pool'], _zz_seed_model
+                                )
+                                bt.logging.info("[ZZ] SALSA seeds re-ranked by surrogate.")
+                        except Exception as _zz_s_err:
+                            bt.logging.debug(f"[ZZ] SALSA seed re-rank skipped: {_zz_s_err}")
+
                         # Multi-seed SALSA: run from up to top-3 candidates so we
                         # explore three distinct chemical neighbourhoods in one pass.
                         # Runtime: ~3 x 180 ms = ~540 ms CPU -- negligible vs Boltz.
@@ -1089,6 +1119,24 @@ async def run_boltz_prescoring(state: Dict[str, Any], max_candidates: int = 5) -
     candidates = candidates.head(max_candidates * 3).copy()
     safe_mask = candidates['product_smiles'].apply(lambda s: is_boltz_safe_smiles(s)[0])
     candidates = candidates[safe_mask].reset_index(drop=True)
+
+    # §ZZ: Re-rank Boltz candidates by mini-surrogate when ≥ 40 scores are cached.
+    # Ridge regression on 20 RDKit descriptors gives Boltz-calibrated ordering so
+    # the scaffold diversity filter preferentially selects molecules whose descriptor
+    # profile correlates with high Boltz scores for this specific protein.
+    # Fitting takes ~30 ms (40 points × 20 features) — negligible vs inference.
+    # Falls back silently to PSICHIC ordering when the cache has < 40 entries.
+    if not candidates.empty:
+        try:
+            _zz_model = fit_surrogate(db_path, protein)
+            if _zz_model is not None:
+                candidates = rank_pool_by_surrogate(candidates, _zz_model)
+                bt.logging.info(
+                    f"[ZZ] Pre-Boltz candidates re-ranked by surrogate "
+                    f"({len(candidates)} entries, target={protein})."
+                )
+        except Exception as _zz_err:
+            bt.logging.debug(f"[ZZ] Candidate surrogate re-rank skipped: {_zz_err}")
 
     if candidates.empty:
         bt.logging.warning("Boltz-2 pre-scoring: no Boltz-safe candidates, keeping PSICHIC ranking.")
@@ -2033,6 +2081,27 @@ async def run_boltz_prescoring(state: Dict[str, Any], max_candidates: int = 5) -
     except Exception as _kk_err:
         bt.logging.warning(f"[KK] Early submission failed (non-fatal): {_kk_err}")
 
+    # §YY: Track the winning molecule's reaction class for biasing next-epoch
+    # SAVI-2020 streaming.  The product_name prefix (e.g. "rxn:5") identifies
+    # the SAVI-2020 reaction template that produced the best Boltz-validated
+    # molecule.  Storing it in state lets stream_random_chunk_from_dataset
+    # apply a 2× weight to CSV files from that reaction class, increasing the
+    # probability of sampling structurally similar candidates on subsequent
+    # epochs without excluding other classes.  Persists across epoch boundaries
+    # (not reset in the epoch-reset block) so bias accumulates over the session.
+    try:
+        _yy_pname = (state.get('candidate_product') or '').split(',')[0].strip()
+        if _yy_pname and '/' in _yy_pname:
+            _yy_rxn = _yy_pname.split('/')[0]
+            if _yy_rxn.startswith('rxn'):
+                state['best_boltz_rxn_class'] = _yy_rxn
+                bt.logging.info(
+                    f"[YY] Winning reaction class: {_yy_rxn!r} "
+                    f"— SAVI streaming biased toward this class next epoch."
+                )
+    except Exception as _yy_err:
+        bt.logging.debug(f"[YY] rxn_class extraction failed (non-fatal): {_yy_err}")
+
 
 # ----------------------------------------------------------------------------
 # 6. MAIN MINING LOOP
@@ -2085,6 +2154,7 @@ async def run_miner(config: argparse.Namespace) -> None:
         'salsa_run_this_epoch': False,   # prevent duplicate SALSA runs per epoch
         'ga_run_this_epoch': False,      # prevent duplicate GradientGA runs per epoch
         'chembl_seeds': [],              # §SS: ChEMBL known actives, fetched at startup
+        'best_boltz_rxn_class': None,    # §YY: winning rxn class for SAVI streaming bias (persists across epochs)
         'best_score': float('-inf'),
         'boltz_prescored': False,
         'last_submitted_product': None,

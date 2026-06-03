@@ -16,3 +16,4 @@ from .salsa import run_salsa_search, generate_perturbations, nearest_pool_molecu
 from .genetic import run_gradient_ga, brics_crossover, tournament_select
 from .msa import ensure_msa, fetch_msa, msa_exists
 from .chembl import get_chembl_seeds
+from .surrogate import fit_surrogate, rank_pool_by_surrogate

@@ -1,6 +1,6 @@
 # Boltz-2 Miner Integration
 
-## Current Status (as of 2026-06-01)
+## Current Status (as of 2026-06-03)
 
 **Boltz-2 integration is complete and heavily optimised.**  The stock miner scored 0 on
 Boltz-2; this miner has been rewritten from the ground up around the scoring formula.  All
@@ -44,6 +44,12 @@ seeds is placed at position 0.  On A100 hardware this adds at most 2 extra Boltz
 epoch; on RTX 3090 the time guard fires immediately and §WW is a no-op.  Alternate-seed
 scores are not written to disk cache — the validator uses seed=68 and §CC comparisons must
 remain seed-68 consistent.
+
+§YY and §ZZ added 2026-06-03: two data-driven optimisations that activate on epoch 3+ when
+the disk cache has accumulated enough Boltz scores.  §YY biases SAVI-2020 streaming toward
+the reaction class of the current best molecule (2× weight, soft bias).  §ZZ fits a Ridge
+regression on 20 RDKit descriptors to re-rank SALSA seeds and Boltz pre-scoring candidates
+with a protein-specific Boltz-calibrated signal, complementing the general PSICHIC ranking.
 
 Two conditional/research items remain (§D, FBLD).
 
@@ -99,8 +105,8 @@ Two conditional/research items remain (§D, FBLD).
 | WW | Multi-seed stability estimation for top-2 candidates | wrapper.py, miner.py | ✅ |
 | D | Binding-pocket pre-docking filter | utils/docking.py | ⏳ conditional |
 | FBLD | Fragment-Based Lead Discovery | — | ⏳ research |
-| YY | Reaction-class-biased SAVI-2020 streaming | miner.py | ⏳ planned |
-| ZZ | Mini-surrogate Boltz predictor from disk cache | utils/surrogate.py, miner.py | ⏳ planned |
+| YY | Reaction-class-biased SAVI-2020 streaming | miner.py | ✅ |
+| ZZ | Mini-surrogate Boltz predictor from disk cache | utils/surrogate.py, miner.py | ✅ |
 
 ---
 
@@ -289,7 +295,7 @@ would let SALSA find high-quality nearest-neighbours across a 500× larger searc
 Estimated effort: High (several GB download, index construction, FAISS/pynndescent
 integration).  Not yet attempted.
 
-### §YY — Reaction-Class-Biased SAVI-2020 Streaming
+### §YY — Reaction-Class-Biased SAVI-2020 Streaming ✅ Implemented
 
 SAVI-2020 product names encode the reaction template that produced each molecule
 (`rxn:5/fragment` = amide coupling, etc.).  When the best Boltz-validated molecule comes
@@ -300,57 +306,69 @@ each streaming cycle explores more of the relevant chemical space rather than sa
 uniformly from all 87 SAVI reaction classes.
 
 **Algorithm:**
-1. Parse reaction class from the winning molecule's `product_name`: `rxn_class = pname.split('/')[0]`
-2. When sampling the next CSV file, apply weighted sampling: 2× weight for files whose path
-   matches `rxn_class`, 1× for all others.  All files remain reachable (no exclusion).
-3. Store `state['best_boltz_rxn_class']` in `run_boltz_prescoring` when a winner is found.
-4. Fall back to uniform sampling when the class is unknown (first epoch, empty cache).
+1. At the end of `run_boltz_prescoring` (after §KK), parse the winning product_name:
+   `rxn_class = pname.split('/')[0]` (e.g. `"rxn:5"`).
+2. Store in `state['best_boltz_rxn_class']` — persists across epoch boundaries (not reset
+   on epoch rollover) so bias accumulates within a session on the same weekly target.
+3. `stream_random_chunk_from_dataset` gains an optional `rxn_bias` parameter.  When set,
+   `random.choices(available, weights=[2.0 if rxn_bias in f else 1.0 ...])` selects files
+   with 2× probability for those containing the reaction class string.  All files remain
+   reachable — this is a soft bias, not an exclusion.
+4. Falls back to uniform `random.choice` when `rxn_bias` is `None` (first epoch or no
+   prior winner).
 
-**Risk:** If the winning reaction class was a lucky one-off rather than systematically better,
-the 2× bias causes the miner to see slightly fewer molecules from other classes.  Using a
-modest weight (not exclusive sampling) bounds this cost.
+**Files changed:**
+- `neurons/miner.py` — `stream_random_chunk_from_dataset` gains `rxn_bias` kwarg; call
+  site in `run_psichic_model_loop` passes `state.get('best_boltz_rxn_class')`; `run_boltz_prescoring`
+  appends §YY extraction block after §KK; `'best_boltz_rxn_class': None` added to state.
 
-**Estimated effort:** ~50 lines in `neurons/miner.py`.  Status: ⏳ planned.
+**Risk:** If the winning reaction class was a lucky one-off rather than systematically
+better, the 2× bias causes the miner to see slightly fewer molecules from other classes.
+Using a modest weight (not exclusive sampling) bounds this cost.  On the first epoch the
+bias is always `None` — zero regression vs. prior behaviour.
 
 ---
 
-### §ZZ — Mini-Surrogate Boltz Predictor from Disk Cache
+### §ZZ — Mini-Surrogate Boltz Predictor from Disk Cache ✅ Implemented
 
 PSICHIC scores molecules with a general affinity model; its correlation with Boltz-2 for
 any specific protein is moderate (~0.3–0.5).  After accumulating ≥ 40 Boltz scores in the
-disk cache, it is possible to fit a lightweight Ridge regression on ~20 RDKit molecular
-descriptors (MW, logP, TPSA, ring count, H-bond counts, rotatable bonds).  This protein-
-specific surrogate re-ranks the 10,000-molecule SAVI stream pool before SALSA fires,
-replacing the PSICHIC-only ranking with a Boltz-calibrated one.
+disk cache, a lightweight Ridge regression on 20 RDKit molecular descriptors provides a
+protein-specific surrogate that re-ranks candidates with a Boltz-calibrated signal.
 
 **When it activates:**
-- Disk cache has ≥ 40 entries for the current protein (typically epoch 3+ of a weekly target)
-- Fitted once per epoch at the SALSA trigger point (~30 ms for 40 points / 20 features)
-- Falls back silently to PSICHIC ranking when the cache is too small
+- Disk cache has ≥ 40 entries for the current protein (typically epoch 3+ of a weekly target).
+- Fitted twice per epoch — once at the SALSA trigger point (to re-rank SALSA seeds) and
+  once at the Boltz pre-scoring trigger (to re-rank candidates before scaffold diversity
+  selection).  Fitting takes ~30 ms per call (40 pts × 20 features).
+- Falls back silently to PSICHIC ordering when the cache has < 40 entries.
 
-**Implementation (`utils/surrogate.py`):**
-```python
-def fit_surrogate(db_path, protein):
-    rows = _disk_cache_get_all(db_path, protein)   # returns [(smiles, score)]
-    if len(rows) < 40:
-        return None
-    X = [rdkit_descriptor_vector(smiles) for smiles, _ in rows]
-    y = [score for _, score in rows]
-    return Ridge(alpha=1.0).fit(X, y)
+**20-feature descriptor vector** (`utils/surrogate._descriptor_vector`):
+MolWt, MolLogP, TPSA, NumHDonors, NumHAcceptors, NumRotatableBonds, RingCount,
+NumAromaticRings, NumAliphaticRings, FractionCSP3, NumHeteroatoms, HeavyAtomCount,
+NumSaturatedRings, NumAliphaticCarbocycles, NumAromaticCarbocycles, BertzCT, MolMR,
+LabuteASA, NumStereocenters, NumUnspecifiedAtomStereoCenters.
 
-def rank_pool_by_surrogate(pool_df, model):
-    X = [rdkit_descriptor_vector(s) for s in pool_df['product_smiles']]
-    pool_df['surrogate_score'] = model.predict(X)
-    return pool_df.sort_values('surrogate_score', ascending=False)
-```
+**Hook points in `neurons/miner.py`:**
 
-**Risk:** Under 40 training points, Ridge regression can overfit and may rank the pool
-worse than PSICHIC.  The ≥ 40-entry threshold and fallback guard contain the downside.
-Empirical validation: compare mean Boltz score of the top-5 SALSA hits under PSICHIC vs.
-surrogate ranking over 5 epochs.
+1. **SALSA trigger** — right after `salsa_run_this_epoch = True`, calls `fit_surrogate` and
+   `rank_pool_by_surrogate(global_candidate_pool, model)` so the top-3 SALSA seeds are
+   Boltz-calibrated rather than purely PSICHIC-ranked.
 
-**Estimated effort:** ~120 lines in `utils/surrogate.py` + 20 lines in `neurons/miner.py`.
-Status: ⏳ planned.
+2. **`run_boltz_prescoring`** — after Boltz-safe filtering, calls `fit_surrogate` and
+   `rank_pool_by_surrogate(candidates, model)` so the scaffold diversity filter receives
+   surrogate-ordered candidates, preferentially selecting molecules whose descriptor profile
+   correlates with high Boltz scores for this protein.
+
+**Files changed:**
+- `utils/surrogate.py` — new module: `_descriptor_vector`, `fit_surrogate`, `rank_pool_by_surrogate`
+- `utils/__init__.py` — exports `fit_surrogate`, `rank_pool_by_surrogate`
+- `neurons/miner.py` — imports and two hook points (SALSA trigger + `run_boltz_prescoring`)
+
+**Risk:** Under 40 training points Ridge regression can overfit and may rank the pool
+worse than PSICHIC.  The ≥ 40-entry threshold and fallback guard (returns original
+DataFrame on any exception) contain the downside.  On first/second epochs the surrogate
+is always skipped — zero regression vs. prior behaviour.
 
 ---
 
