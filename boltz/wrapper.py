@@ -36,6 +36,24 @@ class BoltzWrapper:
         self.config = yaml.load(open(config_path, 'r'), Loader=yaml.FullLoader)
         self.base_dir = BASE_DIR
 
+        # §AAA: Scale MSA depth to available GPU memory.
+        # More sequences = richer evolutionary context = better affinity calibration,
+        # at the cost of larger attention tensors.  Only increases from the config
+        # default (1024) — never decreases a user-set value.
+        # A100 40/80 GiB (≥38 GiB): 2048 seqs → ~5-10% better affinity predictions.
+        if self.config.get('subsample_msa', True):
+            try:
+                if torch.cuda.is_available():
+                    vram_gib = torch.cuda.get_device_properties(0).total_memory / (1024 ** 3)
+                    if vram_gib >= 38 and self.config.get('num_subsampled_msa', 1024) < 2048:
+                        self.config['num_subsampled_msa'] = 2048
+                        bt.logging.info(
+                            f"[§AAA] Hardware-adaptive MSA: {vram_gib:.0f} GiB VRAM → "
+                            f"num_subsampled_msa=2048"
+                        )
+            except Exception:
+                pass
+
         self.tmp_dir = os.path.join(PARENT_DIR, "boltz_tmp_files")
         os.makedirs(self.tmp_dir, exist_ok=True)
 

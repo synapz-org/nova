@@ -797,10 +797,67 @@ async def run_psichic_model_loop(state: Dict[str, Any]) -> None:
                                     f"GradientGA: global_candidate_pool now has "
                                     f"{len(state['global_candidate_pool'])} entries."
                                 )
+                                # §BBB: store best GA hit for post-GA SALSA pass.
+                                state['best_ga_smiles'] = ga_hits.iloc[0]['product_smiles']
                             else:
                                 bt.logging.info("GradientGA: no hits found.")
                         except Exception as _ga_err:
                             bt.logging.error(f"GradientGA error: {_ga_err}")
+
+                    # §BBB: Post-GA SALSA — one SALSA pass from the best GA hit, exploring
+                    # its chemical neighbourhood before Boltz fires.  GA often discovers
+                    # molecules in a different region of chemical space than PSICHIC/ChEMBL
+                    # seeds; running SALSA from the GA winner maps its surroundings onto
+                    # SAVI-2020 products that Boltz can then score alongside the PSICHIC
+                    # candidates.  Fires once per epoch, immediately after the GA block.
+                    if (
+                        not state.get('bbb_run_this_epoch', False)
+                        and state.get('best_ga_smiles')
+                        and blocks_until_epoch > boltz_trigger_ga + 5
+                        and state.get('savi_stream_pool') is not None
+                        and not state['savi_stream_pool'].empty
+                    ):
+                        state['bbb_run_this_epoch'] = True
+                        _bbb_pool = state['savi_stream_pool']
+                        bt.logging.info(
+                            f"§BBB: post-GA SALSA from GA winner "
+                            f"({blocks_until_epoch} blocks remaining)..."
+                        )
+                        try:
+                            _bbb_hits = await asyncio.to_thread(
+                                run_salsa_search,
+                                state['best_ga_smiles'],
+                                _bbb_pool,
+                                2,   # rounds — neighbourhood exploration
+                                200, # n_perturb — full operator coverage
+                                3,   # top_k
+                            )
+                            if not _bbb_hits.empty:
+                                bt.logging.info(
+                                    f"§BBB: {len(_bbb_hits)} post-GA SALSA hits — "
+                                    f"merging into global_candidate_pool."
+                                )
+                                _bbb_combined = pd.concat(
+                                    [state['global_candidate_pool'], _bbb_hits],
+                                    ignore_index=True,
+                                )
+                                _bbb_combined.drop_duplicates(
+                                    subset=['product_name'], inplace=True
+                                )
+                                _bbb_combined.sort_values(
+                                    'combined_score', ascending=False, inplace=True
+                                )
+                                state['global_candidate_pool'] = (
+                                    _bbb_combined.head(20).reset_index(drop=True)
+                                )
+                                bt.logging.info(
+                                    f"§BBB: global_candidate_pool now has "
+                                    f"{len(state['global_candidate_pool'])} entries."
+                                )
+                            else:
+                                bt.logging.info("§BBB: no post-GA SALSA hits.")
+                        except Exception as _bbb_err:
+                            bt.logging.error(f"§BBB post-GA SALSA error: {_bbb_err}")
 
                     # Trigger Boltz-2 pre-scoring when approaching epoch end.
                     # Threshold starts at 100 blocks (20 min); after the first run it is
@@ -2153,6 +2210,8 @@ async def run_miner(config: argparse.Namespace) -> None:
         'savi_stream_pool': None,        # all PSICHIC-scored molecules this epoch (capped at 10000)
         'salsa_run_this_epoch': False,   # prevent duplicate SALSA runs per epoch
         'ga_run_this_epoch': False,      # prevent duplicate GradientGA runs per epoch
+        'bbb_run_this_epoch': False,     # §BBB: prevent duplicate post-GA SALSA runs per epoch
+        'best_ga_smiles': None,          # §BBB: best SMILES found by GradientGA this epoch
         'chembl_seeds': [],              # §SS: ChEMBL known actives, fetched at startup
         'best_boltz_rxn_class': None,    # §YY: winning rxn class for SAVI streaming bias (persists across epochs)
         'best_score': float('-inf'),
@@ -2334,6 +2393,8 @@ async def run_miner(config: argparse.Namespace) -> None:
                 state['savi_stream_pool'] = None
                 state['salsa_run_this_epoch'] = False
                 state['ga_run_this_epoch'] = False
+                state['bbb_run_this_epoch'] = False
+                state['best_ga_smiles'] = None
                 state['best_score'] = float('-inf')
                 state['boltz_prescored'] = False
                 state['last_submitted_product'] = None

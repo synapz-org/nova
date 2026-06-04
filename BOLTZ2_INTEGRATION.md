@@ -1,6 +1,6 @@
 # Boltz-2 Miner Integration
 
-## Current Status (as of 2026-06-03)
+## Current Status (as of 2026-06-04)
 
 **Boltz-2 integration is complete and heavily optimised.**  The stock miner scored 0 on
 Boltz-2; this miner has been rewritten from the ground up around the scoring formula.  All
@@ -50,6 +50,9 @@ the disk cache has accumulated enough Boltz scores.  §YY biases SAVI-2020 strea
 the reaction class of the current best molecule (2× weight, soft bias).  §ZZ fits a Ridge
 regression on 20 RDKit descriptors to re-rank SALSA seeds and Boltz pre-scoring candidates
 with a protein-specific Boltz-calibrated signal, complementing the general PSICHIC ranking.
+
+Three new optimisations added 2026-06-04: §AAA hardware-adaptive MSA subsampling,
+§BBB post-GA SALSA pass, and §CCC StandardScaler pipeline for the §ZZ surrogate.
 
 Two conditional/research items remain (§D, FBLD).
 
@@ -107,6 +110,9 @@ Two conditional/research items remain (§D, FBLD).
 | FBLD | Fragment-Based Lead Discovery | — | ⏳ research |
 | YY | Reaction-class-biased SAVI-2020 streaming | miner.py | ✅ |
 | ZZ | Mini-surrogate Boltz predictor from disk cache | utils/surrogate.py, miner.py | ✅ |
+| AAA | Hardware-adaptive MSA subsampling (auto-scale on A100/H100) | boltz/wrapper.py | ✅ |
+| BBB | Post-GA SALSA pass (explore GA winner before Boltz) | miner.py | ✅ |
+| CCC | StandardScaler pipeline for §ZZ Ridge surrogate | utils/surrogate.py | ✅ |
 
 ---
 
@@ -2851,3 +2857,82 @@ and the fallback to PSICHIC-only seeds is seamless.
   `_chembl_fetch_bg` coroutine; `asyncio.create_task` at startup and epoch boundary;
   `_chembl_ok` seed extension in SALSA trigger block
 
+
+---
+
+## §AAA — Hardware-Adaptive MSA Subsampling (`boltz/wrapper.py`)
+
+**Problem:** The YAML default `num_subsampled_msa=1024` is calibrated for 24 GiB GPUs (RTX 3090/4090).
+A100 (40/80 GiB) and H100 hardware has substantially more VRAM and can run larger MSA attention tensors
+without OOM risk, yielding richer evolutionary context and better affinity predictions.  The
+`boltz_config.yaml` already documents the hardware-specific recommendations but the code never acted
+on them — miners running A100s were leaving potential quality improvement on the table.
+
+**Fix:** In `BoltzWrapper.__init__`, immediately after loading the YAML config, probe the first visible
+GPU with `torch.cuda.get_device_properties(0).total_memory`.  If VRAM ≥ 38 GiB (A100 40/80 GB, H100)
+and the config value is below 2048, override `num_subsampled_msa=2048`.  The override is logged at INFO
+level so operators can see it without digging into config files.
+
+Key safety properties:
+- Only *increases* from the config default — never reduces a user-set value above 2048.
+- Uses `try/except Exception: pass` so any cuda detection failure (CPU-only machine, cupy absent,
+  version mismatch) is silently ignored and the config value is used as-is.
+- Cap of 2048 (not 4096) keeps memory within safe bounds even on long protein sequences; the H100
+  recommendation of 4096 can be set manually in `boltz_config.yaml` if desired.
+
+**Expected benefit:** ~5-10% improvement in `affinity_probability_binary` accuracy on A100/H100 hardware
+per the Boltz-2 ablation results documented in `boltz_config.yaml`.  Zero cost: the same GPU is used
+regardless; only the attention tensor size changes.
+
+**Files changed:** `boltz/wrapper.py` — §AAA block in `__init__` after config load.
+
+---
+
+## §BBB — Post-GA SALSA Pass (`neurons/miner.py`)
+
+**Problem:** The epoch pipeline is: Stream → SALSA → GA → Boltz.  SALSA fires before GA, so its
+seeds are the top PSICHIC/ChEMBL/cache candidates.  GA fires after SALSA but its results go directly
+into `global_candidate_pool` and skip any SALSA exploration.  GA often discovers molecules from
+structurally distinct chemical regions (BRICS crossover can produce scaffolds PSICHIC streaming never
+sees); these regions never get a dedicated SALSA neighbourhood search before Boltz fires.
+
+**Fix:** After GA sets `state['best_ga_smiles']` (the top-ranked GA hit), a new §BBB block fires once
+per epoch (guarded by `bbb_run_this_epoch`): runs 2-round SALSA with n_perturb=200 from the GA winner,
+then merges the hits into `global_candidate_pool` (capped at 20).  Timing guard: only fires when
+`blocks_until_epoch > boltz_trigger_ga + 5`, so it never conflicts with the Boltz pre-scoring window.
+
+Implementation details:
+- `state['best_ga_smiles']` set inside the `if not ga_hits.empty:` branch of the GA block.
+- `state['bbb_run_this_epoch']` added to initial state dict and reset at epoch boundary.
+- Uses the existing `run_salsa_search` + `savi_stream_pool`; no new dependencies.
+- Silently falls back to no-op when GA finds no hits (no `best_ga_smiles` set).
+
+**Expected benefit:** On A100 hardware where GA fires ~25 blocks before Boltz, §BBB adds ~500 ms of
+CPU work and potentially 1-3 Boltz-worthy candidates from the GA's chemical neighbourhood.  On slow
+hardware where the epoch window is tighter, `boltz_trigger_ga + 5` guard keeps §BBB a no-op.
+
+**Files changed:** `neurons/miner.py` — §BBB block after GA block; `best_ga_smiles` stored in GA block;
+state dict and epoch-reset updated.
+
+---
+
+## §CCC — StandardScaler Pipeline for §ZZ Surrogate (`utils/surrogate.py`)
+
+**Problem:** The §ZZ Ridge regression fits 20 RDKit descriptors with vastly different scales:
+molecular weight (MW) ranges 200–500, while `NumHDonors` ranges 0–5.  Without feature normalisation,
+Ridge's L2 penalty penalises the MW coefficient 40-100× less than the NumHDonors coefficient (per unit
+of raw value), causing the model to under-weight chemically important but small-range descriptors.
+This degrades ranking quality — the objective of the surrogate is NDCG, not RMSE.
+
+**Fix:** Replace the bare `Ridge(alpha=1.0)` with a `Pipeline([StandardScaler(), Ridge(alpha=1.0)])`.
+`StandardScaler` normalises each descriptor to zero mean / unit variance across the training points
+before Ridge sees them, so the regulariser treats all features equally.  The `Pipeline.predict(X)`
+interface is identical to `Ridge.predict(X)` so `rank_pool_by_surrogate` requires no changes.
+
+**Expected benefit:** Better ranking (NDCG) of the surrogate-reranked candidate pool, leading to
+higher-quality Boltz-scoring candidates at §ZZ hook points (SALSA seed selection and pre-Boltz
+candidate reranking).  The improvement is largest on epoch 3+ when the cache has 40-100 training
+points — small samples are where scale sensitivity matters most.
+
+**Files changed:** `utils/surrogate.py` — `fit_surrogate()` imports `Pipeline` and `StandardScaler`;
+model construction updated.

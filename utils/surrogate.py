@@ -67,15 +67,21 @@ def fit_surrogate(db_path: str, protein: str, min_points: int = 40):
     Fit a Ridge regression surrogate on Boltz-2 scores from the disk cache.
 
     Reads all (smiles, score) pairs for *protein* from the SQLite cache and
-    fits a Ridge(alpha=1.0) on the 20-feature descriptor vectors.
+    fits a StandardScaler→Ridge(alpha=1.0) pipeline on the 20-feature descriptor
+    vectors.  The scaler normalises each descriptor to zero mean / unit variance
+    before regularisation so that Ridge penalises all features equally regardless
+    of their absolute range (e.g. MW 200-500 vs NumHDonors 0-5).  This is
+    §CCC: StandardScaler pipeline.
 
-    Returns the fitted model, or None if:
+    Returns the fitted pipeline, or None if:
     - sklearn is unavailable
     - fewer than *min_points* valid training examples exist in the cache
     - fitting itself raises an exception
     """
     try:
         from sklearn.linear_model import Ridge
+        from sklearn.pipeline import Pipeline
+        from sklearn.preprocessing import StandardScaler
     except ImportError:
         return None
 
@@ -102,7 +108,10 @@ def fit_surrogate(db_path: str, protein: str, min_points: int = 40):
         return None
 
     try:
-        model = Ridge(alpha=1.0)
+        model = Pipeline([
+            ('scaler', StandardScaler()),
+            ('ridge', Ridge(alpha=1.0)),
+        ])
         model.fit(X, y)
         return model
     except Exception:
