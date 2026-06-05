@@ -1,16 +1,23 @@
 """
 §ZZ — Mini-Surrogate Boltz Predictor from Disk Cache
 
-Fits a lightweight Ridge regression on ~20 RDKit molecular descriptors using
-Boltz scores stored in the persistent disk cache.  When ≥ 40 data points are
-available for the current weekly target (typically epoch 3+), the surrogate
-re-ranks candidate molecules with a Boltz-calibrated signal, complementing the
-general PSICHIC ranking.
+Fits a lightweight Ridge regression on ~84 features (20 physicochemical RDKit
+descriptors + 64-bit Morgan fingerprint) using Boltz scores stored in the
+persistent disk cache.  When ≥ 40 data points are available for the current
+weekly target (typically epoch 3+), the surrogate re-ranks candidate molecules
+with a Boltz-calibrated signal, complementing the general PSICHIC ranking.
 
 Key design decisions:
 - Ridge regression (alpha=1.0) prevents overfitting under sparse data.
-- 20-feature descriptor vector covers MW, logP, TPSA, H-bond counts, ring
-  counts, and stereo information — all known correlates of binding affinity.
+- 20-feature physicochemical descriptor vector covers MW, logP, TPSA, H-bond
+  counts, ring counts, and stereo information — known correlates of binding.
+- §DDD: 64-bit folded Morgan fingerprint (radius=2) appended to the physicochemical
+  vector.  The low bit-count reduces sparsity vs. standard 1024-bit FPs, keeping
+  the feature:sample ratio manageable at 40–100 training points.  StandardScaler
+  normalises each bit to zero-mean/unit-variance before Ridge regularisation, so
+  the penalty is applied equally across physicochemical and structural features.
+  This lets the surrogate learn scaffold-level patterns ("molecules with this
+  ring system bind well") that physicochemical features alone cannot capture.
 - Falls back silently to PSICHIC ordering when the cache has < 40 entries.
 - rank_pool_by_surrogate drops the temporary 'surrogate_score' column before
   returning so the pool schema remains unchanged.
@@ -21,19 +28,26 @@ import numpy as np
 from typing import Optional
 
 from rdkit import Chem
-from rdkit.Chem import Descriptors
+from rdkit.Chem import AllChem, Descriptors
+
+_N_MORGAN_BITS = 64   # §DDD: folded FP; low count keeps feature/sample ratio sane
+_N_PHYSCHEM    = 20
+_N_FEATURES    = _N_PHYSCHEM + _N_MORGAN_BITS  # 84 total
 
 
 def _descriptor_vector(smiles: str) -> Optional[list]:
     """
-    Compute a 20-feature RDKit descriptor vector for surrogate fitting.
-    Returns None if the molecule cannot be parsed or descriptors fail.
+    Compute an 84-feature descriptor vector for surrogate fitting.
+
+    Returns a list of 84 floats (20 physicochemical + 64 Morgan FP bits),
+    or None if the molecule cannot be parsed or any physicochemical descriptor
+    produces NaN/Inf.
     """
     mol = Chem.MolFromSmiles(smiles)
     if mol is None:
         return None
     try:
-        vec = [
+        physchem = [
             Descriptors.MolWt(mol),
             Descriptors.MolLogP(mol),
             Descriptors.TPSA(mol),
@@ -55,9 +69,11 @@ def _descriptor_vector(smiles: str) -> Optional[list]:
             float(Descriptors.NumStereocenters(mol)),
             float(Descriptors.NumUnspecifiedAtomStereoCenters(mol)),
         ]
-        if any(v is None or (isinstance(v, float) and (np.isnan(v) or np.isinf(v))) for v in vec):
+        if any(v is None or (isinstance(v, float) and (np.isnan(v) or np.isinf(v))) for v in physchem):
             return None
-        return vec
+        # §DDD: 64-bit Morgan fingerprint (radius=2)
+        fp = AllChem.GetMorganFingerprintAsBitVect(mol, radius=2, nBits=_N_MORGAN_BITS)
+        return physchem + list(fp)
     except Exception:
         return None
 
@@ -67,11 +83,11 @@ def fit_surrogate(db_path: str, protein: str, min_points: int = 40):
     Fit a Ridge regression surrogate on Boltz-2 scores from the disk cache.
 
     Reads all (smiles, score) pairs for *protein* from the SQLite cache and
-    fits a StandardScaler→Ridge(alpha=1.0) pipeline on the 20-feature descriptor
-    vectors.  The scaler normalises each descriptor to zero mean / unit variance
-    before regularisation so that Ridge penalises all features equally regardless
-    of their absolute range (e.g. MW 200-500 vs NumHDonors 0-5).  This is
-    §CCC: StandardScaler pipeline.
+    fits a StandardScaler→Ridge(alpha=1.0) pipeline on the 84-feature descriptor
+    vectors (20 physicochemical + 64 Morgan FP bits).  The scaler normalises each
+    feature to zero mean / unit variance so that Ridge penalises all features
+    equally regardless of their absolute range.  This is §CCC (StandardScaler
+    pipeline) combined with §DDD (Morgan fingerprint augmentation).
 
     Returns the fitted pipeline, or None if:
     - sklearn is unavailable
@@ -135,7 +151,7 @@ def rank_pool_by_surrogate(pool_df, model, smiles_col: str = 'product_smiles'):
         if n_valid < max(1, len(pool_df) * 0.5):
             return pool_df
 
-        placeholder = [0.0] * 20
+        placeholder = [0.0] * _N_FEATURES
         X = [v if v is not None else placeholder for v in vecs]
         scores = model.predict(X)
 

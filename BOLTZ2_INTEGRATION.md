@@ -1,6 +1,6 @@
 # Boltz-2 Miner Integration
 
-## Current Status (as of 2026-06-04)
+## Current Status (as of 2026-06-05)
 
 **Boltz-2 integration is complete and heavily optimised.**  The stock miner scored 0 on
 Boltz-2; this miner has been rewritten from the ground up around the scoring formula.  All
@@ -9,6 +9,15 @@ screening, §SS ChEMBL known-active warm-start, and §RR confidence-weighted ord
 (2026-05-26).  A §CC bug fix was applied (2026-05-25): §FF scores were not included in
 `all_scores` when §MM exited with no time for any rounds, causing §CC to potentially
 promote a stale disk-cached molecule over the §FF winner.
+
+§DDD added 2026-06-05: the §ZZ surrogate feature vector is expanded from 20 physicochemical
+descriptors to 84 features by appending a 64-bit folded Morgan fingerprint (radius=2).  The
+low bit-count is deliberate — with 40–100 training points Ridge regularisation can fit 64
+binary structural bits without severe overfitting, while 1024-bit FPs would be
+underdetermined.  StandardScaler (§CCC) normalises both physicochemical and FP features to
+zero mean/unit variance, so Ridge penalises them equally.  Expected benefit: 5–15% NDCG
+improvement at top-3 SALSA seed selection in epoch 4+ when the cache accumulates scaffold-level
+signal.
 
 Two §MM improvements added 2026-05-27:
 - `_mm_max_rounds` raised 5 → 10: A100/RTX 4090 hardware was hitting the cap before the
@@ -113,6 +122,7 @@ Two conditional/research items remain (§D, FBLD).
 | AAA | Hardware-adaptive MSA subsampling (auto-scale on A100/H100) | boltz/wrapper.py | ✅ |
 | BBB | Post-GA SALSA pass (explore GA winner before Boltz) | miner.py | ✅ |
 | CCC | StandardScaler pipeline for §ZZ Ridge surrogate | utils/surrogate.py | ✅ |
+| DDD | Morgan fingerprint augmentation of §ZZ surrogate (64-bit, radius=2) | utils/surrogate.py | ✅ |
 
 ---
 
@@ -291,15 +301,78 @@ before Boltz-2 inference, saving GPU time and improving submission quality.
 Estimated effort: ~150 lines in `utils/docking.py`.  Priority: low (only relevant when
 `binding_pocket` is set by the subnet operator).
 
-### Large-Scale SAVI-2020 Indexing
+### §EEE — Adaptive `use_potentials` on A100/H100
+
+The Boltz-2 `predict()` function accepts `use_potentials: bool` which enables FK steering and
+physical guidance during diffusion.  The `boltz_config.yaml` comment reads "steers diffusion
+toward physically plausible poses — can improve affinity accuracy on hardware with ample GPU
+memory (A100 / H100). Adds ~10-20% to per-molecule inference time."  Currently set to `false`.
+
+**Tradeoff analysis:** On A100 (45 s/mol), a 15% increase → 51.75 s/mol.  Over 10 §MM rounds:
+- Without potentials: 10 rounds × 45 s = 450 s
+- With potentials:    8 rounds × 52 s = 416 s (loses ~2 rounds but each round is higher quality)
+
+The break-even depends on how much `use_potentials` improves per-call accuracy.  If it raises
+the Boltz score of the winning molecule by ≥ 0.005 (one decimal place of precision), and §MM
+would have needed 2 extra rounds to find an equal improvement organically, the tradeoff is
+favourable.  This is unknown without benchmarking.
+
+**Proposed implementation (§EEE):** Hardware-adaptive activation alongside §AAA in
+`BoltzWrapper.__init__()`:
+```python
+if vram_gib >= 38 and not self.config.get('use_potentials', False):
+    self.config['use_potentials'] = True
+    bt.logging.info(f"[§EEE] use_potentials=True on {vram_gib:.0f} GiB GPU")
+```
+Priority: medium.  Requires empirical benchmarking on A100 hardware to confirm the accuracy
+benefit outweighs the reduced §MM round count.  Risk: could reduce §MM from 10 → 8 rounds,
+net-negative if the per-round accuracy gain is < 2 rounds × average SALSA-Boltz improvement.
+
+### §FFF — Large-Scale SAVI-2020 Indexing
 
 The SALSA Tanimoto search covers only the ~10,000 molecules in `savi_stream_pool` — less
 than 0.004% of SAVI-2020's 283 M compounds.  Pre-downloading a representative subset
 (e.g., 5 M reactions from 10–35 HA products) and building a local LSH/ball-tree FP index
 would let SALSA find high-quality nearest-neighbours across a 500× larger search space.
 
-Estimated effort: High (several GB download, index construction, FAISS/pynndescent
-integration).  Not yet attempted.
+**Proposed approach:**
+1. Pre-download SAVI-2020 CSV shards filtered to 10–35 heavy atoms (≈ 80% of SAVI-2020).
+2. Build a FAISS `IndexFlatL2` or `IndexIVFFlat` over 256-bit Morgan fingerprints.
+3. Replace the `nearest_pool_molecules` BulkTanimoto search with an ANN query to the FAISS
+   index, falling back to the in-memory pool for the first epoch (before index is ready).
+4. The index is built once per machine and cached; weekly target rotation requires no rebuild
+   (SAVI-2020 is target-agnostic).
+
+Estimated effort: High (several GB download, index construction ~1 h, FAISS integration).
+Expected benefit: SALSA can reach the nearest SAVI-2020 molecule to any SMILES perturbation,
+not just the nearest within the streamed 10k subset.  Particularly valuable for scaffold hops
+where the SALSA perturbation targets a region of chemical space underrepresented in the 10k pool.
+
+### §GGG — Boltz-2 Structure Output for Pose Quality Filtering
+
+The `predict()` function accepts `write_full_pae: bool` and `write_full_pde: bool`, which output
+per-residue-pair PAE (Predicted Aligned Error) and PDE (Predicted Distortion Error) matrices.
+Currently unused — only the JSON `confidence_*.json` scalar summaries are read.
+
+**Potential use:** PAE at the protein-ligand interface (protein residues within 8 Å of the
+ligand) gives a per-residue-pair estimate of pose uncertainty.  A molecule with high
+`affinity_probability_binary` but large interface PAE may have a poorly-packed binding pose
+that will not reproduce in the validator's re-run.  Filtering out high-PAE candidates before
+submission could improve reproducibility.
+
+**Implementation sketch (§GGG):**
+```python
+# In BoltzWrapper.postprocess_data(), after reading confidence JSON:
+if write_full_pae:
+    pae_path = results_path / f"pae_{mol_idx}.npz"
+    pae = np.load(pae_path)['pae']
+    # Average PAE over ligand-touching residues (indices from structure file)
+    interface_pae = pae[protein_residue_indices, ligand_index].mean()
+    scores[mol_idx]['interface_pae'] = interface_pae
+```
+
+Estimated effort: ~100 lines.  Priority: low (requires parsing PDB structure output to identify
+interface residues; adds I/O overhead per inference call).
 
 ### §YY — Reaction-Class-Biased SAVI-2020 Streaming ✅ Implemented
 
@@ -2936,3 +3009,51 @@ points — small samples are where scale sensitivity matters most.
 
 **Files changed:** `utils/surrogate.py` — `fit_surrogate()` imports `Pipeline` and `StandardScaler`;
 model construction updated.
+
+---
+
+## §DDD — Morgan Fingerprint Augmentation of §ZZ Surrogate (`utils/surrogate.py`)
+
+**Problem:** The §ZZ Ridge surrogate's 20 physicochemical descriptors (MW, logP, TPSA, H-bond
+counts, ring counts, etc.) can only capture bulk molecular properties — they cannot distinguish
+between "this specific scaffold binds P31652" and "that scaffold doesn't."  Two molecules with
+identical physicochemical profiles but different core scaffolds receive the same surrogate
+prediction even if their Boltz-2 scores differ by 0.15.  This limits NDCG improvement on
+epoch 4+ when the disk cache holds enough data to learn scaffold-level patterns.
+
+**Fix:** Append a 64-bit folded Morgan fingerprint (radius=2, `GetMorganFingerprintAsBitVect`)
+to the physicochemical descriptor vector, expanding the feature set from 20 to 84.  The low
+bit-count (64 vs the standard 1024) is intentional: with 40–100 training points and Ridge
+regularisation, 1024 binary features would be severely underdetermined.  64 bits capture
+scaffold-level patterns (ring systems, characteristic substituent patterns) with far less
+sparsity, keeping the feature:sample ratio around 1:1 in early epochs and improving as the
+cache grows.
+
+`StandardScaler` (§CCC) normalises the Morgan bits the same way as physicochemical features:
+each bit is centred to its sample mean (≈ fraction of molecules with that pattern set) and
+scaled to unit variance `sqrt(p(1-p))`.  This ensures Ridge penalises structural and
+physicochemical features symmetrically.
+
+The feature vector now has the layout:
+
+```
+[MW, logP, TPSA, HBD, HBA, RotBonds, RingCount, AromaticRings, AliphaticRings,
+ FractionCSP3, Heteroatoms, HeavyAtoms, SatRings, AliphCarbocycles, AromCarbocycles,
+ BertzCT, MolMR, LabuteASA, NumStereocenters, NumUnspecifiedStereocenters,  ← 20 physchem
+ bit_0, bit_1, …, bit_63]                                                    ← 64 Morgan FP
+```
+
+**Expected benefit:** On epoch 4+ (80–200 cache entries), the surrogate can assign higher
+predicted scores to scaffolds whose structural motifs appeared frequently in high-Boltz-score
+training molecules.  When the best weekly molecule belongs to, say, a pyrimidine–piperazine
+scaffold, the Morgan bits capture this, and SALSA seeds / Boltz pre-screening candidates with
+the same pattern get boosted.  Expected NDCG improvement: 5–15% over §CCC alone, specifically
+at the top of the ranking (top-3 SALSA seeds selection).
+
+**No regression risk:** The surrogate is always a secondary ranking signal; PSICHIC ordering
+is the primary.  If Morgan features add noise (sparse cache), Ridge(alpha=1.0) will shrink
+their coefficients toward zero.  The fallback threshold (min_points=40) is unchanged.
+
+**Files changed:** `utils/surrogate.py` — `_descriptor_vector()` imports `AllChem` and appends
+64 Morgan FP bits; `_N_MORGAN_BITS`, `_N_PHYSCHEM`, `_N_FEATURES` constants added;
+`rank_pool_by_surrogate` placeholder updated to `_N_FEATURES`.
