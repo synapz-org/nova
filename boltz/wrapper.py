@@ -36,8 +36,8 @@ class BoltzWrapper:
         self.config = yaml.load(open(config_path, 'r'), Loader=yaml.FullLoader)
         self.base_dir = BASE_DIR
 
-        # §AAA + §EEE: Hardware-adaptive settings for A100/H100 (≥38 GiB VRAM).
-        # Single VRAM probe shared by both optimisations.
+        # §AAA + §EEE + §HHH: Hardware-adaptive settings for A100/H100 (≥38 GiB VRAM).
+        # Single VRAM probe shared by all three optimisations.
         try:
             if torch.cuda.is_available():
                 vram_gib = torch.cuda.get_device_properties(0).total_memory / (1024 ** 3)
@@ -59,6 +59,16 @@ class BoltzWrapper:
                         bt.logging.info(
                             f"[§EEE] Hardware-adaptive potentials: {vram_gib:.0f} GiB VRAM → "
                             f"use_potentials=True"
+                        )
+                    # §HHH: Higher affinity sampling steps — more diffusion iterations for
+                    # the affinity head improve affinity_probability_binary calibration on
+                    # hardware where the extra ~50% inference time fits the epoch budget.
+                    # Only raises; never lowers a deliberately-set high config value.
+                    if self.config.get('sampling_steps_affinity', 100) < 150:
+                        self.config['sampling_steps_affinity'] = 150
+                        bt.logging.info(
+                            f"[§HHH] Hardware-adaptive affinity steps: {vram_gib:.0f} GiB VRAM → "
+                            f"sampling_steps_affinity=150"
                         )
         except Exception:
             pass

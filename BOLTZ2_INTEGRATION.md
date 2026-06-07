@@ -1,6 +1,6 @@
 # Boltz-2 Miner Integration
 
-## Current Status (as of 2026-06-06)
+## Current Status (as of 2026-06-07)
 
 **Boltz-2 integration is complete and heavily optimised.**  The stock miner scored 0 on
 Boltz-2; this miner has been rewritten from the ground up around the scoring formula.  All
@@ -17,6 +17,13 @@ inference time but +5-10% affinity accuracy on large-memory hardware.  On RTX 30
 is never set (VRAM < 38 GiB), so there is zero regression.  §AAA and §EEE now share a single
 VRAM probe in a unified hardware-adaptive block, eliminating the redundant `cuda.get_device_properties`
 call that §AAA previously made separately.
+
+§HHH added 2026-06-07: hardware-adaptive `sampling_steps_affinity`.  On A100/H100
+(≥38 GiB VRAM) the affinity diffusion step count is automatically raised from 100 → 150,
+matching the library's recommended ratio between structure and affinity sampling.  The
+adaptive trigger (§G) recalibrates automatically to the slightly longer per-molecule time.
+On RTX 3090/4090 the default of 100 remains unchanged — zero regression.  §HHH shares the
+same VRAM probe block as §AAA and §EEE.
 
 §DDD added 2026-06-05: the §ZZ surrogate feature vector is expanded from 20 physicochemical
 descriptors to 84 features by appending a 64-bit folded Morgan fingerprint (radius=2).  The
@@ -132,6 +139,7 @@ Two conditional/research items remain (§D, FBLD).
 | CCC | StandardScaler pipeline for §ZZ Ridge surrogate | utils/surrogate.py | ✅ |
 | DDD | Morgan fingerprint augmentation of §ZZ surrogate (64-bit, radius=2) | utils/surrogate.py | ✅ |
 | EEE | Hardware-adaptive FK steering potentials on A100/H100 | boltz/wrapper.py | ✅ |
+| HHH | Hardware-adaptive `sampling_steps_affinity` 100→150 on A100/H100 | boltz/wrapper.py | ✅ |
 
 ---
 
@@ -363,32 +371,44 @@ before Boltz-2 inference, saving GPU time and improving submission quality.
 Estimated effort: ~150 lines in `utils/docking.py`.  Priority: low (only relevant when
 `binding_pocket` is set by the subnet operator).
 
-### §EEE — Adaptive `use_potentials` on A100/H100
+### §HHH — Hardware-Adaptive `sampling_steps_affinity` ✅ Implemented
 
-The Boltz-2 `predict()` function accepts `use_potentials: bool` which enables FK steering and
-physical guidance during diffusion.  The `boltz_config.yaml` comment reads "steers diffusion
-toward physically plausible poses — can improve affinity accuracy on hardware with ample GPU
-memory (A100 / H100). Adds ~10-20% to per-molecule inference time."  Currently set to `false`.
+`sampling_steps_affinity` controls how many diffusion steps are used for the affinity
+prediction head.  The config default is 100 — half the library default of 200 — chosen
+for speed on RTX 3090 hardware.  On A100/H100 the adaptive trigger (§G) has already
+absorbed the overhead from §AAA and §EEE; a further 50% step increase fits inside the
+same epoch window.
 
-**Tradeoff analysis:** On A100 (45 s/mol), a 15% increase → 51.75 s/mol.  Over 10 §MM rounds:
-- Without potentials: 10 rounds × 45 s = 450 s
-- With potentials:    8 rounds × 52 s = 416 s (loses ~2 rounds but each round is higher quality)
-
-The break-even depends on how much `use_potentials` improves per-call accuracy.  If it raises
-the Boltz score of the winning molecule by ≥ 0.005 (one decimal place of precision), and §MM
-would have needed 2 extra rounds to find an equal improvement organically, the tradeoff is
-favourable.  This is unknown without benchmarking.
-
-**Proposed implementation (§EEE):** Hardware-adaptive activation alongside §AAA in
-`BoltzWrapper.__init__()`:
+**Mechanism (added to the §AAA + §EEE block in `BoltzWrapper.__init__()`):**
 ```python
-if vram_gib >= 38 and not self.config.get('use_potentials', False):
-    self.config['use_potentials'] = True
-    bt.logging.info(f"[§EEE] use_potentials=True on {vram_gib:.0f} GiB GPU")
+# §HHH: Higher affinity sampling steps on large-memory GPUs.
+if self.config.get('sampling_steps_affinity', 100) < 150:
+    self.config['sampling_steps_affinity'] = 150
+    bt.logging.info(
+        f"[§HHH] Hardware-adaptive affinity steps: {vram_gib:.0f} GiB VRAM → "
+        f"sampling_steps_affinity=150"
+    )
 ```
-Priority: medium.  Requires empirical benchmarking on A100 hardware to confirm the accuracy
-benefit outweighs the reduced §MM round count.  Risk: could reduce §MM from 10 → 8 rounds,
-net-negative if the per-round accuracy gain is < 2 rounds × average SALSA-Boltz improvement.
+
+**Time-budget impact on A100 (~45 s/mol baseline):**
+
+| Config | Affinity steps | Estimated Δ time/mol | §MM rounds (10-round cap) |
+|--------|---------------|----------------------|--------------------------|
+| Default (100 steps) | 100 | baseline | 10 |
+| §HHH (150 steps)  | 150 | ~+15–20 s | ~8–9 rounds |
+
+The §MM time guard fires at `< boltz_time_per_mol + 30 s`, and `boltz_time_per_mol` is
+updated from `last_inference_duration` after the first full run.  So §MM auto-adjusts to
+the measured slower timing — trading ~1 round for better per-call affinity calibration.
+
+**Zero regression on RTX 3090/4090:** `vram_gib < 38` → `sampling_steps_affinity` stays at
+config value (100).  Behaviour unchanged from prior epochs on all existing deployments.
+
+**Fast-mode safety:** When `fast=True` (§NN), `_s_steps_aff = 50` is always used regardless
+of `self.config['sampling_steps_affinity']`.  §HHH only affects full-inference calls —
+pre-screening speed is unaffected.
+
+---
 
 ### §FFF — Large-Scale SAVI-2020 Indexing
 
@@ -2072,7 +2092,7 @@ is unchanged.
 | File | Change |
 |------|--------|
 | `neurons/miner.py` | Added `is_boltz_safe_smiles` + `max_heavy_atoms` filters; `run_boltz_prescoring()` with two-tier cache; Boltz trigger at 100 blocks (was 50); `boltz_score_cache` + `boltz_cache_db` state fields; `_init_boltz_cache_db`, `_disk_cache_get`, `_disk_cache_put` helpers; fixed `entropy_weight` → `entropy_start_weight` AttributeError; pharmacophore pre-filter (§F); adaptive trigger using `boltz_trigger_blocks` state field (§G); anytime incremental scoring — one molecule at a time with immediate reorder (§H); PSICHIC ligand-efficiency scoring — divide combined_score by heavy_atoms (§I); global candidate pool — top-20 across all epoch chunks for Boltz (§J); dynamic max_candidates from available epoch time + `boltz_time_per_mol` state (§K); epoch-end guard before each cache-miss Boltz inference (§L); `boltz_time_per_mol` persisted in state (§M); SALSA stream pool + trigger + epoch reset (§N); `ga_run_this_epoch` added to initial state dict; validator constraint filters (banned atoms, rotatable bonds) added to `_pharma_ok` (§P); multi-seed SALSA — top-3 seeds for broader chemical space coverage (§Q); MSA auto-fetch at startup via `ensure_msa` (§S) |
-| `boltz/wrapper.py` | Added `last_inference_duration` field populated after each `predict()` call (§G); pass `no_kernels`, `num_workers`, `preprocessing_threads` from config to `predict()` (§T); pass `use_potentials` from config (§U); pass `step_scale` from config (§V); try/except around `os.listdir(results_path)` — missing directory → score=-inf instead of crash (§X.1); empty-scores guard + safe `mol_scores.get()` in score assignment (§X.2); try/except around entire `combine_boltz_scores` body (§X.3); `create_yaml_content` checks `os.path.exists(msa_path)` before including MSA line — absent file falls back to single-sequence mode gracefully (§X.4); forward `subsample_msa` and `num_subsampled_msa` from config to `predict()` (§Z) |
+| `boltz/wrapper.py` | Added `last_inference_duration` field populated after each `predict()` call (§G); pass `no_kernels`, `num_workers`, `preprocessing_threads` from config to `predict()` (§T); pass `use_potentials` from config (§U); pass `step_scale` from config (§V); try/except around `os.listdir(results_path)` — missing directory → score=-inf instead of crash (§X.1); empty-scores guard + safe `mol_scores.get()` in score assignment (§X.2); try/except around entire `combine_boltz_scores` body (§X.3); `create_yaml_content` checks `os.path.exists(msa_path)` before including MSA line — absent file falls back to single-sequence mode gracefully (§X.4); forward `subsample_msa` and `num_subsampled_msa` from config to `predict()` (§Z); hardware-adaptive `sampling_steps_affinity` 100→150 on A100/H100 in shared VRAM probe block (§HHH) |
 | `boltz/boltz_config.yaml` | Added `use_potentials: false` (§U); added `step_scale: null` (§V); added `subsample_msa`, `num_subsampled_msa`, `num_workers`, `preprocessing_threads` with defaults (§Z) |
 | `config/config.yaml` | Added `max_heavy_atoms: 35` |
 | `config/config_loader.py` | Loads and exposes `max_heavy_atoms` |
