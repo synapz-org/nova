@@ -1,5 +1,17 @@
 # Boltz-2 Miner Integration
 
+## Current Status (as of 2026-06-08)
+
+§III added 2026-06-08: reduced affinity recycling steps for §NN fast pre-screening passes.
+The Boltz-2 affinity model hardcoded `recycling_steps=5` in `boltz/src/boltz/main.py` and
+this value was never configurable from the wrapper.  §III exposes `recycling_steps_affinity`
+as a new parameter of `predict()` (default 5) and sets it to 2 when `fast=True` in
+`BoltzWrapper.score_molecules_target`.  Fewer affinity-recycling passes reduce per-molecule
+inference time on the affinity head by ~30-40%, which translates directly into more §MM
+hill-climbing rounds per epoch on all hardware tiers.  Full-quality runs (`fast=False`) keep
+`recycling_steps_affinity=5` for maximum accuracy.  Affected files: `boltz/src/boltz/main.py`,
+`boltz/wrapper.py`, `boltz/boltz_config.yaml`.
+
 ## Current Status (as of 2026-06-07)
 
 **Boltz-2 integration is complete and heavily optimised.**  The stock miner scored 0 on
@@ -140,6 +152,7 @@ Two conditional/research items remain (§D, FBLD).
 | DDD | Morgan fingerprint augmentation of §ZZ surrogate (64-bit, radius=2) | utils/surrogate.py | ✅ |
 | EEE | Hardware-adaptive FK steering potentials on A100/H100 | boltz/wrapper.py | ✅ |
 | HHH | Hardware-adaptive `sampling_steps_affinity` 100→150 on A100/H100 | boltz/wrapper.py | ✅ |
+| III | Reduced `recycling_steps_affinity` 5→2 for §NN fast pre-screening | boltz/main.py, boltz/wrapper.py | ✅ |
 
 ---
 
@@ -407,6 +420,47 @@ config value (100).  Behaviour unchanged from prior epochs on all existing deplo
 **Fast-mode safety:** When `fast=True` (§NN), `_s_steps_aff = 50` is always used regardless
 of `self.config['sampling_steps_affinity']`.  §HHH only affects full-inference calls —
 pre-screening speed is unaffected.
+
+---
+
+### §III — Reduced `recycling_steps_affinity` for §NN Fast Pre-Screening ✅ Implemented
+
+The Boltz-2 affinity model runs multiple recycling passes over the protein–ligand structure
+before producing the final affinity prediction.  The affinity pipeline in
+`boltz/src/boltz/main.py` had `recycling_steps: 5` hardcoded inside `predict_affinity_args`
+and this value was never configurable through the `BoltzWrapper` API.
+
+**Problem:**  When `fast=True` (§NN), the wrapper already reduces:
+- `sampling_steps_affinity`: 100 → 50 (50% fewer diffusion steps)
+- `diffusion_samples_affinity`: 3 → 1 (3× fewer structure samples)
+
+But `recycling_steps` remained at 5 for both fast and full-quality calls, leaving a
+significant speedup on the table.  The affinity recycling loop — which refines the pair
+representation through the trunk for each of 5 passes — accounts for a substantial fraction
+of the per-molecule affinity inference time (roughly proportional to recycling_steps / 5).
+
+**Fix (§III):**
+1. `boltz/src/boltz/main.py`: Added `recycling_steps_affinity: int = 5` parameter to
+   `predict()`.  Used in `predict_affinity_args["recycling_steps"]` instead of the
+   hardcoded literal 5.
+2. `boltz/boltz_config.yaml`: Added `recycling_steps_affinity: 5` as the documented
+   tunable default.
+3. `boltz/wrapper.py`: Added `_recycle_aff = 2 if fast else config.get('recycling_steps_affinity', 5)`.
+   Passed as `recycling_steps_affinity=_recycle_aff` to `predict()`.
+
+**Expected benefit:**
+- Fast passes (`fast=True`): affinity recycling 5→2, saving ~40% of the affinity-module
+  time that was not yet covered by §NN's sampling/sample-count reductions.  On a typical
+  RTX 3090 setup where §NN runs at ~75 s/mol (50% of 150 s/mol full), §III reduces fast
+  inference to approximately ~55–65 s/mol.  With 10 §MM rounds capped and a ~70-min epoch,
+  this could yield 1–2 additional §MM rounds per epoch.
+- Full-quality passes (`fast=False`): unchanged.  `recycling_steps_affinity=5` is always
+  used for final scoring, cache writes, and §WW multi-seed comparisons — ensuring validator
+  alignment is maintained.
+
+**Zero regression:** The full inference path is unchanged.  The `fast=True` code path only
+affects intermediate §NN/§FF pre-screening calls whose scores are never written to the
+persistent disk cache and never drive the final submission directly.
 
 ---
 

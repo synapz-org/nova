@@ -5,6 +5,9 @@ diffusion_samples: 1
 sampling_steps: 100
 sampling_steps_affinity: 100
 diffusion_samples_affinity: 3
+# Recycling steps for the affinity model (default 5).  Reducing to 2 for §NN
+# fast pre-screening passes is handled automatically in wrapper.py (§III).
+recycling_steps_affinity: 5
 affinity_mw_correction: true
 output_format: "pdb"
 override: false

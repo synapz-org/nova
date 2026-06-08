@@ -787,6 +787,7 @@ def predict(  # noqa: C901, PLR0915, PLR0912
     num_subsampled_msa: int = 1024,
     no_kernels: bool = False,
     write_embeddings: bool = False,
+    recycling_steps_affinity: int = 5,
 ) -> None:
     """Run predictions with Boltz."""
     # If cpu, write a friendly warning
@@ -1044,7 +1045,7 @@ def predict(  # noqa: C901, PLR0915, PLR0912
         )
 
         predict_affinity_args = {
-            "recycling_steps": 5,
+            "recycling_steps": recycling_steps_affinity,
             "sampling_steps": sampling_steps_affinity,
             "diffusion_samples": diffusion_samples_affinity,
             "max_parallel_samples": 1,
