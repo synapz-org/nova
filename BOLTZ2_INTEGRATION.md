@@ -1,5 +1,19 @@
 # Boltz-2 Miner Integration
 
+## Current Status (as of 2026-06-09)
+
+§NNNN added 2026-06-09: scaffold-diverse SALSA hit selection in §FF and §MM.
+`run_salsa_search` in both §FF (Boltz-guided SALSA) and §MM (iterative hill-climbing)
+was called with `top_k=3`, meaning the 3 hits passed to the §NN fast-screen were the
+3 highest PSICHIC-scored molecules — which, when SALSA converges, often share a single
+Murcko scaffold.  Scoring 3 scaffold-repeats wastes 2 of the 3 fast-screen slots on
+redundant chemical hypotheses.  §NNNN raises `top_k` to 5 in both calls (zero extra
+compute — SALSA just returns 2 extra rows from its existing deduplication) then applies
+`_scaffold_diverse_candidates(hits, max_k=3)` to select the 3 most scaffold-diverse
+molecules for fast-screening.  The fill-pass inside `_scaffold_diverse_candidates`
+ensures exactly 3 hits are returned even when the pool is chemically homogeneous.
+Affected file: `neurons/miner.py`.
+
 ## Current Status (as of 2026-06-08)
 
 §III added 2026-06-08: reduced affinity recycling steps for §NN fast pre-screening passes.
@@ -153,6 +167,7 @@ Two conditional/research items remain (§D, FBLD).
 | EEE | Hardware-adaptive FK steering potentials on A100/H100 | boltz/wrapper.py | ✅ |
 | HHH | Hardware-adaptive `sampling_steps_affinity` 100→150 on A100/H100 | boltz/wrapper.py | ✅ |
 | III | Reduced `recycling_steps_affinity` 5→2 for §NN fast pre-screening | boltz/main.py, boltz/wrapper.py | ✅ |
+| NNNN | Scaffold-diverse SALSA hit selection in §FF and §MM (top_k 3→5 + diversity filter) | neurons/miner.py | ✅ |
 
 ---
 
@@ -464,6 +479,48 @@ persistent disk cache and never drive the final submission directly.
 
 ---
 
+### §NNNN — Scaffold-Diverse SALSA Hit Selection in §FF and §MM ✅ Implemented
+
+**Problem:** `run_salsa_search` with `top_k=3` returns the 3 highest PSICHIC-scored
+molecules from the SAVI pool.  When §MM has been running for several rounds, the
+neighbourhood exploration converges and all 3 hits frequently share the same Murcko
+scaffold.  The §NN fast-screen then runs 3 Boltz-2 inference calls on near-identical
+molecules — 2 of the 3 calls add no new chemical information.
+
+**Fix:** Raise `top_k` from 3 → 5 in both the §FF and §MM `run_salsa_search` calls.
+SALSA already deduplicates hits and returns them sorted by `combined_score`; increasing
+`top_k` by 2 adds negligible compute (returns 2 more rows from the same deduplication
+step).  After the SALSA call, apply `_scaffold_diverse_candidates(hits, max_k=3)` to
+select the 3 most Murcko-scaffold-diverse molecules for fast-screening.  The fill-pass
+inside `_scaffold_diverse_candidates` ensures the full 3-slot fast-screen budget is
+always used, even when the pool is chemically homogeneous (falls back to top-3 by
+score).
+
+**Affected code (`neurons/miner.py`):**
+
+```python
+# §FF and §MM SALSA calls — top_k raised 3 → 5
+_mm_salsa_hits = await asyncio.to_thread(
+    run_salsa_search, ..., top_k=5
+)
+# §NNNN: scaffold-diverse selection — each fast-screen slot tests a different family
+if not _mm_salsa_hits.empty and len(_mm_salsa_hits) > 3:
+    _mm_salsa_hits = _scaffold_diverse_candidates(_mm_salsa_hits, max_k=3)
+```
+
+**Expected benefit:** When SALSA converges to a single scaffold (common in §MM rounds
+3–7), §NNNN ensures the 3 fast-screen calls cover up to 3 different scaffolds.  Each
+Boltz call tests a distinct chemical hypothesis, improving the probability that at least
+one round discovers a structurally novel binder that beats the current seed.  On rounds
+where SALSA naturally surfaces 3 diverse scaffolds, the diversity filter is a no-op (the
+top-3 are already diverse) — zero regression.
+
+**Zero cost:** The `top_k=5→3` downselect happens in microseconds (DataFrame sort +
+MurckoScaffold computation on 5 molecules).  No extra SALSA iterations, no extra pool
+searches, no extra Boltz calls.
+
+---
+
 ### §FFF — Large-Scale SAVI-2020 Indexing
 
 The SALSA Tanimoto search covers only the ~10,000 molecules in `savi_stream_pool` — less
@@ -509,6 +566,53 @@ if write_full_pae:
 
 Estimated effort: ~100 lines.  Priority: low (requires parsing PDB structure output to identify
 interface residues; adds I/O overhead per inference call).
+
+### §OOOO — Learned Perturbation Operator Weighting
+
+**Observation:** SALSA uses four operators: bioisosteric substitution, FG addition, terminal
+removal, and ring walk.  In any given epoch, some operators consistently produce SAVI-2020
+hits that score higher with Boltz-2 than others (e.g., terminal removal may yield high-efficiency
+small molecules while ring walk discovers better-fitting scaffolds).  Currently all operators
+are weighted equally in `generate_perturbations`.
+
+**Proposal:** Track, within the §MM loop, which operator TYPE generated the SALSA hit that
+led to each Boltz improvement.  After the first improvement, bias subsequent rounds toward
+that operator (e.g., 2× weight via `n_max` partitioning).  This is a lightweight bandit-style
+learning loop over the 4 operator types.
+
+**Implementation sketch:** `generate_perturbations` would accept an optional `operator_weights`
+dict (e.g., `{'bioisostere': 2.0, 'fg_add': 1.0, 'terminal_remove': 1.5, 'ring_walk': 1.0}`)
+and split `n_max` proportionally.  The §MM improvement tracking would update weights after
+each confirmed improvement.  On the first epoch (no prior data) all weights default to 1.0.
+
+Estimated effort: ~60 lines in `utils/salsa.py` + 30 lines in `neurons/miner.py`.
+Priority: medium.
+
+### §PPPP — SALSA Elite Pool Pre-seeding at Epoch Start
+
+**Observation:** The `savi_stream_pool` starts empty at each epoch.  SALSA and §MM can only
+search among molecules accumulated during the current epoch's PSICHIC streaming (~10,000 by
+trigger time).  Prior-epoch Boltz winners are used as DIRECT SEEDS (§UU) but are NOT in
+the pool — their bioisosteric neighbours are unreachable until the current epoch happens to
+stream them.
+
+**Proposal:** At epoch start, pre-populate `savi_stream_pool` with the top-50 Boltz-validated
+molecules from the disk cache.  These molecules are guaranteed to be structurally valid and
+SAVI-submittable (they have product_names from prior epochs).  Once SALSA fires (≥500 pool
+molecules), the pool already contains 50 confirmed high-scoring molecules as anchors.  Any
+PSICHIC molecule that falls near these anchors in Morgan fingerprint space will map to a
+neighbour of a proven Boltz binder — regardless of whether the PSICHIC score is high.
+
+**Risk:** These 50 molecules need accurate `heavy_atoms` and `combined_score` columns to
+participate in SALSA ranking.  `combined_score` could be reconstructed from cached Boltz
+scores (not PSICHIC), but SALSA sorts by `combined_score` as a PSICHIC proxy.  Mixing
+Boltz scores and PSICHIC scores in one DataFrame column would corrupt the PSICHIC ranking.
+**Mitigation:** Assign the cached Boltz score directly as `combined_score` (normalised to
+the same scale as PSICHIC by dividing by `boltz_time_per_mol`-adjusted factor, or simply
+by using the raw score).  SALSA's nearest-neighbour search uses Morgan FP Tanimoto, not
+`combined_score`; the score only determines which hit is selected as the next SALSA seed.
+
+Estimated effort: ~40 lines in `neurons/miner.py`.  Priority: medium.
 
 ### §YY — Reaction-Class-Biased SAVI-2020 Streaming ✅ Implemented
 

@@ -1414,8 +1414,12 @@ async def run_boltz_prescoring(state: Dict[str, Any], max_candidates: int = 5) -
                     _savi_pool_ff,
                     2,   # rounds (fewer -- time is limited)
                     200, # n_perturb — full operator coverage (ring walk + terminal removal)
-                    3,   # top_k
+                    5,   # top_k — §NNNN: wider net for scaffold-diversity selection below
                 )
+                # §NNNN: scaffold-diverse selection — ensures §NN fast-screen tests
+                # different chemical hypotheses instead of scaffold-homogeneous top-3.
+                if not ff_salsa_hits.empty and len(ff_salsa_hits) > 3:
+                    ff_salsa_hits = _scaffold_diverse_candidates(ff_salsa_hits, max_k=3)
                 if not ff_salsa_hits.empty:
                     bt.logging.info(
                         f"§FF: {len(ff_salsa_hits)} Boltz-guided SALSA hits -- §NN two-phase screening..."
@@ -1598,8 +1602,12 @@ async def run_boltz_prescoring(state: Dict[str, Any], max_candidates: int = 5) -
                     _mm_savi_pool,
                     2,   # rounds — neighbourhood exploration
                     200, # n_perturb — full operator coverage (ring walk + terminal removal)
-                    3,   # top_k — cap Boltz calls per round
+                    5,   # top_k — §NNNN: wider net for scaffold-diversity selection below
                 )
+                # §NNNN: scaffold-diverse selection — each §MM fast-screen slot tests
+                # a different chemical family, maximising coverage per GPU budget.
+                if not _mm_salsa_hits.empty and len(_mm_salsa_hits) > 3:
+                    _mm_salsa_hits = _scaffold_diverse_candidates(_mm_salsa_hits, max_k=3)
             except Exception as _mm_salsa_err:
                 bt.logging.warning(f"§MM SALSA error: {_mm_salsa_err}")
                 break
