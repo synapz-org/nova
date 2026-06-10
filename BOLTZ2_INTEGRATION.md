@@ -1,5 +1,20 @@
 # Boltz-2 Miner Integration
 
+## Current Status (as of 2026-06-10)
+
+§OOOO added 2026-06-10: scaffold-diverse SALSA seed selection in the main PSICHIC loop.
+The multi-seed SALSA block previously selected the top-3 molecules from
+`global_candidate_pool` by PSICHIC (or surrogate-reranked) score as SALSA starting
+points.  When SALSA or prior streaming has converged to one chemical region, the top-3
+candidates often share a single Murcko scaffold, causing all three SALSA passes to
+explore the same structural neighbourhood and wasting 2 of the 3 SALSA budgets on
+redundant chemical hypotheses.  §OOOO widens the seed pool to top-5 and applies
+`_scaffold_diverse_candidates(pool, max_k=3)` to select the 3 most scaffold-diverse
+starting points.  This is the input-diversity complement to §NNNN (which added output
+diversity at the fast-screening stage) and §VV/§QQ (basin-hop scaffold diversity inside
+§MM).  The overhead is one MurckoScaffold call per candidate (~0.5 ms total) — negligible
+vs Boltz.  Affected file: `neurons/miner.py`.
+
 ## Current Status (as of 2026-06-09)
 
 §NNNN added 2026-06-09: scaffold-diverse SALSA hit selection in §FF and §MM.
@@ -168,6 +183,7 @@ Two conditional/research items remain (§D, FBLD).
 | HHH | Hardware-adaptive `sampling_steps_affinity` 100→150 on A100/H100 | boltz/wrapper.py | ✅ |
 | III | Reduced `recycling_steps_affinity` 5→2 for §NN fast pre-screening | boltz/main.py, boltz/wrapper.py | ✅ |
 | NNNN | Scaffold-diverse SALSA hit selection in §FF and §MM (top_k 3→5 + diversity filter) | neurons/miner.py | ✅ |
+| OOOO | Scaffold-diverse SALSA seed selection (top-5 pool → 3 diverse input seeds) | neurons/miner.py | ✅ |
 
 ---
 

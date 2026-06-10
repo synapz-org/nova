@@ -641,11 +641,21 @@ async def run_psichic_model_loop(state: Dict[str, Any]) -> None:
                         except Exception as _zz_s_err:
                             bt.logging.debug(f"[ZZ] SALSA seed re-rank skipped: {_zz_s_err}")
 
-                        # Multi-seed SALSA: run from up to top-3 candidates so we
-                        # explore three distinct chemical neighbourhoods in one pass.
-                        # Runtime: ~3 x 180 ms = ~540 ms CPU -- negligible vs Boltz.
-                        _n_seeds = min(3, len(state['global_candidate_pool']))
-                        _seeds = state['global_candidate_pool'].head(_n_seeds)['product_smiles'].tolist()
+                        # §OOOO: multi-seed SALSA with scaffold-diverse input seeds.
+                        # Take the top-5 (by PSICHIC / surrogate-reranked order) then
+                        # apply _scaffold_diverse_candidates to select the 3 most
+                        # structurally distinct starting points.  When SALSA or prior
+                        # streaming has converged to one scaffold region, this ensures
+                        # the 3 SALSA passes each explore a genuinely different chemical
+                        # neighbourhood — complementing §NNNN (output diversity) and
+                        # §VV/§QQ (basin-hop diversity) with upstream seed diversity.
+                        # Runtime overhead: one extra MurckoScaffold call per candidate
+                        # (~0.5 ms total) -- negligible vs Boltz.
+                        _seed_cand_n = min(5, len(state['global_candidate_pool']))
+                        _seed_cand = state['global_candidate_pool'].head(_seed_cand_n)
+                        _seed_cand = _scaffold_diverse_candidates(_seed_cand, max_k=3)
+                        _n_seeds = len(_seed_cand)
+                        _seeds = _seed_cand['product_smiles'].tolist()
                         # §SS: extend with up to 3 ChEMBL known actives as additional seeds.
                         # These are validated binders fetched at startup; each is used as a
                         # SALSA starting point and the NN lookup maps perturbations back to
