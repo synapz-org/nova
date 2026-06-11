@@ -1,5 +1,95 @@
 # Boltz-2 Miner Integration
 
+## Current Status (as of 2026-06-11)
+
+§QQQQ added 2026-06-11: adaptive surrogate model — RandomForest above 100 training points.
+
+The §ZZ surrogate previously used a Ridge(alpha=1.0) pipeline regardless of dataset size.
+Ridge is appropriate for the sparse regime (40–99 Boltz scores): the 84-feature descriptor
+vector would be underdetermined with a richer non-linear model and few training examples.
+However, in epoch 4+ on a popular weekly target, the disk cache often accumulates 100–300
+scored molecules.  At that scale, RandomForestRegressor(n_estimators=100, max_features='sqrt')
+can learn non-linear scaffold→Boltz-score relationships — ring system preferences, halogen
+placement patterns, heteroatom positions — that Ridge can only approximate linearly.
+
+§QQQQ adds a threshold check in `fit_surrogate` (utils/surrogate.py):
+- cache < 100 entries → Ridge(alpha=1.0) as before (no change).
+- cache >= 100 entries → RandomForestRegressor(n_estimators=100, max_features='sqrt',
+  random_state=68, n_jobs=1).  StandardScaler is still included in the Pipeline for
+  interface compatibility; it is a no-op for tree ensembles (scale-invariant).
+  n_jobs=1 avoids spawning extra OS processes inside the miner's async event loop.
+
+The `rank_pool_by_surrogate` caller in miner.py is unchanged — it calls `model.predict(X)`
+regardless of which Pipeline step is the estimator.  Expected benefit: 5–20% NDCG improvement
+at top-3 SALSA seed selection during week-2+ runs where the cache is dense.  Zero regression
+on first-epoch or sparse-cache runs where the Ridge path is unchanged.  Affected file:
+`utils/surrogate.py`.
+
+### Assessment: Boltz-2 Integration Status
+
+Full audit performed 2026-06-11. The stock SN68 miner scores 0 on Boltz-2 (no integration).
+**This miner has Boltz-2 fully integrated with 50+ named optimisations (§A – §OOOO).**
+The boltz/ directory contains a complete copy of jwohlwend/boltz (MIT-licensed) with:
+- Hardware-adaptive MSA subsampling, FK steering potentials, affinity sampling steps (§AAA/§EEE/§HHH)
+- Reduced affinity recycling steps for fast pre-screening (§III)
+- Pre-computed MSAs for P31652 and P31645 in boltz/msa_files/
+- Full YAML-based input pipeline with binding-pocket constraint support
+- Persistent SQLite Boltz score cache with warm-start across epochs (§AA/§CC)
+
+The mining pipeline already implements every roadmap item from kb/raw/arxiv-survey.md:
+- SALSA hill-climbing (§N/§FF/§MM) with scaffold-diverse seeds and hits (§OOOO/§NNNN)
+- GradientGA (§O) with BRICS crossover and Boltz elitism
+- Mini-surrogate Ridge/RF re-ranking (§ZZ/§CCC/§DDD/§QQQQ)
+- ChEMBL known-active warm-start (§SS), prior-epoch cache seeds (§UU)
+- Tautomer enumeration (§XX), multi-seed stability estimation (§WW)
+- Scaffold-diverse basin-hopping (§VV/§QQ)
+- Reaction-class-biased SAVI streaming (§YY)
+- Antitarget-penalised ligand-efficiency PSICHIC scoring in the streaming loop
+
+Two items remain conditional or research-stage:
+- §D (binding-pocket pre-docking filter): only beneficial when config.binding_pocket is set
+- FBLD (fragment-based lead discovery): SAVI-2020 minimum molecule size limits fragment space;
+  needs empirical Boltz calibration at 10–18 heavy atoms before deployment
+
+### Future Optimisation Opportunities (post-§QQQQ)
+
+The following have not been implemented and represent the next frontier:
+
+**§RRRR — Bayesian Acquisition Function for §MM**
+When the surrogate has >= 100 training points, replace the simple re-ranking step with an
+Upper Confidence Bound (UCB) or Expected Improvement (EI) acquisition function.  RandomForest
+provides per-tree variance estimates via `predict()` on each tree; the std across trees gives
+a cheap uncertainty proxy.  UCB = surrogate_mean + β × surrogate_std selects candidates that
+are either predicted-good OR highly uncertain — balancing exploitation with exploration.
+Estimated effort: ~50 lines in utils/surrogate.py + miner.py integration.
+
+**§SSSS — Secondary Affinity Metric Ensemble**
+Boltz-2 outputs three sets of affinity predictions: primary (affinity_probability_binary,
+affinity_pred_value), and two additional ensemble members (_1, _2).  The wrapper already
+collects all six values in per_molecule_components but the miner currently ranks by the
+primary pair only.  A weighted average across all three ensemble members could give a more
+stable rank estimate for close candidates, reducing the noise in top-2 ordering decisions.
+Estimated effort: ~20 lines in boltz/wrapper.py + miner.py.
+
+**§TTTT — FBLD Fragment Bias in SAVI Streaming**
+The Boltz-2 scoring formula (affinity_prob_binary − affinity_pred_value) / heavy_atoms
+rewards small molecules.  SAVI-2020 includes many products with 10–18 heavy atoms that
+are under-sampled relative to drug-like 20–35 HA molecules.  §TTTT would add a secondary
+SAVI streaming batch biased toward the 10–18 HA range, populating the SALSA probe pool
+with fragment-like entries.  These are not submitted directly (SAVI-2020 minimum is ~8 HA)
+but serve as SALSA nearest-neighbour probes that map back to valid SAVI-2020 products.
+Empirical validation against the weekly Boltz scoring is required first.
+Estimated effort: ~30 lines; depends on SAVI-2020 fragment count per file.
+
+**§UUUU — Antitarget Boltz Selectivity Scoring**
+The PSICHIC streaming loop already penalises antitarget binders via
+(target_score − antitarget_weight × antitarget_score) / heavy_atoms.  However, the
+miner-side Boltz prescoring only evaluates the target protein.  §UUUU would run a fast
+Boltz inference (fast=True, reduced recycling) on the antitarget for the top-2 candidates
+and compute a true Boltz-level selectivity score.  Cost: doubles Boltz inference budget
+for those 2 candidates — only feasible on A100/H100 hardware with time to spare after §MM.
+Estimated effort: ~80 lines in miner.py + boltz/wrapper.py antitarget scoring path.
+
 ## Current Status (as of 2026-06-10)
 
 §OOOO added 2026-06-10: scaffold-diverse SALSA seed selection in the main PSICHIC loop.

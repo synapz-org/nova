@@ -78,16 +78,27 @@ def _descriptor_vector(smiles: str) -> Optional[list]:
         return None
 
 
+_RF_THRESHOLD = 100  # §QQQQ: switch to RandomForest above this many training points
+
+
 def fit_surrogate(db_path: str, protein: str, min_points: int = 40):
     """
-    Fit a Ridge regression surrogate on Boltz-2 scores from the disk cache.
+    Fit a surrogate model on Boltz-2 scores from the disk cache.
 
     Reads all (smiles, score) pairs for *protein* from the SQLite cache and
-    fits a StandardScaler→Ridge(alpha=1.0) pipeline on the 84-feature descriptor
-    vectors (20 physicochemical + 64 Morgan FP bits).  The scaler normalises each
-    feature to zero mean / unit variance so that Ridge penalises all features
-    equally regardless of their absolute range.  This is §CCC (StandardScaler
-    pipeline) combined with §DDD (Morgan fingerprint augmentation).
+    fits a StandardScaler→model pipeline on the 84-feature descriptor vectors
+    (20 physicochemical + 64 Morgan FP bits).
+
+    §QQQQ — Adaptive model selection:
+    - < 100 training points: Ridge(alpha=1.0).  Linear model, strong regularisation,
+      suitable for the sparse early-epoch regime where non-linearities cannot be
+      estimated reliably.
+    - >= 100 training points: RandomForestRegressor(n_estimators=100).  Tree ensembles
+      capture non-linear scaffold→Boltz-score relationships (ring system preferences,
+      halogen placement, heteroatom patterns) that Ridge cannot express.  n_jobs=1
+      avoids spawning extra processes inside the miner's async event loop.
+      StandardScaler is included in the pipeline for interface consistency; it has no
+      effect on RF predictions (trees are scale-invariant).
 
     Returns the fitted pipeline, or None if:
     - sklearn is unavailable
@@ -96,6 +107,7 @@ def fit_surrogate(db_path: str, protein: str, min_points: int = 40):
     """
     try:
         from sklearn.linear_model import Ridge
+        from sklearn.ensemble import RandomForestRegressor
         from sklearn.pipeline import Pipeline
         from sklearn.preprocessing import StandardScaler
     except ImportError:
@@ -124,9 +136,19 @@ def fit_surrogate(db_path: str, protein: str, min_points: int = 40):
         return None
 
     try:
+        if len(X) >= _RF_THRESHOLD:
+            # §QQQQ: RandomForest for non-linear scaffold-score patterns.
+            learner = RandomForestRegressor(
+                n_estimators=100,
+                max_features='sqrt',
+                random_state=68,
+                n_jobs=1,
+            )
+        else:
+            learner = Ridge(alpha=1.0)
         model = Pipeline([
             ('scaler', StandardScaler()),
-            ('ridge', Ridge(alpha=1.0)),
+            ('model', learner),
         ])
         model.fit(X, y)
         return model
