@@ -44,7 +44,7 @@ from utils.msa import ensure_msa
 from utils.salsa import run_salsa_search
 from utils.genetic import run_gradient_ga
 from utils.chembl import get_chembl_seeds
-from utils.surrogate import fit_surrogate, rank_pool_by_surrogate
+from utils.surrogate import fit_surrogate, rank_pool_by_surrogate, ucb_rank_pool
 from PSICHIC.wrapper import PsichicWrapper
 from boltz.wrapper import BoltzWrapper
 from btdr import QuicknetBittensorDrandTimelock
@@ -634,10 +634,12 @@ async def run_psichic_model_loop(state: Dict[str, Any]) -> None:
                                 state['config'].weekly_target,
                             )
                             if _zz_seed_model is not None and not state['global_candidate_pool'].empty:
-                                state['global_candidate_pool'] = rank_pool_by_surrogate(
+                                # §RRRR: UCB ranking when surrogate is RF (≥100 pts);
+                                # falls back to plain mean for Ridge automatically.
+                                state['global_candidate_pool'] = ucb_rank_pool(
                                     state['global_candidate_pool'], _zz_seed_model
                                 )
-                                bt.logging.info("[ZZ] SALSA seeds re-ranked by surrogate.")
+                                bt.logging.info("[§RRRR/ZZ] SALSA seeds re-ranked by UCB surrogate.")
                         except Exception as _zz_s_err:
                             bt.logging.debug(f"[ZZ] SALSA seed re-rank skipped: {_zz_s_err}")
 
@@ -1197,9 +1199,11 @@ async def run_boltz_prescoring(state: Dict[str, Any], max_candidates: int = 5) -
         try:
             _zz_model = fit_surrogate(db_path, protein)
             if _zz_model is not None:
-                candidates = rank_pool_by_surrogate(candidates, _zz_model)
+                # §RRRR: UCB ranking when surrogate is RF (≥100 pts);
+                # falls back to plain mean for Ridge automatically.
+                candidates = ucb_rank_pool(candidates, _zz_model)
                 bt.logging.info(
-                    f"[ZZ] Pre-Boltz candidates re-ranked by surrogate "
+                    f"[§RRRR/ZZ] Pre-Boltz candidates re-ranked by UCB surrogate "
                     f"({len(candidates)} entries, target={protein})."
                 )
         except Exception as _zz_err:
@@ -1350,7 +1354,44 @@ async def run_boltz_prescoring(state: Dict[str, Any], max_candidates: int = 5) -
                                     f"(ligand_iptm={_li:.3f}, conf={_cs:.3f}): "
                                     f"ordering {score:.4f} -> {_rr_score:.4f}"
                                 )
-                    _rr_eff_scores[smiles] = _rr_score
+                    # §SSSS: Ensemble scoring — average ligand-efficiency across the 3
+                    # Boltz affinity ensemble members (primary + _1 + _2).  Averaging
+                    # valid pairs reduces noise in close-call ordering decisions without
+                    # changing what is cached: all_scores / disk cache always store the
+                    # primary score so §CC and §MM comparisons stay consistent.
+                    _ssss_eff = _rr_score  # default: confidence-adjusted primary
+                    try:
+                        _ha = _comps.get('heavy_atom_count') or 1
+                        if _ha and _ha > 0:
+                            _ssss_pairs = [
+                                (_comps.get('affinity_probability_binary'),
+                                 _comps.get('affinity_pred_value')),
+                                (_comps.get('affinity_probability_binary1'),
+                                 _comps.get('affinity_pred_value1')),
+                                (_comps.get('affinity_probability_binary2'),
+                                 _comps.get('affinity_pred_value2')),
+                            ]
+                            _mem_scores = [
+                                (apb - apv) / _ha
+                                for apb, apv in _ssss_pairs
+                                if isinstance(apb, (int, float))
+                                and isinstance(apv, (int, float))
+                                and math.isfinite(apb) and math.isfinite(apv)
+                            ]
+                            if len(_mem_scores) >= 2:
+                                _ssss_raw = sum(_mem_scores) / len(_mem_scores)
+                                # Preserve §RR confidence-penalty ratio if it was applied.
+                                if math.isfinite(score) and score != 0 and _rr_score != score:
+                                    _ssss_eff = _ssss_raw * (_rr_score / score)
+                                else:
+                                    _ssss_eff = _ssss_raw
+                                bt.logging.debug(
+                                    f"  [§SSSS] ensemble={_ssss_eff:.4f} "
+                                    f"(n={len(_mem_scores)}, primary={score:.4f})"
+                                )
+                    except Exception:
+                        pass  # fall back to _rr_score
+                    _rr_eff_scores[smiles] = _ssss_eff
 
                     # Persist to both cache layers (product_name enables warm-start §AA)
                     boltz_cache[key] = score

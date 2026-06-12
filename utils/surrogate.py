@@ -187,3 +187,76 @@ def rank_pool_by_surrogate(pool_df, model, smiles_col: str = 'product_smiles'):
         )
     except Exception:
         return pool_df
+
+
+def predict_with_uncertainty(model, X: list) -> tuple:
+    """
+    Return (mean_preds, std_preds) arrays.
+
+    For RandomForestRegressor: std comes from variance across individual trees,
+    a free uncertainty proxy with no extra calibration cost.
+    For Ridge and other non-ensemble models: std is all-zeros, so UCB reduces
+    to plain mean ranking (identical to rank_pool_by_surrogate).
+    """
+    try:
+        from sklearn.ensemble import RandomForestRegressor
+    except ImportError:
+        preds = model.predict(X)
+        return preds, np.zeros(len(preds))
+
+    scaler = model.named_steps['scaler']
+    learner = model.named_steps['model']
+    X_arr = np.asarray(X, dtype=float)
+    X_scaled = scaler.transform(X_arr)
+
+    if isinstance(learner, RandomForestRegressor):
+        # (n_trees, n_samples) — each tree.predict is a cheap lookup table call
+        tree_preds = np.array([t.predict(X_scaled) for t in learner.estimators_])
+        return tree_preds.mean(axis=0), tree_preds.std(axis=0)
+    else:
+        preds = learner.predict(X_scaled)
+        return preds, np.zeros(len(preds))
+
+
+def ucb_rank_pool(pool_df, model, beta: float = 1.0, smiles_col: str = 'product_smiles'):
+    """
+    §RRRR: Re-rank pool_df by UCB = surrogate_mean + beta * surrogate_std.
+
+    When the surrogate is a RandomForestRegressor (≥100 cache points, §QQQQ),
+    per-tree variance provides an uncertainty estimate at zero extra inference
+    cost.  UCB(β=1.0) selects candidates that are either predicted-good OR
+    underexplored, balancing exploitation with exploration.  Falls back to
+    plain mean ranking (rank_pool_by_surrogate) for Ridge models and on any
+    error so the call is always safe.
+    """
+    try:
+        from sklearn.ensemble import RandomForestRegressor
+        _is_rf = isinstance(model.named_steps.get('model'), RandomForestRegressor)
+    except Exception:
+        _is_rf = False
+
+    if not _is_rf:
+        return rank_pool_by_surrogate(pool_df, model, smiles_col)
+
+    try:
+        vecs = [_descriptor_vector(s) for s in pool_df[smiles_col]]
+        n_valid = sum(1 for v in vecs if v is not None)
+        if n_valid < max(1, len(pool_df) * 0.5):
+            return pool_df
+
+        placeholder = [0.0] * _N_FEATURES
+        X = [v if v is not None else placeholder for v in vecs]
+
+        mean_preds, std_preds = predict_with_uncertainty(model, X)
+        ucb_scores = mean_preds + beta * std_preds
+
+        pool_copy = pool_df.copy()
+        pool_copy['surrogate_score'] = ucb_scores
+        return (
+            pool_copy
+            .sort_values('surrogate_score', ascending=False)
+            .drop(columns=['surrogate_score'])
+            .reset_index(drop=True)
+        )
+    except Exception:
+        return rank_pool_by_surrogate(pool_df, model, smiles_col)

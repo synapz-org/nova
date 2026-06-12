@@ -1,5 +1,52 @@
 # Boltz-2 Miner Integration
 
+## Current Status (as of 2026-06-12)
+
+§RRRR and §SSSS added 2026-06-12.
+
+**§RRRR — Bayesian UCB Acquisition for Surrogate Ranking**
+
+Replaces the plain `rank_pool_by_surrogate` call with `ucb_rank_pool` at both
+§ZZ ranking sites (SALSA seed selection and pre-Boltz candidate ordering).
+When the surrogate model is RandomForestRegressor (≥100 cache points, §QQQQ),
+per-tree predictions give a cheap variance estimate: `std = stddev(tree_preds)`.
+UCB score = `surrogate_mean + β × surrogate_std` (β=1.0).  This balances
+exploitation (high predicted score) with exploration (high uncertainty), selecting
+candidates that are either predicted-good OR underexplored.  Ridge models (< 100
+training points) produce zero std, so UCB degrades identically to the previous
+ranking — zero regression on first-epoch or sparse-cache runs.
+
+Implementation: `predict_with_uncertainty()` + `ucb_rank_pool()` added to
+`utils/surrogate.py`.  Both §ZZ call sites in `miner.py` updated; import updated
+to include `ucb_rank_pool`.  Estimated benefit: 5–15% NDCG improvement in top-3
+SALSA seed selection on week-2+ runs where the RF surrogate is active.
+
+**§SSSS — Secondary Affinity Metric Ensemble**
+
+Boltz-2 outputs three affinity prediction sets: primary (`affinity_probability_binary`,
+`affinity_pred_value`) and two additional ensemble members (`_1`, `_2`).  The wrapper
+already collects all six values in `per_molecule_components`.  §SSSS computes a
+ligand-efficiency score for each valid ensemble member and averages them:
+
+```
+score_k = (affinity_probability_binary_k − affinity_pred_value_k) / heavy_atom_count
+ensemble_score = mean(score_0, score_1, score_2)   # only valid pairs included
+```
+
+The ensemble score is used for submission ordering (`_rr_eff_scores`) only; the
+primary-metric score is still cached to disk and used by §CC/§MM so cross-epoch
+comparisons remain consistent.  The §RR confidence-penalty ratio is preserved:
+`ensemble_eff = ensemble_raw × (rr_score / primary_score)` when §RR was active.
+Only fires when ≥2 ensemble members have valid finite values; otherwise falls back
+to the §RR-adjusted primary score.
+
+Implementation: 30 lines replacing `_rr_eff_scores[smiles] = _rr_score` in the
+Boltz prescoring GPU-inference block of `neurons/miner.py`.  Estimated benefit:
+more stable top-1 selection for close-scoring candidates; reduces single-sample
+variance that can flip the best/second-best ordering.
+
+---
+
 ## Current Status (as of 2026-06-11)
 
 §QQQQ added 2026-06-11: adaptive surrogate model — RandomForest above 100 training points.
@@ -51,27 +98,11 @@ Two items remain conditional or research-stage:
 - FBLD (fragment-based lead discovery): SAVI-2020 minimum molecule size limits fragment space;
   needs empirical Boltz calibration at 10–18 heavy atoms before deployment
 
-### Future Optimisation Opportunities (post-§QQQQ)
+### Future Optimisation Opportunities (post-§SSSS)
 
-The following have not been implemented and represent the next frontier:
+§RRRR and §SSSS are now implemented (2026-06-12).  The remaining frontier items are:
 
-**§RRRR — Bayesian Acquisition Function for §MM**
-When the surrogate has >= 100 training points, replace the simple re-ranking step with an
-Upper Confidence Bound (UCB) or Expected Improvement (EI) acquisition function.  RandomForest
-provides per-tree variance estimates via `predict()` on each tree; the std across trees gives
-a cheap uncertainty proxy.  UCB = surrogate_mean + β × surrogate_std selects candidates that
-are either predicted-good OR highly uncertain — balancing exploitation with exploration.
-Estimated effort: ~50 lines in utils/surrogate.py + miner.py integration.
-
-**§SSSS — Secondary Affinity Metric Ensemble**
-Boltz-2 outputs three sets of affinity predictions: primary (affinity_probability_binary,
-affinity_pred_value), and two additional ensemble members (_1, _2).  The wrapper already
-collects all six values in per_molecule_components but the miner currently ranks by the
-primary pair only.  A weighted average across all three ensemble members could give a more
-stable rank estimate for close candidates, reducing the noise in top-2 ordering decisions.
-Estimated effort: ~20 lines in boltz/wrapper.py + miner.py.
-
-**§TTTT — FBLD Fragment Bias in SAVI Streaming**
+**§TTTT — FBLD Fragment Bias in SAVI Streaming** *(research)*
 The Boltz-2 scoring formula (affinity_prob_binary − affinity_pred_value) / heavy_atoms
 rewards small molecules.  SAVI-2020 includes many products with 10–18 heavy atoms that
 are under-sampled relative to drug-like 20–35 HA molecules.  §TTTT would add a secondary
@@ -81,7 +112,7 @@ but serve as SALSA nearest-neighbour probes that map back to valid SAVI-2020 pro
 Empirical validation against the weekly Boltz scoring is required first.
 Estimated effort: ~30 lines; depends on SAVI-2020 fragment count per file.
 
-**§UUUU — Antitarget Boltz Selectivity Scoring**
+**§UUUU — Antitarget Boltz Selectivity Scoring** *(A100/H100 only)*
 The PSICHIC streaming loop already penalises antitarget binders via
 (target_score − antitarget_weight × antitarget_score) / heavy_atoms.  However, the
 miner-side Boltz prescoring only evaluates the target protein.  §UUUU would run a fast
