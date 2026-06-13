@@ -197,6 +197,58 @@ def _apply_warm_start(state: Dict[str, Any], db_path: str, protein: str) -> None
     )
 
 
+def _pppp_seed_savi_pool(db_path: str, protein: str, limit: int = 50) -> Optional[Any]:
+    """
+    §PPPP: Build a seed DataFrame from the top-*limit* Boltz-validated molecules in
+    the disk cache for *protein*.
+
+    Pre-populating savi_stream_pool at epoch start means that when SALSA triggers
+    (pool >= 500) the neighbourhood search already contains Boltz-confirmed anchors.
+    Molecules streaming from PSICHIC during the first ~10 minutes are added on top;
+    if any of them fall near a cached anchor in fingerprint space, SALSA will select
+    that anchor (or its nearest neighbour) as a SALSA output — immediately exploring
+    the neighbourhood of a proven binder rather than a freshly-seen PSICHIC candidate.
+
+    The Boltz score is stored directly as *combined_score*.  Because Boltz
+    ligand-efficiency scores are typically larger than PSICHIC LE scores, SALSA
+    will preferentially map to cached molecules when they are Tanimoto-nearest to a
+    perturbation.  This is the desired behaviour: cached molecules are Boltz-validated
+    and are better SALSA seeds than PSICHIC-ranked unknowns.
+
+    Returns a DataFrame with columns [product_name, product_smiles, combined_score,
+    heavy_atoms], or None when the cache is empty or an error occurs.
+    """
+    try:
+        rows = _disk_cache_get_candidates(db_path, protein, limit=limit)
+        if not rows:
+            return None
+        records = []
+        for row in rows:
+            smiles = row['product_smiles']
+            mol = Chem.MolFromSmiles(smiles)
+            if mol is None:
+                continue
+            ha = mol.GetNumHeavyAtoms()
+            records.append({
+                'product_name': row['product_name'],
+                'product_smiles': smiles,
+                'combined_score': float(row['combined_score']),
+                'heavy_atoms': ha,
+            })
+        if not records:
+            return None
+        seed_df = pd.DataFrame(records)
+        seed_df.sort_values('combined_score', ascending=False, inplace=True)
+        seed_df.reset_index(drop=True, inplace=True)
+        bt.logging.info(
+            f"[§PPPP] Pre-seeded savi_stream_pool with {len(seed_df)} Boltz-validated "
+            f"molecules from disk cache (target={protein})"
+        )
+        return seed_df
+    except Exception:
+        return None
+
+
 # ----------------------------------------------------------------------------
 # 1. CONFIG & ARGUMENT PARSING
 # ----------------------------------------------------------------------------
@@ -2302,6 +2354,12 @@ async def run_miner(config: argparse.Namespace) -> None:
     # fallback submission before PSICHIC streaming finds new candidates.
     _apply_warm_start(state, state['boltz_cache_db'], config.weekly_target)
 
+    # §PPPP: Pre-seed savi_stream_pool with top Boltz-validated molecules so SALSA
+    # has proven-good anchors in the pool from the very first PSICHIC chunk.
+    _pppp_pool = _pppp_seed_savi_pool(state['boltz_cache_db'], config.weekly_target)
+    if _pppp_pool is not None:
+        state['savi_stream_pool'] = _pppp_pool
+
     # Ensure MSA file exists for the current weekly target (§S).
     # Boltz-2 predictions are significantly weaker without an MSA -- this call
     # is a no-op when the file already exists and fetches it via ColabFold
@@ -2473,6 +2531,12 @@ async def run_miner(config: argparse.Namespace) -> None:
                 # there is always a valid Boltz-validated submission available
                 # even before PSICHIC streaming produces new candidates.
                 _apply_warm_start(state, state['boltz_cache_db'], config.weekly_target)
+
+                # §PPPP: Pre-seed savi_stream_pool with top Boltz-validated molecules
+                # so SALSA has proven-good anchors in the pool from the first chunk.
+                _pppp_pool = _pppp_seed_savi_pool(state['boltz_cache_db'], config.weekly_target)
+                if _pppp_pool is not None:
+                    state['savi_stream_pool'] = _pppp_pool
 
                 # Initialize models for new proteins
                 try:

@@ -1,5 +1,48 @@
 # Boltz-2 Miner Integration
 
+## Current Status (as of 2026-06-13)
+
+§PPPP added 2026-06-13: SALSA Elite Pool Pre-seeding at epoch start.
+
+**§PPPP — SALSA Elite Pool Pre-seeding**
+
+At epoch start (and at miner startup), the top-50 Boltz-validated molecules from the
+persistent SQLite disk cache are pre-loaded into `savi_stream_pool` before PSICHIC
+streaming begins.  Each cached molecule contributes a row with `product_name`,
+`product_smiles`, `combined_score` (= its Boltz ligand-efficiency score), and
+`heavy_atoms` — the same schema as PSICHIC-streamed rows.
+
+**Why this helps:** The SALSA trigger fires when `savi_stream_pool ≥ 500`.  Previously
+the pool contained only PSICHIC-scored molecules from the current epoch's streaming;
+prior Boltz winners were only used as DIRECT SEEDS (§UU) but were not in the pool,
+so their bioisosteric neighbours were unreachable until PSICHIC happened to stream them.
+After §PPPP, the 50 cached molecules are present as pool anchors from the first PSICHIC
+chunk.  When SALSA maps a perturbation to the nearest pool molecule, if a proven Boltz
+binder is Tanimoto-nearest it gets selected — immediately directing the neighbourhood
+search toward a confirmed high-scoring chemical region.
+
+**Score scale:** Cached Boltz LE scores are typically 0.2–0.5 while PSICHIC LE scores
+are ~0.01–0.05.  SALSA uses `combined_score` only to pick the best discovered hit as the
+next seed; the Boltz-scale anchors will be selected as seeds over PSICHIC-scored entries
+when they are in the Tanimoto neighbourhood.  This is the desired behaviour — the SALSA
+hill-climbing starts from a Boltz-validated optimum rather than a PSICHIC estimate.
+
+**Implementation:**
+- `_pppp_seed_savi_pool(db_path, protein, limit=50)` — new helper in `neurons/miner.py`
+  (~45 lines).  Reads top-50 cache rows, RDKit-parses each SMILES for `heavy_atoms`,
+  builds a DataFrame, returns None on empty cache or error.
+- Called at miner startup (after `_apply_warm_start`) and at every epoch rollover.
+- On first run (empty cache) it is a pure no-op — zero regression.
+
+**Estimated benefit:** On epoch 2+ (cache has ≥ 1 prior winner), SALSA gains 1–50
+pre-validated anchor molecules in its search pool.  Molecules that PSICHIC later streams
+near these anchors map directly to them via Tanimoto, so SALSA explores the neighbourhood
+of a Boltz-confirmed binder within the first SALSA round — without waiting for PSICHIC to
+re-discover that chemical region from scratch.  Most effective when PSICHIC streaming
+re-discovers similar scaffolds (common for weekly targets with stable binding preferences).
+
+---
+
 ## Current Status (as of 2026-06-12)
 
 §RRRR and §SSSS added 2026-06-12.
@@ -305,6 +348,7 @@ Two conditional/research items remain (§D, FBLD).
 | III | Reduced `recycling_steps_affinity` 5→2 for §NN fast pre-screening | boltz/main.py, boltz/wrapper.py | ✅ |
 | NNNN | Scaffold-diverse SALSA hit selection in §FF and §MM (top_k 3→5 + diversity filter) | neurons/miner.py | ✅ |
 | OOOO | Scaffold-diverse SALSA seed selection (top-5 pool → 3 diverse input seeds) | neurons/miner.py | ✅ |
+| PPPP | SALSA Elite Pool Pre-seeding — top-50 disk-cache molecules pre-loaded into savi_stream_pool at epoch start | neurons/miner.py | ✅ |
 
 ---
 
@@ -725,31 +769,11 @@ each confirmed improvement.  On the first epoch (no prior data) all weights defa
 Estimated effort: ~60 lines in `utils/salsa.py` + 30 lines in `neurons/miner.py`.
 Priority: medium.
 
-### §PPPP — SALSA Elite Pool Pre-seeding at Epoch Start
+### §PPPP — SALSA Elite Pool Pre-seeding at Epoch Start ✅ Implemented
 
-**Observation:** The `savi_stream_pool` starts empty at each epoch.  SALSA and §MM can only
-search among molecules accumulated during the current epoch's PSICHIC streaming (~10,000 by
-trigger time).  Prior-epoch Boltz winners are used as DIRECT SEEDS (§UU) but are NOT in
-the pool — their bioisosteric neighbours are unreachable until the current epoch happens to
-stream them.
-
-**Proposal:** At epoch start, pre-populate `savi_stream_pool` with the top-50 Boltz-validated
-molecules from the disk cache.  These molecules are guaranteed to be structurally valid and
-SAVI-submittable (they have product_names from prior epochs).  Once SALSA fires (≥500 pool
-molecules), the pool already contains 50 confirmed high-scoring molecules as anchors.  Any
-PSICHIC molecule that falls near these anchors in Morgan fingerprint space will map to a
-neighbour of a proven Boltz binder — regardless of whether the PSICHIC score is high.
-
-**Risk:** These 50 molecules need accurate `heavy_atoms` and `combined_score` columns to
-participate in SALSA ranking.  `combined_score` could be reconstructed from cached Boltz
-scores (not PSICHIC), but SALSA sorts by `combined_score` as a PSICHIC proxy.  Mixing
-Boltz scores and PSICHIC scores in one DataFrame column would corrupt the PSICHIC ranking.
-**Mitigation:** Assign the cached Boltz score directly as `combined_score` (normalised to
-the same scale as PSICHIC by dividing by `boltz_time_per_mol`-adjusted factor, or simply
-by using the raw score).  SALSA's nearest-neighbour search uses Morgan FP Tanimoto, not
-`combined_score`; the score only determines which hit is selected as the next SALSA seed.
-
-Estimated effort: ~40 lines in `neurons/miner.py`.  Priority: medium.
+See full description in "Current Status (as of 2026-06-13)" above.
+`_pppp_seed_savi_pool()` added to `neurons/miner.py`; called at miner startup and at
+every epoch rollover.  Zero regression on first-epoch (empty cache) runs.
 
 ### §YY — Reaction-Class-Biased SAVI-2020 Streaming ✅ Implemented
 
