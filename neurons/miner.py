@@ -2474,6 +2474,40 @@ async def run_miner(config: argparse.Namespace) -> None:
                 # even before PSICHIC streaming produces new candidates.
                 _apply_warm_start(state, state['boltz_cache_db'], config.weekly_target)
 
+                # §PPPP: Pre-seed savi_stream_pool with top-50 Boltz-validated
+                # molecules from disk cache.  These act as attractor anchors in
+                # Morgan fingerprint space: when SALSA maps any perturbation back
+                # to the pool via Tanimoto, a prior Boltz winner that is the
+                # nearest neighbour will be selected and used as the next SALSA
+                # seed — directing hill-climbing toward validated binders from
+                # the very first SALSA round.  The Boltz score is used directly
+                # as combined_score so SALSA's score-based seed-advance logic
+                # naturally promotes these anchors over random SAVI molecules.
+                _pppp_rows = _disk_cache_get_candidates(
+                    state['boltz_cache_db'], config.weekly_target, limit=50
+                )
+                if _pppp_rows:
+                    try:
+                        _pppp_df = pd.DataFrame(_pppp_rows)
+                        _pppp_df['heavy_atoms'] = _pppp_df['product_smiles'].apply(
+                            lambda s: get_heavy_atom_count(s) or 0
+                        )
+                        _pppp_df = _pppp_df[_pppp_df['heavy_atoms'] > 0].reset_index(
+                            drop=True
+                        )
+                        if not _pppp_df.empty:
+                            state['savi_stream_pool'] = _pppp_df
+                            bt.logging.info(
+                                f"[§PPPP] Pre-seeded savi_stream_pool with "
+                                f"{len(_pppp_df)} Boltz-validated anchors "
+                                f"from disk cache."
+                            )
+                    except Exception as _pppp_exc:
+                        bt.logging.debug(
+                            f"[§PPPP] Pool pre-seeding failed (non-fatal): "
+                            f"{_pppp_exc}"
+                        )
+
                 # Initialize models for new proteins
                 try:
                     for target_protein in state['current_challenge_targets']:
