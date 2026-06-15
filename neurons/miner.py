@@ -569,7 +569,26 @@ async def run_psichic_model_loop(state: Dict[str, Any]) -> None:
                         )
                         _pool_combined.drop_duplicates(subset=['product_name'], inplace=True)
                         _pool_combined.sort_values('combined_score', ascending=False, inplace=True)
-                        state['savi_stream_pool'] = _pool_combined.head(10000).reset_index(drop=True)
+                        # §TTTT: Fragment-slot quota — reserve up to 1000 of the 10,000
+                        # pool slots for molecules with ≤18 heavy atoms.  The validator
+                        # scoring formula divides by heavy_atom_count, so a fragment with
+                        # moderate absolute affinity beats a drug-like molecule with higher
+                        # absolute affinity.  Without a quota, fragments are crowded out
+                        # by the more abundant 20–35 HA SAVI-2020 products even though
+                        # the ligand-efficiency PSICHIC score already normalises by HA.
+                        # Keeping fragments in the pool lets SALSA nearest-neighbour
+                        # lookup map perturbation probes to small SAVI-2020 products and
+                        # explore fragment-like chemical space.  Drug-like molecules (>18
+                        # HA) fill the remaining 9,000 slots sorted by combined_score.
+                        # NaN heavy_atoms (should not occur but defensive) are treated as
+                        # drug-like (25 HA assumed) to avoid accidental fragment mis-count.
+                        _tttt_ha = _pool_combined['heavy_atoms'].fillna(25)
+                        _tttt_frags = _pool_combined[_tttt_ha <= 18].head(1000)
+                        _tttt_rest  = _pool_combined[_tttt_ha  > 18].head(9000)
+                        _pool_capped = pd.concat([_tttt_frags, _tttt_rest], ignore_index=True)
+                        _pool_capped.drop_duplicates(subset=['product_name'], inplace=True)
+                        _pool_capped.sort_values('combined_score', ascending=False, inplace=True)
+                        state['savi_stream_pool'] = _pool_capped.head(10000).reset_index(drop=True)
 
                 if not top_molecules.empty:
                     entropy = compute_maccs_entropy(top_molecules['product_smiles'].tolist())

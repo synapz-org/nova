@@ -1,5 +1,42 @@
 # Boltz-2 Miner Integration
 
+## Current Status (as of 2026-06-15)
+
+§TTTT added 2026-06-15: Fragment-slot quota in savi_stream_pool.
+
+**§TTTT — Fragment-Slot Quota in SAVI Stream Pool**
+
+The validator scoring formula is `(affinity_probability_binary − affinity_pred_value) /
+heavy_atom_count`.  Dividing by HA count means a fragment (10–18 HA) with moderate
+absolute affinity beats a drug-like molecule (25–35 HA) with high absolute affinity.
+The PSICHIC pre-filter already normalises by HA (ligand-efficiency PSICHIC score), so
+fragments that bind well do float toward the top of the pool.  However, SAVI-2020 files
+contain many more drug-like products (20–35 HA) than fragments (10–18 HA), and if PSICHIC
+assigns fragments lower absolute scores (as expected for weak binders), they are crowded
+out of the 10,000-slot pool by the sheer volume of drug-like molecules.
+
+§TTTT reserves up to 1,000 of the 10,000 savi_stream_pool slots for ≤18 HA molecules,
+sorted by ligand-efficiency PSICHIC score within that range.  The remaining 9,000 slots
+go to >18 HA molecules as before.  The quota guarantees that fragments are always
+reachable by SALSA's Tanimoto nearest-neighbour search: when a bioisosteric perturbation
+produces a small probe, it can now map to a valid small SAVI-2020 product even if that
+product's absolute PSICHIC score would otherwise rank it outside the top 9,000.
+
+Implementation: 12 lines replacing `_pool_combined.head(10000)` in the savi_stream_pool
+update block of `run_psichic_model_loop` in `neurons/miner.py`.  The initial-pool
+assignment path (`savi_stream_pool is None`) is unchanged — §PPPP anchors already have
+`heavy_atoms` computed and the first chunk is small enough that no quota is needed.
+Defensive fillna(25) handles any edge-case NaN heavy_atoms.  Zero regression: when fewer
+than 1,000 fragments exist in the pool all fragment slots are filled, the rest go to
+drug-like, and total pool size remains ≤10,000.
+
+Estimated benefit: SALSA and §MM hill-climbing can now explore smaller chemical space
+via nearest-neighbour lookup.  If Boltz-2's affinity module is reasonably calibrated at
+10–18 HA (fragment regime), this should improve Boltz LE scores in epoch 2+ when SALSA
+is active.  Empirical validation against the weekly scoring is still advisable.
+
+---
+
 ## Current Status (as of 2026-06-14)
 
 §PPPP added 2026-06-14: SALSA Elite Pool Pre-seeding at Epoch Start.
@@ -135,28 +172,79 @@ Two items remain conditional or research-stage:
 - FBLD (fragment-based lead discovery): SAVI-2020 minimum molecule size limits fragment space;
   needs empirical Boltz calibration at 10–18 heavy atoms before deployment
 
-### Future Optimisation Opportunities (post-§SSSS)
+### Future Optimisation Opportunities (post-§TTTT)
 
-§RRRR and §SSSS are now implemented (2026-06-12).  The remaining frontier items are:
-
-**§TTTT — FBLD Fragment Bias in SAVI Streaming** *(research)*
-The Boltz-2 scoring formula (affinity_prob_binary − affinity_pred_value) / heavy_atoms
-rewards small molecules.  SAVI-2020 includes many products with 10–18 heavy atoms that
-are under-sampled relative to drug-like 20–35 HA molecules.  §TTTT would add a secondary
-SAVI streaming batch biased toward the 10–18 HA range, populating the SALSA probe pool
-with fragment-like entries.  These are not submitted directly (SAVI-2020 minimum is ~8 HA)
-but serve as SALSA nearest-neighbour probes that map back to valid SAVI-2020 products.
-Empirical validation against the weekly Boltz scoring is required first.
-Estimated effort: ~30 lines; depends on SAVI-2020 fragment count per file.
+§TTTT is implemented (2026-06-15).  The one remaining frontier item is:
 
 **§UUUU — Antitarget Boltz Selectivity Scoring** *(A100/H100 only)*
+
 The PSICHIC streaming loop already penalises antitarget binders via
-(target_score − antitarget_weight × antitarget_score) / heavy_atoms.  However, the
-miner-side Boltz prescoring only evaluates the target protein.  §UUUU would run a fast
-Boltz inference (fast=True, reduced recycling) on the antitarget for the top-2 candidates
-and compute a true Boltz-level selectivity score.  Cost: doubles Boltz inference budget
-for those 2 candidates — only feasible on A100/H100 hardware with time to spare after §MM.
-Estimated effort: ~80 lines in miner.py + boltz/wrapper.py antitarget scoring path.
+`(target_score − antitarget_weight × antitarget_score) / heavy_atoms`.  However, the
+miner-side Boltz prescoring only evaluates the **target** protein.  A candidate molecule
+could score well by miner-Boltz on the target while simultaneously being a strong
+antitarget binder — a disadvantage only revealed at validation time when the validator
+runs its own Boltz call on the antitarget.
+
+§UUUU would run a fast Boltz inference (`fast=True`, `recycling_steps_affinity=2`) on the
+weekly antitarget for the top-2 candidates after §MM completes.  The selectivity-adjusted
+score replaces the pure target LE score for final submission ordering:
+
+```
+selectivity_score = target_boltz_LE − antitarget_weight × antitarget_boltz_LE
+```
+
+where `antitarget_weight` is read from `config.antitarget_weight` (currently 0.9).
+
+**Prerequisites for §UUUU:**
+1. The antitarget protein code must be in `state['current_challenge_antitargets']`.
+2. An MSA file must exist at `boltz/msa_files/{antitarget}.a3m` OR `ensure_msa()` must
+   succeed at epoch start for the antitarget (add a second `ensure_msa` call).
+3. Enough time must remain after §MM: the time guard must check
+   `blocks_until_epoch > boltz_trigger_blocks + antitarget_boltz_blocks` where
+   `antitarget_boltz_blocks ≈ last_inference_duration / 12 * 2 + 20`.
+
+**Implementation sketch (≈80 lines in miner.py + wrapper.py):**
+
+```python
+# In run_boltz_prescoring(), after §MM completes and _rr_eff_scores is populated:
+if (state.get('current_challenge_antitargets')
+        and blocks_until_epoch > state['boltz_trigger_blocks'] + antitarget_cost_blocks):
+    _top2_smiles = sorted(_rr_eff_scores, key=_rr_eff_scores.get, reverse=True)[:2]
+    _at_protein   = state['current_challenge_antitargets'][0]
+    _at_wrapper   = BoltzWrapper()
+    _at_wrapper.subnet_config = {**state['subnet_config'],
+                                 'weekly_target': _at_protein}
+    _at_boltz_mols = {0: {'smiles': _top2_smiles}}
+    _at_sd         = {0: {}}
+    _at_wrapper.score_molecules_target(
+        _at_boltz_mols, _at_sd, _at_wrapper.subnet_config,
+        final_block_hash='', fast=True
+    )
+    for _s in _top2_smiles:
+        _at_le = _at_wrapper.per_molecule_metric.get(0, {}).get(_s)
+        if _at_le is not None and math.isfinite(_at_le):
+            _rr_eff_scores[_s] -= state['config'].antitarget_weight * _at_le
+            bt.logging.info(
+                f"[§UUUU] {_s[:40]}: antitarget_LE={_at_le:.4f} → "
+                f"selectivity_score={_rr_eff_scores[_s]:.4f}"
+            )
+```
+
+**Cost analysis:**
+- 2 fast-mode Boltz calls on the antitarget ≈ 2 × (fast_inference_time).
+- On RTX 3090 (fast ≈ 2–3 min), this uses 4–6 min of the ~60 min window — only feasible
+  if §MM finishes before `blocks_until_epoch ≈ 70` (which is typical on fast hardware).
+- On A100 (fast ≈ 1 min), cost is negligible.
+- On slow hardware (3090, limited epochs), §UUUU fires only when ample time remains.
+  The time guard prevents it from delaying submission.
+
+**Estimated benefit:** Prevents submitting high-target-affinity molecules that also bind
+the antitarget strongly.  Under `antitarget_weight=0.9`, a molecule with
+`target_LE=0.05` and `antitarget_LE=0.04` scores `0.05 − 0.9×0.04 = 0.014` — much
+worse than a selective molecule with `target_LE=0.04, antitarget_LE=0.01` scoring
+`0.04 − 0.9×0.01 = 0.031`.  §UUUU surfaces this selectivity difference before submission.
+
+**Status:** Not yet implemented.  Requires antitarget MSA files and sufficient epoch time.
 
 ## Current Status (as of 2026-06-10)
 
@@ -277,7 +365,7 @@ with a protein-specific Boltz-calibrated signal, complementing the general PSICH
 Three new optimisations added 2026-06-04: §AAA hardware-adaptive MSA subsampling,
 §BBB post-GA SALSA pass, and §CCC StandardScaler pipeline for the §ZZ surrogate.
 
-Two conditional/research items remain (§D, FBLD).
+Two conditional/research items remain (§D, FBLD). §TTTT–§SSSS implemented 2026-06-12 through 2026-06-15.
 
 ### Implemented optimisation index
 
@@ -343,6 +431,11 @@ Two conditional/research items remain (§D, FBLD).
 | NNNN | Scaffold-diverse SALSA hit selection in §FF and §MM (top_k 3→5 + diversity filter) | neurons/miner.py | ✅ |
 | OOOO | Scaffold-diverse SALSA seed selection (top-5 pool → 3 diverse input seeds) | neurons/miner.py | ✅ |
 | PPPP | SALSA Elite Pool Pre-seeding (top-50 Boltz cache → savi_stream_pool at epoch start) | neurons/miner.py | ✅ |
+| QQQQ | Adaptive RF surrogate above 100 training points | utils/surrogate.py | ✅ |
+| RRRR | Bayesian UCB acquisition for surrogate re-ranking | utils/surrogate.py, miner.py | ✅ |
+| SSSS | Secondary affinity metric ensemble averaging | boltz/wrapper.py, miner.py | ✅ |
+| TTTT | Fragment-slot quota in savi_stream_pool (≤18 HA: 1000 reserved slots) | neurons/miner.py | ✅ |
+| UUUU | Antitarget Boltz selectivity scoring for top-2 candidates | miner.py, wrapper.py | ⏳ A100/H100 only |
 
 ---
 
