@@ -1,5 +1,57 @@
 # Boltz-2 Miner Integration
 
+## Current Status (as of 2026-06-16)
+
+§UUUU added 2026-06-16: Antitarget Boltz Selectivity Scoring.
+
+**§UUUU — Antitarget Boltz Selectivity Scoring**
+
+The PSICHIC streaming loop already penalises antitarget binders via
+`(target_score − antitarget_weight × antitarget_score) / heavy_atoms`.
+However, the Boltz prescoring block only evaluated the **target** protein.
+A top candidate could score well on the target via Boltz while also binding
+the antitarget strongly — a disadvantage that was previously invisible until
+the validator ran its own antitarget Boltz call.
+
+§UUUU fires after §WW (multi-seed stability) in `run_boltz_prescoring`,
+when the epoch still has `> 2 × fast_boltz_time + 60 s` of runway.  It runs
+a fast Boltz inference (`fast=True`, 50 sampling steps, `recycling_steps_affinity=2`)
+on the weekly antitarget protein for the top-2 candidates in `all_scores`.
+The submission ordering is adjusted using:
+
+```
+selectivity_score = target_boltz_LE − antitarget_weight × antitarget_boltz_LE
+```
+
+where `antitarget_weight` is read from `state['config'].antitarget_weight` (default 0.9).
+
+Example: a molecule with `target_LE=0.05` and `antitarget_LE=0.04` scores
+`0.05 − 0.9×0.04 = 0.014` — much worse than a selective molecule with
+`target_LE=0.04, antitarget_LE=0.01` scoring `0.04 − 0.9×0.01 = 0.031`.
+§UUUU surfaces this difference before submission.
+
+**Safety properties:**
+- Entire block is wrapped in `try/except` — any error is non-fatal.
+- Time guard: checks `remaining_time > 2 × fast_time + 60 s` before
+  firing, and again before each antitarget molecule inference.
+- Only reorders the top-2 candidates; §CC warm-start guard and
+  disk cache entries are unaffected (antitarget scores are ephemeral).
+- Falls back to target_LE ordering if antitarget score is non-finite.
+- `binding_pocket` is always cleared for antitarget inference — we have
+  no pocket data for antitargets.
+
+**MSA pre-fetch:**
+- At startup (after `startup_proteins` is known) and at each epoch boundary
+  (after `new_proteins` is applied), `ensure_msa()` is called for each
+  antitarget protein.  This is a no-op if the `.a3m` file already exists.
+  Currently `P31645.a3m` and `P31652.a3m` are pre-computed.
+
+**Files changed:**
+- `neurons/miner.py` — §UUUU block in `run_boltz_prescoring` after §WW;
+  antitarget `ensure_msa` calls at startup and epoch boundary.
+
+---
+
 ## Current Status (as of 2026-06-15)
 
 §TTTT added 2026-06-15: Fragment-slot quota in savi_stream_pool.

@@ -2123,6 +2123,156 @@ async def run_boltz_prescoring(state: Dict[str, Any], max_candidates: int = 5) -
         except Exception as _ww_err:
             bt.logging.warning(f"§WW multi-seed check failed (non-fatal): {_ww_err}")
 
+    # §UUUU — Antitarget Boltz Selectivity Scoring.
+    # PSICHIC already penalises antitarget binders in the streaming loop, but the
+    # Boltz prescoring only evaluates the TARGET protein.  A top candidate could
+    # score well on the target while also binding the antitarget strongly — a
+    # disadvantage discovered only at validation time.  §UUUU runs a fast Boltz
+    # inference on the weekly antitarget for the top-2 Boltz candidates and adjusts
+    # submission ordering using:
+    #   selectivity_score = target_LE − antitarget_weight × antitarget_LE
+    # Time guard: only fires when ≥ 2 fast-Boltz calls + 60 s of runway remain.
+    _uuuu_antitargets = state.get('current_challenge_antitargets', [])
+    _uuuu_valid = {s: v for s, v in all_scores.items() if math.isfinite(v)}
+    if _uuuu_antitargets and len(_uuuu_valid) >= 2:
+        try:
+            _uuuu_blk = await state['subtensor'].get_current_block()
+            _uuuu_ep = ((_uuuu_blk // state['epoch_length']) + 1) * state['epoch_length']
+            _uuuu_remaining = (_uuuu_ep - _uuuu_blk) * 12
+            # Fast Boltz ≈ 1/3 of full inference time (50 vs 150 sampling steps).
+            _uuuu_t_fast = state.get('boltz_time_per_mol', 150.0) / 3.0
+            if _uuuu_remaining > _uuuu_t_fast * 2 + 60:
+                _uuuu_at_protein = _uuuu_antitargets[0]
+                bt.logging.info(
+                    f"§UUUU: {_uuuu_remaining:.0f}s remaining — antitarget selectivity "
+                    f"check on top-2 candidates (antitarget={_uuuu_at_protein})..."
+                )
+                # Build SMILES→product_name lookup (same pattern as §WW)
+                _uuuu_name_lookup: Dict[str, str] = {}
+                for _uuuu_frame in (candidates, state.get('global_candidate_pool'),
+                                    state.get('savi_stream_pool')):
+                    if _uuuu_frame is None or _uuuu_frame.empty:
+                        continue
+                    if 'product_smiles' not in _uuuu_frame.columns:
+                        continue
+                    if 'product_name' not in _uuuu_frame.columns:
+                        continue
+                    for _, _uuuu_r in _uuuu_frame.iterrows():
+                        _uuuu_ps = str(_uuuu_r.get('product_smiles', ''))
+                        _uuuu_pn = str(_uuuu_r.get('product_name', ''))
+                        if _uuuu_ps and _uuuu_pn:
+                            _uuuu_name_lookup.setdefault(_uuuu_ps, _uuuu_pn)
+                            _uuuu_can_ps = get_canonical_smiles(_uuuu_ps)
+                            if _uuuu_can_ps:
+                                _uuuu_name_lookup.setdefault(_uuuu_can_ps, _uuuu_pn)
+
+                # Subnet config for antitarget inference — same settings as target
+                # but override weekly_target and clear binding_pocket (we have no
+                # pocket data for the antitarget).
+                _uuuu_at_config = {
+                    **subnet_config,
+                    'weekly_target': _uuuu_at_protein,
+                    'binding_pocket': None,
+                    'max_distance': None,
+                    'force': False,
+                }
+
+                _uuuu_selectivity: Dict[str, float] = {}
+                _uuuu_top2 = sorted(
+                    _uuuu_valid.items(), key=lambda kv: kv[1], reverse=True
+                )[:2]
+                _uuuu_at_weight = getattr(state.get('config'), 'antitarget_weight', 0.9)
+                _uuuu_stop = False
+
+                for _uuuu_sm, _uuuu_target_le in _uuuu_top2:
+                    if _uuuu_stop:
+                        break
+                    try:
+                        _uuuu_blk2 = await state['subtensor'].get_current_block()
+                        _uuuu_ep2 = (
+                            (_uuuu_blk2 // state['epoch_length']) + 1
+                        ) * state['epoch_length']
+                        if (_uuuu_ep2 - _uuuu_blk2) * 12 < _uuuu_t_fast + 30:
+                            bt.logging.info("§UUUU: time guard fired — stopping early.")
+                            _uuuu_stop = True
+                            break
+                    except Exception:
+                        pass
+
+                    _uuuu_pname = (
+                        _uuuu_name_lookup.get(_uuuu_sm)
+                        or _uuuu_name_lookup.get(get_canonical_smiles(_uuuu_sm) or '', '')
+                    )
+                    _uuuu_uid = 0
+                    _uuuu_vmbu = {
+                        _uuuu_uid: {"smiles": [_uuuu_sm], "names": [_uuuu_pname or '']}
+                    }
+                    _uuuu_sd: Dict[str, Any] = {_uuuu_uid: {}}
+                    try:
+                        await asyncio.to_thread(
+                            wrapper.score_molecules_target,
+                            _uuuu_vmbu, _uuuu_sd, _uuuu_at_config,
+                            '0x' + '0' * 64, True,  # fast=True
+                        )
+                        _uuuu_at_le = wrapper.per_molecule_metric.get(
+                            _uuuu_uid, {}
+                        ).get(_uuuu_sm)
+                        if _uuuu_at_le is not None and math.isfinite(_uuuu_at_le):
+                            _uuuu_sel = _uuuu_target_le - _uuuu_at_weight * _uuuu_at_le
+                            _uuuu_selectivity[_uuuu_sm] = _uuuu_sel
+                            bt.logging.info(
+                                f"§UUUU {_uuuu_sm[:40]!r}: "
+                                f"target_LE={_uuuu_target_le:.4f}, "
+                                f"antitarget_LE={_uuuu_at_le:.4f} "
+                                f"→ selectivity={_uuuu_sel:.4f}"
+                            )
+                        else:
+                            _uuuu_selectivity[_uuuu_sm] = _uuuu_target_le
+                            bt.logging.debug(
+                                f"§UUUU: no valid antitarget score for "
+                                f"{_uuuu_sm[:40]!r} — keeping target_LE."
+                            )
+                    except Exception as _uuuu_be:
+                        bt.logging.error(f"§UUUU antitarget inference error: {_uuuu_be}")
+                        _uuuu_selectivity[_uuuu_sm] = _uuuu_target_le
+
+                # Reorder submission when both top-2 have selectivity estimates
+                if len(_uuuu_selectivity) >= 2:
+                    _uuuu_best_sm = max(_uuuu_selectivity, key=_uuuu_selectivity.get)
+                    _uuuu_best_pname = (
+                        _uuuu_name_lookup.get(_uuuu_best_sm)
+                        or _uuuu_name_lookup.get(
+                            get_canonical_smiles(_uuuu_best_sm) or '', ''
+                        )
+                    )
+                    if _uuuu_best_pname:
+                        _uuuu_orig = (state.get('candidate_product') or '').split(',')
+                        if _uuuu_orig and _uuuu_orig[0] != _uuuu_best_pname:
+                            state['candidate_product'] = ','.join(
+                                [_uuuu_best_pname]
+                                + [n for n in _uuuu_orig if n != _uuuu_best_pname]
+                            )
+                            _uuuu_other_sel = next(
+                                (v for s, v in _uuuu_selectivity.items()
+                                 if s != _uuuu_best_sm),
+                                -math.inf,
+                            )
+                            bt.logging.info(
+                                f"§UUUU: pos-0 swapped → {_uuuu_best_pname} "
+                                f"(selectivity={_uuuu_selectivity[_uuuu_best_sm]:.4f}) "
+                                f"over {_uuuu_orig[0]} "
+                                f"(selectivity={_uuuu_other_sel:.4f})"
+                            )
+                        else:
+                            bt.logging.info(
+                                f"§UUUU: pos-0 confirmed ({_uuuu_best_pname}); "
+                                "selectivity ordering agrees with target-only ordering."
+                            )
+        except Exception as _uuuu_err:
+            bt.logging.warning(
+                f"§UUUU antitarget selectivity check failed (non-fatal): {_uuuu_err}"
+            )
+
     # Merge §FF / §MM scores into all_scores before the §CC guard.
     # The §MM loop exposes boltz_cache → all_scores at the end of each complete
     # round, but if §MM exits before round 0 (time check fails immediately) or
@@ -2384,6 +2534,19 @@ async def run_miner(config: argparse.Namespace) -> None:
         state['last_challenge_antitargets'] = startup_proteins["antitargets"]
         bt.logging.info(f"Startup targets: {startup_proteins['targets']}, antitargets: {startup_proteins['antitargets']}")
 
+        # §UUUU: Fetch MSA for antitarget proteins so antitarget Boltz scoring
+        # has evolutionary context when §UUUU fires inside run_boltz_prescoring.
+        for _uuuu_at_p in startup_proteins.get("antitargets", []):
+            try:
+                _uuuu_at_seq = get_sequence_from_protein_code(_uuuu_at_p)
+                if _uuuu_at_seq:
+                    ensure_msa(_uuuu_at_p, _uuuu_at_seq)
+            except Exception as _uuuu_at_msa_err:
+                bt.logging.warning(
+                    f"[§UUUU] Antitarget MSA fetch failed for {_uuuu_at_p} "
+                    f"(non-fatal): {_uuuu_at_msa_err}"
+                )
+
         # Initialize models for all proteins
         try:
             for target_protein in startup_proteins["targets"]:
@@ -2456,6 +2619,18 @@ async def run_miner(config: argparse.Namespace) -> None:
                     state['current_challenge_antitargets'] = new_proteins["antitargets"]
                     state['last_challenge_antitargets'] = new_proteins["antitargets"]
                     bt.logging.info(f"New proteins - targets: {new_proteins['targets']}, antitargets: {new_proteins['antitargets']}")
+
+                    # §UUUU: Ensure MSA exists for new antitarget proteins.
+                    for _uuuu_new_at in new_proteins.get("antitargets", []):
+                        try:
+                            _uuuu_new_at_seq = get_sequence_from_protein_code(_uuuu_new_at)
+                            if _uuuu_new_at_seq:
+                                ensure_msa(_uuuu_new_at, _uuuu_new_at_seq)
+                        except Exception as _uuuu_new_at_err:
+                            bt.logging.warning(
+                                f"[§UUUU] Antitarget MSA fetch failed for "
+                                f"{_uuuu_new_at}: {_uuuu_new_at_err}"
+                            )
 
                 # Cancel old inference, reset relevant state
                 if 'inference_task' in state and state['inference_task']:
