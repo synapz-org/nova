@@ -2239,35 +2239,53 @@ async def run_boltz_prescoring(state: Dict[str, Any], max_candidates: int = 5) -
                 # Reorder submission when both top-2 have selectivity estimates
                 if len(_uuuu_selectivity) >= 2:
                     _uuuu_best_sm = max(_uuuu_selectivity, key=_uuuu_selectivity.get)
-                    _uuuu_best_pname = (
-                        _uuuu_name_lookup.get(_uuuu_best_sm)
-                        or _uuuu_name_lookup.get(
-                            get_canonical_smiles(_uuuu_best_sm) or '', ''
+                    # §VVVV: target-LE priority guard.  The validator weights 100% on
+                    # target Boltz LE (pure target score, no antitarget adjustment).
+                    # When num_molecules_boltz=1 only pos-0 is scored, so swapping to a
+                    # molecule with lower target_LE — even if it has better selectivity —
+                    # would decrease our validator score.  Only allow the swap when the
+                    # selectivity winner also has ≥ target_LE as the best target-only
+                    # candidate (or when multiple molecules are scored, so selectivity
+                    # matters for entropy bonus).
+                    _uuuu_best_le = _uuuu_valid.get(_uuuu_best_sm, -math.inf)
+                    _uuuu_top_le = _uuuu_top2[0][1]
+                    _uuuu_n_boltz = subnet_config.get('num_molecules_boltz', 1)
+                    if _uuuu_n_boltz <= 1 and _uuuu_best_le < _uuuu_top_le - 1e-6:
+                        bt.logging.info(
+                            f"§UUUU+§VVVV: selectivity winner target_LE={_uuuu_best_le:.4f} "
+                            f"< top target_LE={_uuuu_top_le:.4f} — swap suppressed; "
+                            "validator uses pure target LE (num_molecules_boltz=1)."
                         )
-                    )
-                    if _uuuu_best_pname:
-                        _uuuu_orig = (state.get('candidate_product') or '').split(',')
-                        if _uuuu_orig and _uuuu_orig[0] != _uuuu_best_pname:
-                            state['candidate_product'] = ','.join(
-                                [_uuuu_best_pname]
-                                + [n for n in _uuuu_orig if n != _uuuu_best_pname]
+                    else:
+                        _uuuu_best_pname = (
+                            _uuuu_name_lookup.get(_uuuu_best_sm)
+                            or _uuuu_name_lookup.get(
+                                get_canonical_smiles(_uuuu_best_sm) or '', ''
                             )
-                            _uuuu_other_sel = next(
-                                (v for s, v in _uuuu_selectivity.items()
-                                 if s != _uuuu_best_sm),
-                                -math.inf,
-                            )
-                            bt.logging.info(
-                                f"§UUUU: pos-0 swapped → {_uuuu_best_pname} "
-                                f"(selectivity={_uuuu_selectivity[_uuuu_best_sm]:.4f}) "
-                                f"over {_uuuu_orig[0]} "
-                                f"(selectivity={_uuuu_other_sel:.4f})"
-                            )
-                        else:
-                            bt.logging.info(
-                                f"§UUUU: pos-0 confirmed ({_uuuu_best_pname}); "
-                                "selectivity ordering agrees with target-only ordering."
-                            )
+                        )
+                        if _uuuu_best_pname:
+                            _uuuu_orig = (state.get('candidate_product') or '').split(',')
+                            if _uuuu_orig and _uuuu_orig[0] != _uuuu_best_pname:
+                                state['candidate_product'] = ','.join(
+                                    [_uuuu_best_pname]
+                                    + [n for n in _uuuu_orig if n != _uuuu_best_pname]
+                                )
+                                _uuuu_other_sel = next(
+                                    (v for s, v in _uuuu_selectivity.items()
+                                     if s != _uuuu_best_sm),
+                                    -math.inf,
+                                )
+                                bt.logging.info(
+                                    f"§UUUU: pos-0 swapped → {_uuuu_best_pname} "
+                                    f"(selectivity={_uuuu_selectivity[_uuuu_best_sm]:.4f}) "
+                                    f"over {_uuuu_orig[0]} "
+                                    f"(selectivity={_uuuu_other_sel:.4f})"
+                                )
+                            else:
+                                bt.logging.info(
+                                    f"§UUUU: pos-0 confirmed ({_uuuu_best_pname}); "
+                                    "selectivity ordering agrees with target-only ordering."
+                                )
         except Exception as _uuuu_err:
             bt.logging.warning(
                 f"§UUUU antitarget selectivity check failed (non-fatal): {_uuuu_err}"

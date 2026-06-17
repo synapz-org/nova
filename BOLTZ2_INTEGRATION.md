@@ -1,8 +1,9 @@
 # Boltz-2 Miner Integration
 
-## Current Status (as of 2026-06-16)
+## Current Status (as of 2026-06-17)
 
 §UUUU added 2026-06-16: Antitarget Boltz Selectivity Scoring.
+§VVVV added 2026-06-17: Target-LE Priority Guard for §UUUU.
 
 **§UUUU — Antitarget Boltz Selectivity Scoring**
 
@@ -3596,3 +3597,71 @@ their coefficients toward zero.  The fallback threshold (min_points=40) is uncha
 **Files changed:** `utils/surrogate.py` — `_descriptor_vector()` imports `AllChem` and appends
 64 Morgan FP bits; `_N_MORGAN_BITS`, `_N_PHYSCHEM`, `_N_FEATURES` constants added;
 `rank_pool_by_surrogate` placeholder updated to `_N_FEATURES`.
+
+---
+
+## §VVVV — Target-LE Priority Guard for §UUUU (`neurons/miner.py`) ✅ Implemented (2026-06-17)
+
+**Problem:** §UUUU (antitarget Boltz selectivity scoring) can swap position 0 of the submission
+to a molecule with *lower* target LE if it has better selectivity
+(`selectivity = target_LE − antitarget_weight × antitarget_LE`).
+
+The validator currently awards **100% of incentive weight** to `winner_boltz`, which is the miner
+whose position-0 molecule has the highest **pure target Boltz LE** (no antitarget adjustment):
+
+```python
+# neurons/validator/weights.py — current logic (as of 2026-06-17)
+if winner_boltz:
+    weights[winner_boltz] = 1.0 - burn_rate  # 100% Boltz winner, 0% PSICHIC
+```
+
+The validator scores only position 0 (`num_molecules_boltz: 1`, `sample_selection: "first"`)
+using `(affinity_probability_binary − affinity_pred_value) / heavy_atom_count` against the target
+protein — no antitarget term.
+
+**Consequence:** if §UUUU found that molecule B (second-highest target_LE) had better selectivity
+than molecule A (highest target_LE), it would promote B to position 0.  The validator then scores B,
+not A, awarding a lower Boltz score than if A had remained at position 0.
+
+**Concrete example:**
+
+| Molecule | target_LE | antitarget_LE | selectivity (−0.9×at) | Validator scores |
+|----------|-----------|---------------|------------------------|-----------------|
+| A (pos-0) | 0.050 | 0.040 | 0.014 | **0.050** |
+| B | 0.048 | 0.001 | 0.047 | 0.048 |
+
+§UUUU would swap B to pos-0 (selectivity 0.047 > 0.014) → validator scores B → **0.048** (−0.002).
+Without §VVVV we'd lose ~4% of score; with §VVVV we keep A at pos-0 → **0.050**.
+
+**Fix:** When `num_molecules_boltz ≤ 1`, only allow the selectivity-driven pos-0 swap if the
+selectivity winner also has **≥ target_LE** of the top target-only candidate (i.e., the swap
+would not demote a higher-LE molecule):
+
+```python
+# §VVVV — added inside §UUUU reordering block (neurons/miner.py)
+_uuuu_best_le = _uuuu_valid.get(_uuuu_best_sm, -math.inf)
+_uuuu_top_le  = _uuuu_top2[0][1]          # highest target LE in top-2
+_uuuu_n_boltz = subnet_config.get('num_molecules_boltz', 1)
+if _uuuu_n_boltz <= 1 and _uuuu_best_le < _uuuu_top_le - 1e-6:
+    bt.logging.info(
+        f"§UUUU+§VVVV: selectivity winner target_LE={_uuuu_best_le:.4f} "
+        f"< top target_LE={_uuuu_top_le:.4f} — swap suppressed; "
+        "validator uses pure target LE (num_molecules_boltz=1)."
+    )
+else:
+    # original swap logic ...
+```
+
+**When §VVVV has no effect:**
+- When `num_molecules_boltz > 1` (entropy bonus regime): selectivity reordering for positions
+  1..N-1 remains unguarded — diversity/selectivity there is beneficial.
+- When the selectivity winner already has the highest target_LE (the common case where both
+  rankings agree): the guard condition is false, swap proceeds normally.
+- When both molecules have identical target_LE (tie within `1e-6`): guard allows the swap,
+  correctly using selectivity to break the tie.
+
+**Zero regression risk:** The guard only fires when `num_molecules_boltz=1` AND the selectivity
+winner has strictly lower target_LE.  All other paths are unaffected.
+
+**Files changed:** `neurons/miner.py` — §VVVV guard block inserted before the name-lookup /
+swap logic inside the `if len(_uuuu_selectivity) >= 2:` block of §UUUU.
