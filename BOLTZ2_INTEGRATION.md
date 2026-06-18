@@ -488,7 +488,7 @@ Two conditional/research items remain (§D, FBLD). §TTTT–§SSSS implemented 2
 | RRRR | Bayesian UCB acquisition for surrogate re-ranking | utils/surrogate.py, miner.py | ✅ |
 | SSSS | Secondary affinity metric ensemble averaging | boltz/wrapper.py, miner.py | ✅ |
 | TTTT | Fragment-slot quota in savi_stream_pool (≤18 HA: 1000 reserved slots) | neurons/miner.py | ✅ |
-| UUUU | Antitarget Boltz selectivity scoring for top-2 candidates | miner.py, wrapper.py | ⏳ A100/H100 only |
+| UUUU | Antitarget Boltz selectivity scoring for top-2 candidates (§VVVV guard) | miner.py, wrapper.py | ✅ |
 
 ---
 
@@ -719,6 +719,94 @@ before Boltz-2 inference, saving GPU time and improving submission quality.
 
 Estimated effort: ~150 lines in `utils/docking.py`.  Priority: low (only relevant when
 `binding_pocket` is set by the subnet operator).
+
+### §WWWWW — Cross-Target Protein-Similarity Seeding
+
+**Problem:** Each week the subnet operator rotates the weekly target protein.  On epoch 1 of
+a new target, the Boltz cache is empty for that protein and SALSA starts cold — warm seeds
+come only from PSICHIC streaming and ChEMBL (§SS).  However, the Boltz cache may hold
+high-scoring molecules from *previous* weekly targets that are structural homologs of the new
+target.  For protein families (e.g., GPCRs, kinases, proteases), a ligand that binds one
+family member often has measurable affinity for related members.  These cross-target seeds
+would let SALSA start from a much stronger chemical neighbourhood on week 1 of a new target.
+
+**Mechanism:**
+1. At epoch start, read the new `weekly_target` UniProt accession.
+2. Enumerate all protein accessions that appear as cache keys in `boltz_score_cache.db`
+   (i.e., prior targets from the same or previous weeks).
+3. For each prior target, compute sequence identity with the new target using a local Smith-
+   Waterman alignment of the cached sequence against the new target sequence (fetched from
+   `utils/proteins.py`).  Alternatively, use `UniProt BLAST` API (already available via
+   `utils/proteins.py`) and parse identity from the response.
+4. If any prior target has sequence identity ≥ 40 % with the new target, retrieve the top-3
+   Boltz-scored molecules from that target's cache rows.
+5. Append them as SALSA seeds alongside the existing §SS (ChEMBL) and §UU (same-target cache)
+   seeds — no priority change, just additional starting points.
+6. Log the homolog accession, sequence identity, and seed SMILES for operator visibility.
+
+**Why 40 % identity:** Structural conservation of binding-site residues is often preserved
+down to ~30–35 % overall identity for protein families.  40 % is a conservative threshold that
+avoids spurious cross-family hits while capturing GPCR family members (typical intra-family
+identity 30–60 %).
+
+**Expected benefit:** On epoch 1 of a new target that is a family member of a prior week's
+target, SALSA immediately explores the neighbourhood of a Boltz-confirmed binder rather than
+starting from streaming fragments.  Expected improvement: 1–3 additional high-quality
+candidates in the Boltz prescoring window without extra Boltz calls.
+
+**Risk:** Cross-target seeds may score poorly on the new target if the binding pockets differ
+despite sequence similarity (e.g., selectivity pockets differ between CCR1 and CCR5).  The
+existing §VVVV guard and Boltz validation prevent bad seeds from reaching submission — the
+worst case is wasted SALSA exploration.
+
+**Implementation sketch (~60 lines):**
+
+```python
+# utils/proteins.py — add helper
+def sequence_identity(seq_a: str, seq_b: str) -> float:
+    """Smith-Waterman alignment identity fraction."""
+    from Bio import pairwise2
+    from Bio.Align import substitution_matrices
+    matrix = substitution_matrices.load("BLOSUM62")
+    aligns = pairwise2.align.globalds(seq_a, seq_b, matrix, -10, -0.5)
+    if not aligns:
+        return 0.0
+    aln = aligns[0]
+    matches = sum(a == b for a, b in zip(aln.seqA, aln.seqB) if a != '-' and b != '-')
+    return matches / max(len(seq_a), len(seq_b))
+
+# neurons/miner.py — §WWWWW block in SALSA seed selection section
+async def _cross_target_seeds(state, db_path, current_protein, current_seq, limit=3):
+    prior_proteins = _disk_cache_list_proteins(db_path)  # new helper
+    for prior_protein in prior_proteins:
+        if prior_protein == current_protein:
+            continue
+        prior_seq = await get_protein_sequence(prior_protein)
+        if not prior_seq:
+            continue
+        identity = sequence_identity(current_seq, prior_seq)
+        if identity >= 0.40:
+            hits = _disk_cache_get_candidates(db_path, prior_protein, limit=limit)
+            bt.logging.info(
+                f"§WWWWW: homolog {prior_protein} ({identity:.1%} identity) → "
+                f"{len(hits)} cross-target seeds"
+            )
+            return [h['smiles'] for h in hits]
+    return []
+```
+
+**Files to change:**
+- `utils/proteins.py` — `sequence_identity()` helper
+- `boltz_score_cache.db` — add `_disk_cache_list_proteins()` query helper
+- `neurons/miner.py` — `§WWWWW` block in SALSA seed construction, guarded by `prior_epoch`
+  flag so it only fires once per target rotation
+
+**Dependencies:** `Biopython` (`pip install biopython`) for Smith-Waterman alignment, or a
+pure-Python fallback using `difflib.SequenceMatcher` for fast approximate identity (no new
+package needed, ~2 % slower).
+
+**Estimated effort:** ~80 lines.  Priority: medium — high value on weeks 2–4 when the target
+rotates within a known protein family.
 
 ### §HHH — Hardware-Adaptive `sampling_steps_affinity` ✅ Implemented
 

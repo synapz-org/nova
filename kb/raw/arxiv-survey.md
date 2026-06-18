@@ -358,7 +358,7 @@ Even a partial result (1 of 5 molecules scored) improves on the PSICHIC-only bas
 
 ## Implementation Roadmap (priority order)
 
-All items 1–7 are **implemented**, including §NN. Item 7 (FBLD) remains as future research.
+All items 1–10 are **implemented**. Items 5 and 7 remain as conditional/research directions.
 
 | Priority | Approach | Effort | Status | Expected gain |
 |----------|----------|--------|--------|---------------|
@@ -372,6 +372,7 @@ All items 1–7 are **implemented**, including §NN. Item 7 (FBLD) remains as fu
 | 8 | §NN: Reduced-sample §MM/§FF screening | 60 lines | ✅ Done | ~2× more §MM rounds per epoch budget |
 | 9 | §PP: Full-coverage SALSA perturbations (n_perturb 60→200) + SAVI pool 5k→10k | 4 lines | ✅ Done | Ring walk + terminal removal now contribute to every SALSA call |
 | 10 | §QQQQ: RF surrogate above 100 training points | 30 lines | ✅ Done | 5–20% NDCG improvement on week-2+ runs |
+| 11 | §WWWWW: Cross-target protein-similarity seeding | 80 lines | ⏳ Planned | Better SALSA seeds on week 1 of new family-member target |
 
 All approaches share the same submission constraint: molecules must map to valid SAVI-2020
 product names. SALSA and GradientGA both solve this via nearest-neighbour SAVI-2020 lookup.
