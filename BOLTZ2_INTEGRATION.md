@@ -1,5 +1,68 @@
 # Boltz-2 Miner Integration
 
+## Current Status (as of 2026-06-19)
+
+§WWWWW added 2026-06-19: Cross-Target Protein-Similarity Seeding.
+
+**§WWWWW — Cross-Target Protein-Similarity Seeding**
+
+On the first epoch after a weekly-target rotation, the Boltz cache holds no entries
+for the new target — SALSA must start cold with only PSICHIC and ChEMBL seeds.
+However, the cache may still hold Boltz-validated molecules from the previous weekly
+target.  For protein families (GPCRs, kinases, proteases), a ligand that binds one
+family member often has measurable affinity for related members at ≥40% sequence
+identity.
+
+§WWWWW harvests these cross-family seeds **before** `_cleanup_boltz_cache` runs at
+startup (cleanup removes all non-current-protein rows).  It:
+
+1. Lists distinct protein accessions present in the cache via `_disk_cache_list_proteins`.
+2. Fetches the amino-acid sequence of each prior protein via UniProt.
+3. Computes sequence identity against the current target using
+   `difflib.SequenceMatcher.ratio()` — O(n·m) but fast for typical 300–1000 AA
+   sequences and the small number of prior proteins in the cache (no extra dependency).
+4. For any prior protein with identity ≥ 40%, retrieves its top-3 Boltz-scored
+   molecules from the cache.
+5. Stores all recovered SMILES in `state['cross_target_seeds']` before cleanup fires.
+
+In the SALSA seed-construction block (after §SS and §UU), §WWWWW appends up to 3
+of these cross-target SMILES (deduplicated, Boltz-safe filtered) to `_seeds`.
+The surrounding SALSA logging line is updated to report "N cross-target" seeds.
+
+**New helpers in `neurons/miner.py`:**
+- `_disk_cache_list_proteins(db_path, exclude)` — `SELECT DISTINCT protein` query,
+  O(1) on the indexed table.
+- `_cross_target_seeds_from_cache(db_path, current_protein, identity_threshold=0.40,
+  limit=3)` — orchestrates the sequence-fetch + identity-filter + seed-retrieval.
+
+**Why `difflib.SequenceMatcher`:** No BioPython/Smith-Waterman dependency needed.
+`SequenceMatcher.ratio()` computes 2·M / (len_a + len_b) where M is the longest
+common subsequence length — a good proxy for global sequence identity.  It slightly
+underestimates true alignment identity (especially for distantly related proteins)
+but is conservative (if anything we miss some homologs rather than add spurious ones),
+no installation is required, and it runs in <1 s per protein pair.
+
+**Safety properties:**
+- Entire helper is wrapped in try/except — any sequence-fetch error is non-fatal.
+- Called only at startup, not at epoch boundary (cleanup only runs at startup anyway).
+- `cross_target_seeds` persists in state across epochs but becomes less useful after
+  epoch 1 once the cache accumulates current-target entries (§UU takes over).
+- At most 3 seeds added to SALSA — no change to SALSA round count or Boltz budget.
+
+**Files changed:**
+- `neurons/miner.py` — `import difflib`, `_disk_cache_list_proteins`,
+  `_cross_target_seeds_from_cache`, `state['cross_target_seeds']` initialisation,
+  pre-cleanup call at startup, §WWWWW seed block in SALSA construction,
+  `_seed_parts` logging update.
+
+**Estimated benefit:** On week 2+ when the target rotates within a known protein
+family, SALSA immediately explores the chemical neighbourhood of a Boltz-confirmed
+binder from the prior week.  Expected: 1–3 additional high-quality candidates in the
+Boltz prescoring window on epoch 1 of a new family-member target without extra Boltz
+calls.  No-op on first-ever run (empty cache) or when no homologs are found.
+
+---
+
 ## Current Status (as of 2026-06-17)
 
 §UUUU added 2026-06-16: Antitarget Boltz Selectivity Scoring.

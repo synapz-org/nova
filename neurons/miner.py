@@ -8,6 +8,7 @@ import datetime
 import tempfile
 import traceback
 import base64
+import difflib
 import hashlib
 import sqlite3
 
@@ -171,6 +172,57 @@ def _disk_cache_get_candidates(db_path: str, protein: str, limit: int = 20) -> l
         ]
     except Exception:
         return []
+
+
+def _disk_cache_list_proteins(db_path: str, exclude: str = "") -> list:
+    """Return distinct protein accessions stored in the cache, excluding *exclude*."""
+    try:
+        with sqlite3.connect(db_path) as conn:
+            rows = conn.execute(
+                "SELECT DISTINCT protein FROM boltz_cache WHERE protein != ?",
+                (exclude,),
+            ).fetchall()
+        return [r[0] for r in rows]
+    except Exception:
+        return []
+
+
+def _cross_target_seeds_from_cache(
+    db_path: str,
+    current_protein: str,
+    identity_threshold: float = 0.40,
+    limit: int = 3,
+) -> list:
+    """
+    Return SMILES for Boltz-validated molecules from prior-target proteins that
+    are sequence homologs of *current_protein* (identity >= threshold).
+
+    Must be called BEFORE _cleanup_boltz_cache so prior-protein rows still exist.
+    Uses difflib.SequenceMatcher for fast approximate identity — no extra deps.
+    """
+    prior_proteins = _disk_cache_list_proteins(db_path, exclude=current_protein)
+    if not prior_proteins:
+        return []
+    current_seq = get_sequence_from_protein_code(current_protein)
+    if not current_seq:
+        return []
+    results: list = []
+    for prior in prior_proteins:
+        prior_seq = get_sequence_from_protein_code(prior)
+        if not prior_seq:
+            continue
+        ratio = difflib.SequenceMatcher(None, current_seq, prior_seq).ratio()
+        if ratio >= identity_threshold:
+            hits = _disk_cache_get_candidates(db_path, prior, limit=limit)
+            for h in hits:
+                sm = h.get('product_smiles', '')
+                if sm and sm not in results:
+                    results.append(sm)
+            bt.logging.info(
+                f"§WWWWW: homolog {prior} ({ratio:.1%} seq-identity) → "
+                f"{len(hits)} cross-target seed(s)"
+            )
+    return results
 
 
 def _apply_warm_start(state: Dict[str, Any], db_path: str, protein: str) -> None:
@@ -717,11 +769,28 @@ async def run_psichic_model_loop(state: Dict[str, Any]) -> None:
                                 f"[UU] Adding {len(_uu_seeds)} prior-epoch Boltz-validated seed(s) to SALSA."
                             )
 
+                        # §WWWWW: extend with seeds from homologous prior-target proteins.
+                        # Populated before _cleanup_boltz_cache at startup; only useful on
+                        # the first epoch after a weekly-target rotation to a family member.
+                        _wwwww_ok = [
+                            s for s in state.get('cross_target_seeds', [])
+                            if s not in _seeds
+                            and Chem.MolFromSmiles(s) is not None
+                            and is_boltz_safe_smiles(s)[0]
+                        ][:3]
+                        if _wwwww_ok:
+                            _seeds = _seeds + _wwwww_ok
+                            bt.logging.info(
+                                f"[WWWWW] Adding {len(_wwwww_ok)} cross-target homolog seed(s) to SALSA."
+                            )
+
                         _seed_parts = [f"{_n_seeds} PSICHIC"]
                         if _chembl_ok:
                             _seed_parts.append(f"{len(_chembl_ok)} ChEMBL")
                         if _uu_seeds:
                             _seed_parts.append(f"{len(_uu_seeds)} Boltz-cache")
+                        if _wwwww_ok:
+                            _seed_parts.append(f"{len(_wwwww_ok)} cross-target")
                         _seed_desc = " + ".join(_seed_parts)
                         bt.logging.info(
                             f"SALSA: triggering with {salsa_pool_size}-molecule pool, "
@@ -2477,10 +2546,29 @@ async def run_miner(config: argparse.Namespace) -> None:
         'last_challenge_targets': [],
         'current_challenge_antitargets': [],
         'last_challenge_antitargets': [],
+
+        # §WWWWW: SMILES from homologous prior-target proteins (populated before
+        # cache cleanup so prior-protein rows are still readable).
+        'cross_target_seeds': [],
     }
 
     # Ensure persistent Boltz cache DB exists
     _init_boltz_cache_db(state['boltz_cache_db'])
+
+    # §WWWWW: harvest cross-target seeds from homologous prior-target proteins
+    # BEFORE cleanup removes all non-current-protein entries.  On the first epoch
+    # after a target rotation this gives SALSA confirmed binders from structurally
+    # related targets (≥40% seq-identity) as warm seeds — a no-op when the target
+    # has not rotated or no prior-target entries exist.
+    state['cross_target_seeds'] = _cross_target_seeds_from_cache(
+        state['boltz_cache_db'], config.weekly_target
+    )
+    if state['cross_target_seeds']:
+        bt.logging.info(
+            f"§WWWWW: {len(state['cross_target_seeds'])} cross-target seed(s) "
+            f"saved from homologous prior-target(s)."
+        )
+
     _cleanup_boltz_cache(state['boltz_cache_db'], keep_protein=config.weekly_target)
     bt.logging.info(f"Boltz persistent cache initialised: {state['boltz_cache_db']}")
 
