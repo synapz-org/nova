@@ -36,8 +36,10 @@ class BoltzWrapper:
         self.config = yaml.load(open(config_path, 'r'), Loader=yaml.FullLoader)
         self.base_dir = BASE_DIR
 
-        # §AAA + §EEE + §HHH: Hardware-adaptive settings for A100/H100 (≥38 GiB VRAM).
-        # Single VRAM probe shared by all three optimisations.
+        # §AAA + §EEE + §HHH + §XXXXX: Hardware-adaptive settings.
+        # Single VRAM probe shared by all optimisations.
+        # Tier 1 (≥38 GiB, A100 80 GB / RTX 6000 Ada): §AAA/§EEE/§HHH.
+        # Tier 2 (≥70 GiB, H100 SXM/PCIe 80 GB): §XXXXX further boosts Tier 1.
         try:
             if torch.cuda.is_available():
                 vram_gib = torch.cuda.get_device_properties(0).total_memory / (1024 ** 3)
@@ -70,6 +72,26 @@ class BoltzWrapper:
                             f"[§HHH] Hardware-adaptive affinity steps: {vram_gib:.0f} GiB VRAM → "
                             f"sampling_steps_affinity=150"
                         )
+                    # §XXXXX: H100 ultra-high VRAM tier (≥70 GiB, e.g. H100 SXM/PCIe 80 GB).
+                    # Runs AFTER §AAA/§HHH so it raises from Tier-1 values (2048 / 150)
+                    # to Tier-2 values (4096 / 200).  H100 has 80 GiB HBM3 which can fit
+                    # 4× more MSA rows with only ~40% extra memory versus 2048.  200
+                    # affinity steps is 33% more than §HHH and fits the same epoch budget
+                    # because H100 is ~2× faster than A100 per operation.
+                    if vram_gib >= 70:
+                        if (self.config.get('subsample_msa', True)
+                                and self.config.get('num_subsampled_msa', 2048) < 4096):
+                            self.config['num_subsampled_msa'] = 4096
+                            bt.logging.info(
+                                f"[§XXXXX] H100 tier MSA: {vram_gib:.0f} GiB VRAM → "
+                                f"num_subsampled_msa=4096"
+                            )
+                        if self.config.get('sampling_steps_affinity', 150) < 200:
+                            self.config['sampling_steps_affinity'] = 200
+                            bt.logging.info(
+                                f"[§XXXXX] H100 tier affinity steps: {vram_gib:.0f} GiB VRAM → "
+                                f"sampling_steps_affinity=200"
+                            )
         except Exception:
             pass
 

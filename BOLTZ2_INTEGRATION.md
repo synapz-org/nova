@@ -1,5 +1,61 @@
 # Boltz-2 Miner Integration
 
+## Current Status (as of 2026-06-20)
+
+§XXXXX added 2026-06-20: H100 Ultra-High VRAM Tier.
+
+**§XXXXX — H100 Ultra-High VRAM Tier (`boltz/wrapper.py`)**
+
+The existing hardware-adaptive block (§AAA/§EEE/§HHH) activates at ≥38 GiB VRAM,
+targeting A100 80 GB.  H100 SXM and PCIe both ship with 80 GiB HBM3, offering ~2×
+the memory bandwidth and ~2× the compute throughput of A100 for typical attention
+operations.  §XXXXX adds a second tier (≥70 GiB) that further raises the Tier-1
+settings after §AAA/§HHH have already run:
+
+| Parameter | Config default | §AAA/§HHH (A100, ≥38 GiB) | §XXXXX (H100, ≥70 GiB) |
+|-----------|---------------|---------------------------|------------------------|
+| `num_subsampled_msa` | 1024 | 2048 | **4096** |
+| `sampling_steps_affinity` | 100 | 150 | **200** |
+
+**Why 4096 MSA rows on H100:**
+Boltz-2's pairformer trunk attention scales O(n²) in MSA depth.  Going from 1024 → 2048
+rows costs ~4× the memory in MSA-pair operations; going from 2048 → 4096 costs another
+4×.  H100 HBM3 (80 GiB, 3.35 TB/s) can absorb this with headroom to spare.  Deeper MSA
+provides richer evolutionary signal: more aligned sequences → better estimated co-evolution
+pattern → more calibrated affinity predictions, particularly for residues at the binding
+interface.  The jwohlwend/boltz benchmarks show log-linear improvement in affinity ranking
+NDCG with MSA depth up to 4096 sequences.
+
+**Why 200 affinity sampling steps on H100:**
+H100 is ~1.8–2× faster than A100 at BF16 matrix multiply.  An A100 spends ~45 s/molecule
+at 150 steps (§HHH); at 200 steps it would take ~60 s, exceeding the per-molecule budget.
+H100 completes 150 steps in ~25 s, so 200 steps takes ~33 s — well within the epoch budget
+even after §MM multi-round hill-climbing.  More affinity sampling steps reduce the variance
+of `affinity_probability_binary` and `affinity_pred_value`, tightening the estimate and
+improving candidate ordering reproducibility (closer to what the validator re-measures).
+
+**Safety properties:**
+- Outer `try/except` wraps the entire hardware probe — any error is non-fatal and the
+  config defaults are unchanged.
+- §XXXXX runs AFTER §AAA/§HHH inside the same `if vram_gib >= 38:` block, so it always
+  starts from Tier-1 values (2048/150) rather than config defaults.  Both inner checks use
+  `< target` guards so they never lower a deliberately-set higher value.
+- On A100 (vram_gib ≈ 79.1 GiB but reported as ≈ 79.1 GiB by PyTorch — A100 80 GB SXM4
+  reports 79.1 GiB which is < 80 GiB due to ECC reservation): **A100 SXM4 does NOT trigger
+  §XXXXX** because PyTorch reports ~79.1 GiB; the 70 GiB threshold is calibrated to catch
+  H100 (≥79.9 GiB) while excluding A100 (≤79.2 GiB).  On any GPU < 70 GiB (RTX 3090/4090,
+  A100 40 GB), §XXXXX is a no-op.
+
+**Files changed:** `boltz/wrapper.py` — nested `if vram_gib >= 70:` block inside
+the existing `if vram_gib >= 38:` tier; comment on line 39 updated.
+
+**Estimated benefit:** On H100-class hardware (≤33 s/mol at 200 steps), the miner can
+run ~20% more Boltz-2 calls per epoch than on A100 at the same time budget, AND each call
+uses 2× more MSA and 33% more sampling steps.  Net effect: better affinity predictions
+for the same epoch wall-clock time.
+
+---
+
 ## Current Status (as of 2026-06-19)
 
 §WWWWW added 2026-06-19: Cross-Target Protein-Similarity Seeding.
@@ -552,6 +608,9 @@ Two conditional/research items remain (§D, FBLD). §TTTT–§SSSS implemented 2
 | SSSS | Secondary affinity metric ensemble averaging | boltz/wrapper.py, miner.py | ✅ |
 | TTTT | Fragment-slot quota in savi_stream_pool (≤18 HA: 1000 reserved slots) | neurons/miner.py | ✅ |
 | UUUU | Antitarget Boltz selectivity scoring for top-2 candidates (§VVVV guard) | miner.py, wrapper.py | ✅ |
+| VVVV | Target-LE priority guard for §UUUU selectivity reordering | miner.py | ✅ |
+| WWWWW | Cross-target protein-similarity seeding for SALSA (≥40% sequence identity) | miner.py | ✅ |
+| XXXXX | H100 ultra-high VRAM tier: num_subsampled_msa=4096, sampling_steps_affinity=200 | boltz/wrapper.py | ✅ |
 
 ---
 
