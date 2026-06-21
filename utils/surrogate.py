@@ -260,3 +260,132 @@ def ucb_rank_pool(pool_df, model, beta: float = 1.0, smiles_col: str = 'product_
         )
     except Exception:
         return rank_pool_by_surrogate(pool_df, model, smiles_col)
+
+
+def fit_dual_surrogate(db_path: str, protein: str, min_points: int = 40):
+    """
+    §YYYYY: Fit separate surrogates for APB and APV components.
+
+    Reads (smiles, affinity_prob_binary, affinity_pred_val) from the cache
+    (populated after the §YYYYY component-caching update).  Trains one Ridge
+    or RF model per component.  Returns (model_apb, model_apv) or None when
+    fewer than *min_points* rows have complete component data.
+
+    The combined surrogate score for a molecule is then:
+        (apb_pred − apv_pred) / heavy_atom_count
+
+    Separate models capture the distinct functional forms: APB is a soft
+    probability calibrated by a classification head, while APV is a
+    continuous free-energy estimate.  Predicting them independently avoids
+    the model trying to learn a single linear combination of features that
+    approximates a nonlinear product of two structurally-distinct outputs.
+
+    Falls back to None on any error so callers can degrade to fit_surrogate.
+    """
+    try:
+        from sklearn.linear_model import Ridge
+        from sklearn.ensemble import RandomForestRegressor
+        from sklearn.pipeline import Pipeline
+        from sklearn.preprocessing import StandardScaler
+    except ImportError:
+        return None
+
+    try:
+        with sqlite3.connect(db_path) as conn:
+            rows = conn.execute(
+                "SELECT smiles, affinity_prob_binary, affinity_pred_val "
+                "FROM boltz_cache "
+                "WHERE protein=? "
+                "  AND affinity_prob_binary IS NOT NULL "
+                "  AND affinity_pred_val IS NOT NULL",
+                (protein,),
+            ).fetchall()
+    except Exception:
+        return None
+
+    if len(rows) < min_points:
+        return None
+
+    X, y_apb, y_apv = [], [], []
+    for smiles, apb, apv in rows:
+        vec = _descriptor_vector(smiles)
+        if vec is not None:
+            X.append(vec)
+            y_apb.append(float(apb))
+            y_apv.append(float(apv))
+
+    if len(X) < min_points:
+        return None
+
+    def _make_pipeline(n: int):
+        if n >= _RF_THRESHOLD:
+            learner = RandomForestRegressor(
+                n_estimators=100, max_features='sqrt', random_state=68, n_jobs=1
+            )
+        else:
+            learner = Ridge(alpha=1.0)
+        return Pipeline([('scaler', StandardScaler()), ('model', learner)])
+
+    try:
+        model_apb = _make_pipeline(len(X))
+        model_apb.fit(X, y_apb)
+        model_apv = _make_pipeline(len(X))
+        model_apv.fit(X, y_apv)
+        return (model_apb, model_apv)
+    except Exception:
+        return None
+
+
+def dual_surrogate_rank_pool(
+    pool_df,
+    dual_model,
+    smiles_col: str = 'product_smiles',
+    ha_col: str = 'heavy_atoms',
+):
+    """
+    §YYYYY: Re-rank pool_df using the dual APB+APV surrogate.
+
+    Predicts (apb - apv) / ha for each row using the two component models
+    returned by fit_dual_surrogate.  Falls back gracefully when the dual model
+    is None, when descriptor computation fails for > 50% of rows, or on any
+    exception.  The returned DataFrame has the same schema as the input.
+    """
+    if dual_model is None:
+        return pool_df
+
+    model_apb, model_apv = dual_model
+    try:
+        vecs = [_descriptor_vector(s) for s in pool_df[smiles_col]]
+        n_valid = sum(1 for v in vecs if v is not None)
+        if n_valid < max(1, len(pool_df) * 0.5):
+            return pool_df
+
+        placeholder = [0.0] * _N_FEATURES
+        X = [v if v is not None else placeholder for v in vecs]
+
+        apb_preds = model_apb.predict(X)
+        apv_preds = model_apv.predict(X)
+
+        # HA from pool column when available; fall back to RDKit.
+        if ha_col in pool_df.columns:
+            ha_vals = pool_df[ha_col].fillna(25).values.astype(float)
+        else:
+            from utils.molecules import get_heavy_atom_count
+            ha_vals = np.array([
+                float(get_heavy_atom_count(s) or 25)
+                for s in pool_df[smiles_col]
+            ])
+        ha_vals = np.where(ha_vals > 0, ha_vals, 25.0)
+
+        combined = (apb_preds - apv_preds) / ha_vals
+
+        pool_copy = pool_df.copy()
+        pool_copy['surrogate_score'] = combined
+        return (
+            pool_copy
+            .sort_values('surrogate_score', ascending=False)
+            .drop(columns=['surrogate_score'])
+            .reset_index(drop=True)
+        )
+    except Exception:
+        return pool_df

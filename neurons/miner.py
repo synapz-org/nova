@@ -45,7 +45,7 @@ from utils.msa import ensure_msa
 from utils.salsa import run_salsa_search
 from utils.genetic import run_gradient_ga
 from utils.chembl import get_chembl_seeds
-from utils.surrogate import fit_surrogate, rank_pool_by_surrogate, ucb_rank_pool
+from utils.surrogate import fit_surrogate, rank_pool_by_surrogate, ucb_rank_pool, fit_dual_surrogate, dual_surrogate_rank_pool
 from PSICHIC.wrapper import PsichicWrapper
 from boltz.wrapper import BoltzWrapper
 from btdr import QuicknetBittensorDrandTimelock
@@ -66,12 +66,19 @@ def _init_boltz_cache_db(db_path: str) -> None:
                 PRIMARY KEY (smiles, protein)
             )
         """)
-        # Add product_name column when upgrading from older schema that lacked it.
-        # SQLite raises OperationalError if the column already exists; we swallow it.
-        try:
-            conn.execute("ALTER TABLE boltz_cache ADD COLUMN product_name TEXT")
-        except Exception:
-            pass
+        # Add columns when upgrading from older schemas (swallow if already present).
+        for _col_ddl in (
+            "ALTER TABLE boltz_cache ADD COLUMN product_name TEXT",
+            # §YYYYY: store raw Boltz components alongside the combined score so the
+            # §ZZ/§RRRR surrogate can train on individual APB / APV distributions
+            # and future analysis can study per-component structure-activity trends.
+            "ALTER TABLE boltz_cache ADD COLUMN affinity_prob_binary REAL",
+            "ALTER TABLE boltz_cache ADD COLUMN affinity_pred_val REAL",
+        ):
+            try:
+                conn.execute(_col_ddl)
+            except Exception:
+                pass
 
 
 def _disk_cache_get(db_path: str, smiles: str, protein: str) -> Optional[float]:
@@ -87,13 +94,28 @@ def _disk_cache_get(db_path: str, smiles: str, protein: str) -> Optional[float]:
         return None
 
 
-def _disk_cache_put(db_path: str, smiles: str, protein: str, score: float, product_name: Optional[str] = None) -> None:
-    """Upsert a Boltz score into the persistent cache (silently ignores errors)."""
+def _disk_cache_put(
+    db_path: str,
+    smiles: str,
+    protein: str,
+    score: float,
+    product_name: Optional[str] = None,
+    apb: Optional[float] = None,
+    apv: Optional[float] = None,
+) -> None:
+    """Upsert a Boltz score into the persistent cache (silently ignores errors).
+
+    §YYYYY: apb (affinity_probability_binary) and apv (affinity_pred_value) are
+    stored separately so the §ZZ surrogate can later train on individual components
+    and per-component analysis is available without re-running Boltz.
+    """
     try:
         with sqlite3.connect(db_path) as conn:
             conn.execute(
-                "INSERT OR REPLACE INTO boltz_cache (smiles, protein, score, product_name) VALUES (?,?,?,?)",
-                (smiles, protein, score, product_name),
+                "INSERT OR REPLACE INTO boltz_cache "
+                "(smiles, protein, score, product_name, affinity_prob_binary, affinity_pred_val) "
+                "VALUES (?,?,?,?,?,?)",
+                (smiles, protein, score, product_name, apb, apv),
             )
     except Exception:
         pass
@@ -700,19 +722,23 @@ async def run_psichic_model_loop(state: Dict[str, Any]) -> None:
                         # signal so SALSA explores the most promising chemical region
                         # first.  Falls back silently to PSICHIC ranking on cache miss.
                         try:
-                            _zz_seed_model = fit_surrogate(
-                                state.get('boltz_cache_db', BOLTZ_CACHE_DB),
-                                state['config'].weekly_target,
-                            )
-                            if _zz_seed_model is not None and not state['global_candidate_pool'].empty:
-                                # §RRRR: UCB ranking when surrogate is RF (≥100 pts);
-                                # falls back to plain mean for Ridge automatically.
-                                state['global_candidate_pool'] = ucb_rank_pool(
-                                    state['global_candidate_pool'], _zz_seed_model
+                            _db_path_s = state.get('boltz_cache_db', BOLTZ_CACHE_DB)
+                            _prot_s = state['config'].weekly_target
+                            _dual_s = fit_dual_surrogate(_db_path_s, _prot_s)
+                            if _dual_s is not None and not state['global_candidate_pool'].empty:
+                                state['global_candidate_pool'] = dual_surrogate_rank_pool(
+                                    state['global_candidate_pool'], _dual_s
                                 )
-                                bt.logging.info("[§RRRR/ZZ] SALSA seeds re-ranked by UCB surrogate.")
+                                bt.logging.info("[§YYYYY] SALSA seeds re-ranked by dual APB+APV surrogate.")
+                            else:
+                                _zz_seed_model = fit_surrogate(_db_path_s, _prot_s)
+                                if _zz_seed_model is not None and not state['global_candidate_pool'].empty:
+                                    state['global_candidate_pool'] = ucb_rank_pool(
+                                        state['global_candidate_pool'], _zz_seed_model
+                                    )
+                                    bt.logging.info("[§RRRR/ZZ] SALSA seeds re-ranked by UCB surrogate.")
                         except Exception as _zz_s_err:
-                            bt.logging.debug(f"[ZZ] SALSA seed re-rank skipped: {_zz_s_err}")
+                            bt.logging.debug(f"[ZZ/YYYYY] SALSA seed re-rank skipped: {_zz_s_err}")
 
                         # §OOOO: multi-seed SALSA with scaffold-diverse input seeds.
                         # Take the top-5 (by PSICHIC / surrogate-reranked order) then
@@ -1277,25 +1303,35 @@ async def run_boltz_prescoring(state: Dict[str, Any], max_candidates: int = 5) -
     safe_mask = candidates['product_smiles'].apply(lambda s: is_boltz_safe_smiles(s)[0])
     candidates = candidates[safe_mask].reset_index(drop=True)
 
-    # §ZZ: Re-rank Boltz candidates by mini-surrogate when ≥ 40 scores are cached.
-    # Ridge regression on 20 RDKit descriptors gives Boltz-calibrated ordering so
-    # the scaffold diversity filter preferentially selects molecules whose descriptor
-    # profile correlates with high Boltz scores for this specific protein.
-    # Fitting takes ~30 ms (40 points × 20 features) — negligible vs inference.
-    # Falls back silently to PSICHIC ordering when the cache has < 40 entries.
+    # §ZZ / §YYYYY: Re-rank Boltz candidates by surrogate when ≥ 40 scores cached.
+    # §YYYYY dual surrogate: when ≥ 40 rows with complete APB/APV component data
+    # exist, trains separate surrogates for affinity_probability_binary and
+    # affinity_pred_value, then predicts (apb_pred - apv_pred) / ha as the ranking
+    # signal.  Separate models capture the distinct functional forms of the two Boltz
+    # outputs (probability vs. free energy) better than a single combined-score model.
+    # Falls back to §RRRR UCB surrogate (combined score) when component data is sparse
+    # (pre-§YYYYY cache entries, or first epoch on a new target), and further falls back
+    # to PSICHIC ordering when the cache has < 40 entries.
     if not candidates.empty:
         try:
-            _zz_model = fit_surrogate(db_path, protein)
-            if _zz_model is not None:
-                # §RRRR: UCB ranking when surrogate is RF (≥100 pts);
-                # falls back to plain mean for Ridge automatically.
-                candidates = ucb_rank_pool(candidates, _zz_model)
+            _dual = fit_dual_surrogate(db_path, protein)
+            if _dual is not None:
+                candidates = dual_surrogate_rank_pool(candidates, _dual)
                 bt.logging.info(
-                    f"[§RRRR/ZZ] Pre-Boltz candidates re-ranked by UCB surrogate "
+                    f"[§YYYYY] Pre-Boltz candidates re-ranked by dual APB+APV surrogate "
                     f"({len(candidates)} entries, target={protein})."
                 )
+            else:
+                _zz_model = fit_surrogate(db_path, protein)
+                if _zz_model is not None:
+                    # §RRRR: UCB ranking when surrogate is RF (≥100 pts).
+                    candidates = ucb_rank_pool(candidates, _zz_model)
+                    bt.logging.info(
+                        f"[§RRRR/ZZ] Pre-Boltz candidates re-ranked by UCB surrogate "
+                        f"({len(candidates)} entries, target={protein})."
+                    )
         except Exception as _zz_err:
-            bt.logging.debug(f"[ZZ] Candidate surrogate re-rank skipped: {_zz_err}")
+            bt.logging.debug(f"[ZZ/YYYYY] Candidate surrogate re-rank skipped: {_zz_err}")
 
     if candidates.empty:
         bt.logging.warning("Boltz-2 pre-scoring: no Boltz-safe candidates, keeping PSICHIC ranking.")
@@ -1486,7 +1522,14 @@ async def run_boltz_prescoring(state: Dict[str, Any], max_candidates: int = 5) -
                     _pname = row.get('product_name')
                     if not isinstance(_pname, str):
                         _pname = None
-                    _disk_cache_put(db_path, canon, protein, score, product_name=_pname)
+                    # §YYYYY: extract primary APB/APV for component caching.
+                    _yyyyy_apb = _comps.get('affinity_probability_binary')
+                    _yyyyy_apv = _comps.get('affinity_pred_value')
+                    _disk_cache_put(
+                        db_path, canon, protein, score, product_name=_pname,
+                        apb=_yyyyy_apb if isinstance(_yyyyy_apb, (int, float)) else None,
+                        apv=_yyyyy_apv if isinstance(_yyyyy_apv, (int, float)) else None,
+                    )
 
                     # Adaptive trigger: one molecule gives the most accurate per-mol timing
                     elapsed = wrapper.last_inference_duration
@@ -1628,8 +1671,15 @@ async def run_boltz_prescoring(state: Dict[str, Any], max_candidates: int = 5) -
                                     )
                                     _ff_score = wrapper.per_molecule_metric.get(_ff_uid_f, {}).get(_ff_winner, -math.inf)
                                     boltz_cache[_ff_w_key] = _ff_score
-                                    _disk_cache_put(db_path, _ff_w_canon, protein, _ff_score,
-                                                    product_name=_ff_w_row.get('product_name'))
+                                    _ff_comps = wrapper.per_molecule_components.get(_ff_uid_f, {}).get(_ff_winner, {})
+                                    _ff_apb = _ff_comps.get('affinity_probability_binary')
+                                    _ff_apv = _ff_comps.get('affinity_pred_value')
+                                    _disk_cache_put(
+                                        db_path, _ff_w_canon, protein, _ff_score,
+                                        product_name=_ff_w_row.get('product_name'),
+                                        apb=_ff_apb if isinstance(_ff_apb, (int, float)) else None,
+                                        apv=_ff_apv if isinstance(_ff_apv, (int, float)) else None,
+                                    )
                                     bt.logging.info(
                                         f"§FF §NN full-scored winner: {_ff_w_row.get('product_name', '?')} "
                                         f"boltz={_ff_score:.4f} (screened {len(_ff_screen)} hits)"
@@ -1829,8 +1879,15 @@ async def run_boltz_prescoring(state: Dict[str, Any], max_candidates: int = 5) -
                             )
                             _mm_score = wrapper.per_molecule_metric.get(_mm_uid_f, {}).get(_mm_round_winner, -math.inf)
                             boltz_cache[_mm_w_key] = _mm_score
-                            _disk_cache_put(db_path, _mm_w_canon, protein, _mm_score,
-                                            product_name=_mm_w_row.get('product_name'))
+                            _mm_comps = wrapper.per_molecule_components.get(_mm_uid_f, {}).get(_mm_round_winner, {})
+                            _mm_apb = _mm_comps.get('affinity_probability_binary')
+                            _mm_apv = _mm_comps.get('affinity_pred_value')
+                            _disk_cache_put(
+                                db_path, _mm_w_canon, protein, _mm_score,
+                                product_name=_mm_w_row.get('product_name'),
+                                apb=_mm_apb if isinstance(_mm_apb, (int, float)) else None,
+                                apv=_mm_apv if isinstance(_mm_apv, (int, float)) else None,
+                            )
                             if wrapper.last_inference_duration > 0:
                                 state['boltz_time_per_mol'] = wrapper.last_inference_duration
                             bt.logging.info(
@@ -2043,9 +2100,16 @@ async def run_boltz_prescoring(state: Dict[str, Any], max_candidates: int = 5) -
                                             _xx_uid, {}
                                         ).get(_xx_n_smi, -math.inf)
                                         boltz_cache[_xx_n_key] = _xx_n_score
+                                        _xx_comps = wrapper.per_molecule_components.get(
+                                            _xx_uid, {}
+                                        ).get(_xx_n_smi, {})
+                                        _xx_apb = _xx_comps.get('affinity_probability_binary')
+                                        _xx_apv = _xx_comps.get('affinity_pred_value')
                                         _disk_cache_put(
                                             db_path, _xx_n_canon, protein, _xx_n_score,
                                             product_name=_xx_n_pname or None,
+                                            apb=_xx_apb if isinstance(_xx_apb, (int, float)) else None,
+                                            apv=_xx_apv if isinstance(_xx_apv, (int, float)) else None,
                                         )
                                         if wrapper.last_inference_duration > 0:
                                             state['boltz_time_per_mol'] = wrapper.last_inference_duration
