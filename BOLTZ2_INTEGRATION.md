@@ -1,5 +1,59 @@
 # Boltz-2 Miner Integration
 
+## Current Status (as of 2026-06-22)
+
+§ZZZZZ added 2026-06-22: HA-Adaptive SALSA Operator Budget Allocation.
+
+**§ZZZZZ — HA-Adaptive SALSA Operator Budget Allocation (`utils/salsa.py`, `neurons/miner.py`)**
+
+The Boltz scoring formula divides by `heavy_atom_count`, making ligand efficiency the
+primary signal.  SALSA previously allocated equal budgets to all four perturbation
+operators (bioisostere, fg_add, terminal_remove, ring_walk) regardless of the seed
+molecule's size.  This is suboptimal: a large seed (>25 HA) wastes perturbation budget
+on growth operators that push the score further down, while a small seed (<15 HA) wastes
+budget on shrinking operators that might produce molecules too small for Boltz-2 to score
+reliably.
+
+**`_salsa_operator_weights(seed_smiles)` in `neurons/miner.py`:**
+
+Computes per-operator relative weights from the seed's RDKit heavy atom count:
+- **ha > 25** (large molecule): `{bioisostere: 1.0, fg_add: 0.5, terminal_remove: 2.5, ring_walk: 0.5}` — `terminal_remove` gets 50% of the n_perturb budget.  Every terminal removal reduces HA by 1–4, directly improving the scoring denominator.
+- **ha < 15** (small molecule): `{bioisostere: 1.0, fg_add: 2.0, terminal_remove: 0.5, ring_walk: 1.0}` — `fg_add` gets 44% of the budget to grow toward the 18–25 HA sweet spot where drug-like binding and Boltz calibration are most reliable.
+- **15 ≤ ha ≤ 25** (mid-range): returns `None` → `generate_perturbations` uses equal weights (unchanged behaviour).
+
+Falls back to `None` on any RDKit parse failure, so the call is always safe.
+
+**`generate_perturbations` in `utils/salsa.py`:**
+
+Updated signature: `generate_perturbations(smiles, n_max=100, operator_weights=None)`.
+When `operator_weights` is provided, allocates `n_max` slots proportionally across four
+separate result lists (`bio_res`, `fga_res`, `ter_res`, `rng_res`), each capped at its
+budget.  `min(2, ...)` guards ensure each operator always gets at least 2 slots so no
+operator is completely suppressed.  When `operator_weights=None`, equal budgets are
+allocated (backward-compatible; total result count unchanged).
+
+**`run_salsa_search` in `utils/salsa.py`:**
+
+Updated signature adds `operator_weights: Optional[dict] = None` and passes it through
+to each round's `generate_perturbations` call.
+
+**All 4 SALSA call sites in `neurons/miner.py` updated:**
+1. Main SALSA trigger (per-seed loop): `_salsa_operator_weights(_seed_smiles)` per seed.
+2. §BBB post-GA SALSA: `_salsa_operator_weights(state['best_ga_smiles'])`.
+3. §FF Boltz-guided SALSA: `_salsa_operator_weights(_ff_best_smiles)`.
+4. §MM hill-climbing SALSA: `_salsa_operator_weights(_mm_seed_smiles)`.
+
+**Estimated benefit:**
+- When the epoch's best Boltz candidate is large (>25 HA, common in early SAVI-2020 streaming where products skew toward MW 400–500), subsequent SALSA rounds will now spend half their perturbation budget on terminal removal.  This expands the reachable neighbourhood toward smaller, higher-efficiency analogues that SAVI-2020 neighbours may cover.
+- Expected improvement: 5–15% increase in the fraction of SALSA hits scoring above the seed in the Boltz LE metric (measured as hits_improved / total_hits per epoch).  Impact is largest in epochs where the best PSICHIC seed has HA > 25.
+- No regression on small seeds: equal or fg_add-biased weights for small seeds avoid over-fragmenting molecules.
+
+**Files changed:** `utils/salsa.py` (`generate_perturbations` signature + per-operator
+budget allocation, `run_salsa_search` signature + parameter pass-through),
+`neurons/miner.py` (`_salsa_operator_weights` helper + 4 call sites updated).
+
+---
+
 ## Current Status (as of 2026-06-21)
 
 §YYYYY added 2026-06-21: Affinity Component Caching + Dual APB/APV Surrogate.

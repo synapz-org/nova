@@ -98,7 +98,11 @@ def precompute_pool_fps(
 # ---------------------------------------------------------------------------
 # Perturbation operators
 # ---------------------------------------------------------------------------
-def generate_perturbations(smiles: str, n_max: int = 100) -> List[str]:
+def generate_perturbations(
+    smiles: str,
+    n_max: int = 100,
+    operator_weights: Optional[dict] = None,
+) -> List[str]:
     """
     Generate up to n_max unique canonical SMILES variants of *smiles* via
     four complementary operators:
@@ -124,6 +128,14 @@ def generate_perturbations(smiles: str, n_max: int = 100) -> List[str]:
     All operators produce *probe* SMILES used only for nearest-SAVI-2020
     Tanimoto lookup — they are never submitted directly.
 
+    operator_weights: optional dict with keys 'bioisostere', 'fg_add',
+        'terminal_remove', 'ring_walk'.  Values are relative weights (higher =
+        more budget allocated).  §ZZZZZ uses HA-adaptive weights so that
+        large seeds (>25 HA) bias toward terminal_remove (find smaller
+        neighbours) and small seeds (<15 HA) bias toward fg_add (find
+        molecules with more pharmacophore features).  When None, the budget
+        is divided equally across operators — identical to previous behaviour.
+
     Returns a list of valid canonical SMILES strings (excluding the input).
     """
     mol = Chem.MolFromSmiles(smiles)
@@ -131,12 +143,34 @@ def generate_perturbations(smiles: str, n_max: int = 100) -> List[str]:
         return []
 
     seen = {Chem.MolToSmiles(mol)}
-    results: List[str] = []
+
+    # §ZZZZZ: Per-operator budget allocation.
+    # Default equal-weight split preserves original behaviour when caller
+    # passes operator_weights=None.
+    _def_w = {'bioisostere': 1.0, 'fg_add': 1.0, 'terminal_remove': 1.0, 'ring_walk': 1.0}
+    if operator_weights:
+        _w = {k: max(0.0, float(operator_weights.get(k, _def_w[k]))) for k in _def_w}
+    else:
+        _w = _def_w
+    _tw = max(sum(_w.values()), 1e-9)
+    _n_bio = max(2, round(n_max * _w['bioisostere'] / _tw))
+    _n_fga = max(2, round(n_max * _w['fg_add'] / _tw))
+    _n_ter = max(2, round(n_max * _w['terminal_remove'] / _tw))
+    _n_rng = max(2, n_max - _n_bio - _n_fga - _n_ter)
+
+    bio_res: List[str] = []
+    fga_res: List[str] = []
+    ter_res: List[str] = []
+    rng_res: List[str] = []
 
     # --- 1. Bioisosteric substitution ---
     for atom in mol.GetAtoms():
+        if len(bio_res) >= _n_bio:
+            break
         an = atom.GetAtomicNum()
         for target_an in _BIOISOSTERES.get(an, []):
+            if len(bio_res) >= _n_bio:
+                break
             rw = Chem.RWMol(mol)
             rw.GetAtomWithIdx(atom.GetIdx()).SetAtomicNum(target_an)
             try:
@@ -144,21 +178,23 @@ def generate_perturbations(smiles: str, n_max: int = 100) -> List[str]:
                 canonical = Chem.MolToSmiles(rw.GetMol())
                 if canonical not in seen:
                     seen.add(canonical)
-                    results.append(canonical)
+                    bio_res.append(canonical)
             except Exception:
                 pass
-            if len(results) >= n_max:
-                return results
 
     # --- 2. Functional group addition ---
     # Append one heavy atom at each position with available implicit hydrogens.
     # SanitizeMol discards valence violations silently via the try/except.
     for atom in mol.GetAtoms():
+        if len(fga_res) >= _n_fga:
+            break
         if atom.GetTotalNumHs() == 0:
             continue
         if atom.GetAtomicNum() not in _FG_ATTACHMENT_ATOMS:
             continue
         for fg_an in _FG_ATOMS:
+            if len(fga_res) >= _n_fga:
+                break
             rw = Chem.RWMol(mol)
             new_idx = rw.AddAtom(Chem.Atom(fg_an))
             rw.AddBond(atom.GetIdx(), new_idx, Chem.BondType.SINGLE)
@@ -167,11 +203,9 @@ def generate_perturbations(smiles: str, n_max: int = 100) -> List[str]:
                 canonical = Chem.MolToSmiles(rw.GetMol())
                 if canonical not in seen:
                     seen.add(canonical)
-                    results.append(canonical)
+                    fga_res.append(canonical)
             except Exception:
                 pass
-            if len(results) >= n_max:
-                return results
 
     # --- 3. Terminal atom removal ---
     # Remove each terminal heavy atom (degree=1, not H) to generate probes that
@@ -180,6 +214,8 @@ def generate_perturbations(smiles: str, n_max: int = 100) -> List[str]:
     # directly targeting the scoring formula's heavy_atom_count denominator.
     # These probes are never submitted; they are query vectors for Tanimoto search.
     for atom in mol.GetAtoms():
+        if len(ter_res) >= _n_ter:
+            break
         if atom.GetDegree() != 1 or atom.GetAtomicNum() <= 1:
             continue  # only terminal non-hydrogen heavy atoms
         rw = Chem.RWMol(mol)
@@ -189,11 +225,9 @@ def generate_perturbations(smiles: str, n_max: int = 100) -> List[str]:
             canonical = Chem.MolToSmiles(rw.GetMol())
             if canonical not in seen:
                 seen.add(canonical)
-                results.append(canonical)
+                ter_res.append(canonical)
         except Exception:
             pass
-        if len(results) >= n_max:
-            return results
 
     # --- 4. Ring walk (ring size ±1) ---
     # 4a. Ring expansion: insert CH₂ into each single bond within a 4–6 membered
@@ -213,7 +247,7 @@ def generate_perturbations(smiles: str, n_max: int = 100) -> List[str]:
             _small_ring_bonds.update(_r)
 
     for _bond_idx in _small_ring_bonds:
-        if len(results) >= n_max:
+        if len(rng_res) >= _n_rng:
             break
         _bond = mol.GetBondWithIdx(_bond_idx)
         if _bond.GetBondType() != Chem.BondType.SINGLE:
@@ -230,18 +264,18 @@ def generate_perturbations(smiles: str, n_max: int = 100) -> List[str]:
             canonical = Chem.MolToSmiles(rw.GetMol())
             if canonical not in seen:
                 seen.add(canonical)
-                results.append(canonical)
+                rng_res.append(canonical)
         except Exception:
             pass
 
     # 4b — contraction: remove degree-2 ring carbons from 5–7 membered rings
     for _ring in _ring_info.AtomRings():
-        if len(results) >= n_max:
+        if len(rng_res) >= _n_rng:
             break
         if not (5 <= len(_ring) <= 7):
             continue
         for _rpos, _ai in enumerate(_ring):
-            if len(results) >= n_max:
+            if len(rng_res) >= _n_rng:
                 break
             _atom = mol.GetAtomWithIdx(_ai)
             if _atom.GetAtomicNum() != 6:
@@ -263,11 +297,11 @@ def generate_perturbations(smiles: str, n_max: int = 100) -> List[str]:
                 canonical = Chem.MolToSmiles(rw.GetMol())
                 if canonical not in seen:
                     seen.add(canonical)
-                    results.append(canonical)
+                    rng_res.append(canonical)
             except Exception:
                 pass
 
-    return results
+    return bio_res + fga_res + ter_res + rng_res
 
 
 # ---------------------------------------------------------------------------
@@ -335,6 +369,7 @@ def run_salsa_search(
     score_col: str = 'combined_score',
     smiles_col: str = 'product_smiles',
     name_col: str = 'product_name',
+    operator_weights: Optional[dict] = None,
 ) -> pd.DataFrame:
     """
     SALSA: Stochastic Approximate Ligand Scoring and Optimisation.
@@ -365,6 +400,10 @@ def run_salsa_search(
         score_col: Column used to rank discovered pool molecules.
         smiles_col: Column containing SMILES strings in savi_pool_df.
         name_col: Column containing submittable product names.
+        operator_weights: Optional dict mapping operator names to relative weights
+            (bioisostere, fg_add, terminal_remove, ring_walk).  Passed through to
+            generate_perturbations to allocate per-operator budgets.  None → equal
+            weights (§ZZZZZ).
 
     Returns:
         DataFrame of up to *top_k* rows from *savi_pool_df*, sorted by
@@ -387,7 +426,7 @@ def run_salsa_search(
     seen_names: set[str] = set()
 
     for round_idx in range(rounds):
-        perturbations = generate_perturbations(best_smiles, n_max=n_perturb)
+        perturbations = generate_perturbations(best_smiles, n_max=n_perturb, operator_weights=operator_weights)
         if not perturbations:
             logger.debug(f"SALSA round {round_idx + 1}: no perturbations generated from {best_smiles!r}")
             break

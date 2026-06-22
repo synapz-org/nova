@@ -833,6 +833,10 @@ async def run_psichic_model_loop(state: Dict[str, Any]) -> None:
                                     3,   # rounds
                                     200, # n_perturb — allows ring walk + terminal removal to contribute
                                     5,   # top_k
+                                    'combined_score',
+                                    'product_smiles',
+                                    'product_name',
+                                    _salsa_operator_weights(_seed_smiles),  # §ZZZZZ
                                 )
                                 if not _hits.empty:
                                     _all_salsa.append(_hits)
@@ -957,6 +961,10 @@ async def run_psichic_model_loop(state: Dict[str, Any]) -> None:
                                 2,   # rounds — neighbourhood exploration
                                 200, # n_perturb — full operator coverage
                                 3,   # top_k
+                                'combined_score',
+                                'product_smiles',
+                                'product_name',
+                                _salsa_operator_weights(state['best_ga_smiles']),  # §ZZZZZ
                             )
                             if not _bbb_hits.empty:
                                 bt.logging.info(
@@ -1106,6 +1114,34 @@ async def submit_response(state: Dict[str, Any]) -> None:
 # ----------------------------------------------------------------------------
 # 6. BOLTZ-2 PRE-SCORING
 # ----------------------------------------------------------------------------
+
+def _salsa_operator_weights(seed_smiles: str) -> dict | None:
+    """
+    §ZZZZZ: Return SALSA operator weights biased by the seed molecule's HA count.
+
+    The Boltz scoring formula divides by heavy_atom_count, so shrinking the
+    seed molecule directly improves the score floor.  When the seed is large
+    (>25 HA) we favour terminal_remove; when it is small (<15 HA) we favour
+    fg_add to grow toward the sweet-spot ligand-efficiency range.  The middle
+    range gets equal weights (None → generate_perturbations default).
+    """
+    try:
+        from rdkit import Chem
+        mol = Chem.MolFromSmiles(seed_smiles)
+        if mol is None:
+            return None
+        ha = mol.GetNumHeavyAtoms()
+    except Exception:
+        return None
+
+    if ha > 25:
+        # Seed is large — bias toward shrinking (terminal_remove 50% budget)
+        return {'bioisostere': 1.0, 'fg_add': 0.5, 'terminal_remove': 2.5, 'ring_walk': 0.5}
+    if ha < 15:
+        # Seed is small — bias toward growing (fg_add 44% budget)
+        return {'bioisostere': 1.0, 'fg_add': 2.0, 'terminal_remove': 0.5, 'ring_walk': 1.0}
+    return None  # 15 ≤ ha ≤ 25: equal weights
+
 
 def _scaffold_diverse_candidates(
     df: pd.DataFrame,
@@ -1597,6 +1633,10 @@ async def run_boltz_prescoring(state: Dict[str, Any], max_candidates: int = 5) -
                     2,   # rounds (fewer -- time is limited)
                     200, # n_perturb — full operator coverage (ring walk + terminal removal)
                     5,   # top_k — §NNNN: wider net for scaffold-diversity selection below
+                    'combined_score',
+                    'product_smiles',
+                    'product_name',
+                    _salsa_operator_weights(_ff_best_smiles),  # §ZZZZZ
                 )
                 # §NNNN: scaffold-diverse selection — ensures §NN fast-screen tests
                 # different chemical hypotheses instead of scaffold-homogeneous top-3.
@@ -1792,6 +1832,10 @@ async def run_boltz_prescoring(state: Dict[str, Any], max_candidates: int = 5) -
                     2,   # rounds — neighbourhood exploration
                     200, # n_perturb — full operator coverage (ring walk + terminal removal)
                     5,   # top_k — §NNNN: wider net for scaffold-diversity selection below
+                    'combined_score',
+                    'product_smiles',
+                    'product_name',
+                    _salsa_operator_weights(_mm_seed_smiles),  # §ZZZZZ
                 )
                 # §NNNN: scaffold-diverse selection — each §MM fast-screen slot tests
                 # a different chemical family, maximising coverage per GPU budget.

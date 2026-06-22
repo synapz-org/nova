@@ -374,6 +374,7 @@ All items 1–10 are **implemented**. Items 5 and 7 remain as conditional/resear
 | 10 | §QQQQ: RF surrogate above 100 training points | 30 lines | ✅ Done | 5–20% NDCG improvement on week-2+ runs |
 | 11 | §WWWWW: Cross-target protein-similarity seeding | 80 lines | ✅ Done | Better SALSA seeds on week 1 of new family-member target |
 | 12 | §XXXXX: H100 ultra-high VRAM tier (num_subsampled_msa=4096, sampling_steps_affinity=200) | 15 lines | ✅ Done | Better affinity predictions on H100 80 GB hardware |
+| 13 | §ZZZZZ: HA-adaptive SALSA operator budget allocation | 35 lines | ✅ Done | 5–15% more SALSA hits scoring above seed when seed >25 HA |
 
 All approaches share the same submission constraint: molecules must map to valid SAVI-2020
 product names. SALSA and GradientGA both solve this via nearest-neighbour SAVI-2020 lookup.
