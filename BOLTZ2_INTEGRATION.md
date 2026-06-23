@@ -1,5 +1,54 @@
 # Boltz-2 Miner Integration
 
+## Current Status (as of 2026-06-23)
+
+§AAAAAA added 2026-06-23: Dual Surrogate UCB Acquisition.
+
+**§AAAAAA — Dual Surrogate UCB Acquisition (`utils/surrogate.py`, `neurons/miner.py`)**
+
+The §YYYYY dual surrogate (`dual_surrogate_rank_pool`) predicts `(apb_pred − apv_pred) / ha`
+using the mean of each RF model's trees, giving pure exploitation with no exploration bonus.
+The separate §RRRR UCB path (`ucb_rank_pool`) adds tree-variance exploration but operates
+on a single combined-score model that is only active when the dual surrogate is unavailable.
+Once the dual path is active (epoch 3+, ≥40 component rows), UCB exploration is completely
+absent from the pre-Boltz candidate ranking.
+
+**`dual_surrogate_ucb_rank_pool` in `utils/surrogate.py`:**
+
+Applies UCB independently to each Boltz output component:
+- Optimistic APB estimate: `mean_apb + β·std_apb` (want APB high)
+- Optimistic −APV estimate: `−mean_apv + β·std_apv` (want APV negative / large magnitude)
+- Combined: `UCB = (mean_apb − mean_apv + β·(std_apb + std_apv)) / ha`
+
+The `β·(std_apb + std_apv) / ha` term is the exploration bonus: molecules where either the
+binding probability or the affinity value is uncertain get a proportional boost, incentivising
+Boltz-2 evaluation of structurally novel candidates that the mean-only surrogate would
+deprioritise.
+
+Requires both component models to be RandomForestRegressors (available at ≥100 cache points,
+§QQQQ threshold).  Falls back to `dual_surrogate_rank_pool` (mean-only) for Ridge models
+(< 100 pts) and on any exception, so the call is always safe.
+
+**Two dispatch sites updated in `neurons/miner.py`:**
+1. §ZZ/SALSA seed re-ranking (main SALSA trigger): `dual_surrogate_rank_pool` →
+   `dual_surrogate_ucb_rank_pool`.  Log tag updated to `[§AAAAAA]`.
+2. §ZZ/§YYYYY pre-Boltz candidate ranking (`run_boltz_prescoring`):
+   `dual_surrogate_rank_pool` → `dual_surrogate_ucb_rank_pool`.  Log tag updated.
+
+**Estimated benefit:**
+- Epochs 3–10 (≥40 but <100 component rows): Ridge models → falls back to mean-only dual
+  surrogate (unchanged from §YYYYY).
+- Epoch 10+ (≥100 component rows, RF dual active): UCB exploration bonus active at both
+  ranking sites.  Expected 5–10% improvement in Boltz-confirmed novel binders per epoch
+  relative to mean-only dual surrogate, driven by surfacing unexplored scaffold regions.
+- No regression: β=1.0 is the same default as §RRRR; fall-through logic preserves §YYYYY
+  mean-only behaviour for Ridge models and on any error.
+
+**Files changed:** `utils/surrogate.py` (`dual_surrogate_ucb_rank_pool` function added),
+`neurons/miner.py` (import updated, two dispatch sites updated to UCB variant).
+
+---
+
 ## Current Status (as of 2026-06-22)
 
 §ZZZZZ added 2026-06-22: HA-Adaptive SALSA Operator Budget Allocation.

@@ -45,7 +45,7 @@ from utils.msa import ensure_msa
 from utils.salsa import run_salsa_search
 from utils.genetic import run_gradient_ga
 from utils.chembl import get_chembl_seeds
-from utils.surrogate import fit_surrogate, rank_pool_by_surrogate, ucb_rank_pool, fit_dual_surrogate, dual_surrogate_rank_pool
+from utils.surrogate import fit_surrogate, rank_pool_by_surrogate, ucb_rank_pool, fit_dual_surrogate, dual_surrogate_rank_pool, dual_surrogate_ucb_rank_pool
 from PSICHIC.wrapper import PsichicWrapper
 from boltz.wrapper import BoltzWrapper
 from btdr import QuicknetBittensorDrandTimelock
@@ -726,10 +726,10 @@ async def run_psichic_model_loop(state: Dict[str, Any]) -> None:
                             _prot_s = state['config'].weekly_target
                             _dual_s = fit_dual_surrogate(_db_path_s, _prot_s)
                             if _dual_s is not None and not state['global_candidate_pool'].empty:
-                                state['global_candidate_pool'] = dual_surrogate_rank_pool(
+                                state['global_candidate_pool'] = dual_surrogate_ucb_rank_pool(
                                     state['global_candidate_pool'], _dual_s
                                 )
-                                bt.logging.info("[§YYYYY] SALSA seeds re-ranked by dual APB+APV surrogate.")
+                                bt.logging.info("[§AAAAAA] SALSA seeds re-ranked by dual APB+APV UCB surrogate.")
                             else:
                                 _zz_seed_model = fit_surrogate(_db_path_s, _prot_s)
                                 if _zz_seed_model is not None and not state['global_candidate_pool'].empty:
@@ -1352,9 +1352,9 @@ async def run_boltz_prescoring(state: Dict[str, Any], max_candidates: int = 5) -
         try:
             _dual = fit_dual_surrogate(db_path, protein)
             if _dual is not None:
-                candidates = dual_surrogate_rank_pool(candidates, _dual)
+                candidates = dual_surrogate_ucb_rank_pool(candidates, _dual)
                 bt.logging.info(
-                    f"[§YYYYY] Pre-Boltz candidates re-ranked by dual APB+APV surrogate "
+                    f"[§AAAAAA] Pre-Boltz candidates re-ranked by dual APB+APV UCB surrogate "
                     f"({len(candidates)} entries, target={protein})."
                 )
             else:

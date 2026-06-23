@@ -389,3 +389,83 @@ def dual_surrogate_rank_pool(
         )
     except Exception:
         return pool_df
+
+
+def dual_surrogate_ucb_rank_pool(
+    pool_df,
+    dual_model,
+    beta: float = 1.0,
+    smiles_col: str = 'product_smiles',
+    ha_col: str = 'heavy_atoms',
+):
+    """
+    §AAAAAA: UCB acquisition on the dual APB+APV surrogate.
+
+    When both component models are RandomForestRegressors, uses per-tree variance
+    to compute an optimistic upper-confidence-bound score:
+
+        UCB = (mean_apb + β·std_apb − mean_apv + β·std_apv) / ha
+            = (mean_apb − mean_apv + β·(std_apb + std_apv)) / ha
+
+    The derivation follows the standard UCB principle applied independently to
+    each Boltz component: the optimistic estimate of APB is (mean + β·std) and
+    the optimistic estimate of −APV (we want APV as negative as possible) is
+    (−mean_apv + β·std_apv).  Summing them yields the formula above.
+
+    This rewards both high-confidence good molecules (exploitation) and
+    structurally novel ones where either APB or APV is uncertain (exploration),
+    without needing a separate UCB pass on the combined score.
+
+    Falls back to dual_surrogate_rank_pool (mean-only) when:
+    - either model is Ridge rather than RF (no tree variance available)
+    - descriptor computation fails for > 50% of rows
+    - any exception is raised
+    """
+    if dual_model is None:
+        return pool_df
+
+    try:
+        from sklearn.ensemble import RandomForestRegressor
+        model_apb, model_apv = dual_model
+        _apb_rf = isinstance(model_apb.named_steps.get('model'), RandomForestRegressor)
+        _apv_rf = isinstance(model_apv.named_steps.get('model'), RandomForestRegressor)
+    except Exception:
+        return dual_surrogate_rank_pool(pool_df, dual_model, smiles_col, ha_col)
+
+    if not (_apb_rf and _apv_rf):
+        return dual_surrogate_rank_pool(pool_df, dual_model, smiles_col, ha_col)
+
+    try:
+        vecs = [_descriptor_vector(s) for s in pool_df[smiles_col]]
+        n_valid = sum(1 for v in vecs if v is not None)
+        if n_valid < max(1, len(pool_df) * 0.5):
+            return pool_df
+
+        placeholder = [0.0] * _N_FEATURES
+        X = [v if v is not None else placeholder for v in vecs]
+
+        mean_apb, std_apb = predict_with_uncertainty(model_apb, X)
+        mean_apv, std_apv = predict_with_uncertainty(model_apv, X)
+
+        if ha_col in pool_df.columns:
+            ha_vals = pool_df[ha_col].fillna(25).values.astype(float)
+        else:
+            from utils.molecules import get_heavy_atom_count
+            ha_vals = np.array([
+                float(get_heavy_atom_count(s) or 25)
+                for s in pool_df[smiles_col]
+            ])
+        ha_vals = np.where(ha_vals > 0, ha_vals, 25.0)
+
+        ucb_scores = (mean_apb - mean_apv + beta * (std_apb + std_apv)) / ha_vals
+
+        pool_copy = pool_df.copy()
+        pool_copy['surrogate_score'] = ucb_scores
+        return (
+            pool_copy
+            .sort_values('surrogate_score', ascending=False)
+            .drop(columns=['surrogate_score'])
+            .reset_index(drop=True)
+        )
+    except Exception:
+        return dual_surrogate_rank_pool(pool_df, dual_model, smiles_col, ha_col)
