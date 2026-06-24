@@ -1,5 +1,80 @@
 # Boltz-2 Miner Integration
 
+## Current Status (as of 2026-06-24)
+
+§BBBBB added 2026-06-24: Persist Adaptive Timing Across Process Restarts.
+
+**§BBBBB — Persist `boltz_time_per_mol` + `boltz_trigger_blocks` Across Restarts (`neurons/miner.py`)**
+
+**Problem:** On fast hardware (A100: ~45 s/mol, H100: ~25 s/mol) the adaptive trigger
+(§G) reduces `boltz_trigger_blocks` from the default 100 to ~30–42 after the first
+Boltz run.  This gain is stored only in `state` (in-memory) and is lost on every process
+restart.  After a crash or manual restart, the miner defaults back to 100 blocks (20 min)
+for the first post-restart epoch, wasting 12–16 minutes of PSICHIC streaming time on
+hardware where Boltz completes in 4–5 minutes.
+
+**Fix:** Extended `_init_boltz_cache_db` to create a `miner_state` key-value table in the
+same SQLite database used for Boltz score caching:
+
+```sql
+CREATE TABLE IF NOT EXISTS miner_state (
+    key   TEXT PRIMARY KEY,
+    value REAL NOT NULL,
+    ts    INTEGER DEFAULT (strftime('%s','now'))
+);
+```
+
+Two new helpers manage reads and writes:
+
+| Function | Purpose |
+|----------|---------|
+| `_load_miner_state(db_path, key)` | Return `float` from `miner_state` by key, or `None` on miss |
+| `_save_miner_state(db_path, key, value)` | Upsert a `(key, value)` row; silently ignores errors |
+
+**Load at startup** (in `run_miner`, after `_cleanup_boltz_cache`):
+
+```python
+_bbbbb_tpm = _load_miner_state(db_path, 'boltz_time_per_mol')
+_bbbbb_trg = _load_miner_state(db_path, 'boltz_trigger_blocks')
+if _bbbbb_tpm and _bbbbb_tpm > 0:
+    state['boltz_time_per_mol'] = _bbbbb_tpm
+if _bbbbb_trg and _bbbbb_trg >= 30:
+    state['boltz_trigger_blocks'] = int(_bbbbb_trg)
+```
+
+**Save after each measurement** — three sites in `run_boltz_prescoring`:
+
+1. **Main Boltz loop** (§G site) — after `state['boltz_trigger_blocks']` is updated, persist both:
+   ```python
+   _save_miner_state(db_path, 'boltz_time_per_mol', elapsed)
+   _save_miner_state(db_path, 'boltz_trigger_blocks', float(state['boltz_trigger_blocks']))
+   ```
+2. **§MM full-score** — when `wrapper.last_inference_duration > 0`, save `boltz_time_per_mol`.
+3. **§XX tautomer** — when `wrapper.last_inference_duration > 0`, save `boltz_time_per_mol`.
+
+**Expected benefit:**
+
+| Hardware | Default trigger | Calibrated trigger | Streaming time recovered |
+|----------|-----------------|--------------------|--------------------------|
+| RTX 3090 (150 s/mol) | 100 blocks | ~80–100 blocks | ~0 (already correct) |
+| A100 80 GB (45 s/mol) | 100 blocks | ~42 blocks | **~12 min per restart** |
+| H100 80 GB (25 s/mol) | 100 blocks | ~30 blocks | **~15 min per restart** |
+
+Miners running on fast hardware that restart frequently (auto-updater, CUDA OOM recovery)
+gain the most — each restart that previously wasted a 20-minute Boltz window now fires at
+the correct 42- or 30-block threshold immediately.
+
+**Zero regression risk:** Both values default gracefully — `state.get('boltz_time_per_mol', 150.0)`
+and `state.get('boltz_trigger_blocks', 100)` retain their old defaults when the SQLite table is
+empty (first ever run on fresh hardware).  The `miner_state` table is additive to the existing
+schema; old cache DBs are automatically migrated by the `CREATE TABLE IF NOT EXISTS` guard.
+
+**Files changed:** `neurons/miner.py` — `_init_boltz_cache_db` (add `miner_state` table);
+new `_load_miner_state` and `_save_miner_state` helpers; `run_miner` startup load block;
+three `_save_miner_state` call sites in `run_boltz_prescoring`.
+
+---
+
 ## Current Status (as of 2026-06-23)
 
 §AAAAAA added 2026-06-23: Dual Surrogate UCB Acquisition.

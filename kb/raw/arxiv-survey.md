@@ -376,6 +376,7 @@ All items 1–10 are **implemented**. Items 5 and 7 remain as conditional/resear
 | 12 | §XXXXX: H100 ultra-high VRAM tier (num_subsampled_msa=4096, sampling_steps_affinity=200) | 15 lines | ✅ Done | Better affinity predictions on H100 80 GB hardware |
 | 13 | §ZZZZZ: HA-adaptive SALSA operator budget allocation | 35 lines | ✅ Done | 5–15% more SALSA hits scoring above seed when seed >25 HA |
 | 14 | §AAAAAA: Dual surrogate UCB — per-component tree-variance exploration on APB+APV RF models | 70 lines | ✅ Done | 5–10% more novel Boltz-confirmed binders/epoch at ≥100 cache points |
+| 15 | §BBBBB: Persist adaptive timing (`boltz_time_per_mol`, `boltz_trigger_blocks`) across restarts | 35 lines | ✅ Done | 12–15 min extra PSICHIC streaming recovered per restart on A100/H100 |
 
 All approaches share the same submission constraint: molecules must map to valid SAVI-2020
 product names. SALSA and GradientGA both solve this via nearest-neighbour SAVI-2020 lookup.

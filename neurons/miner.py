@@ -79,6 +79,14 @@ def _init_boltz_cache_db(db_path: str) -> None:
                 conn.execute(_col_ddl)
             except Exception:
                 pass
+        # §BBBBB: key-value store for miner timing state that survives restarts.
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS miner_state (
+                key   TEXT PRIMARY KEY,
+                value REAL NOT NULL,
+                ts    INTEGER DEFAULT (strftime('%s','now'))
+            )
+        """)
 
 
 def _disk_cache_get(db_path: str, smiles: str, protein: str) -> Optional[float]:
@@ -207,6 +215,30 @@ def _disk_cache_list_proteins(db_path: str, exclude: str = "") -> list:
         return [r[0] for r in rows]
     except Exception:
         return []
+
+
+def _load_miner_state(db_path: str, key: str) -> Optional[float]:
+    """§BBBBB: Return a persisted miner state value by key, or None on miss/error."""
+    try:
+        with sqlite3.connect(db_path) as conn:
+            row = conn.execute(
+                "SELECT value FROM miner_state WHERE key=?", (key,)
+            ).fetchone()
+        return float(row[0]) if row else None
+    except Exception:
+        return None
+
+
+def _save_miner_state(db_path: str, key: str, value: float) -> None:
+    """§BBBBB: Persist a miner state value (silently ignores errors)."""
+    try:
+        with sqlite3.connect(db_path) as conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO miner_state (key, value) VALUES (?,?)",
+                (key, value),
+            )
+    except Exception:
+        pass
 
 
 def _cross_target_seeds_from_cache(
@@ -1573,6 +1605,10 @@ async def run_boltz_prescoring(state: Dict[str, Any], max_candidates: int = 5) -
                         state['boltz_time_per_mol'] = elapsed  # persist for dynamic budget calc
                         adaptive_trigger = int(elapsed * max_candidates / 12) + 20
                         state['boltz_trigger_blocks'] = max(adaptive_trigger, 30)
+                        # §BBBBB: persist timing so next restart uses calibrated trigger.
+                        _save_miner_state(db_path, 'boltz_time_per_mol', elapsed)
+                        _save_miner_state(db_path, 'boltz_trigger_blocks',
+                                          float(state['boltz_trigger_blocks']))
                         bt.logging.info(
                             f"  adaptive timing: {elapsed:.1f}s/mol -> "
                             f"trigger={state['boltz_trigger_blocks']} blocks"
@@ -1934,6 +1970,8 @@ async def run_boltz_prescoring(state: Dict[str, Any], max_candidates: int = 5) -
                             )
                             if wrapper.last_inference_duration > 0:
                                 state['boltz_time_per_mol'] = wrapper.last_inference_duration
+                                _save_miner_state(db_path, 'boltz_time_per_mol',
+                                                  wrapper.last_inference_duration)
                             bt.logging.info(
                                 f"§MM §NN [{_mm_round_idx + 1}/{_mm_max_rounds}] full-scored winner: "
                                 f"{_mm_w_row.get('product_name', '?')} boltz={_mm_score:.4f} "
@@ -2157,6 +2195,8 @@ async def run_boltz_prescoring(state: Dict[str, Any], max_candidates: int = 5) -
                                         )
                                         if wrapper.last_inference_duration > 0:
                                             state['boltz_time_per_mol'] = wrapper.last_inference_duration
+                                            _save_miner_state(db_path, 'boltz_time_per_mol',
+                                                              wrapper.last_inference_duration)
                                         bt.logging.info(
                                             f"§XX: tautomer SAVI neighbour "
                                             f"{_xx_n_pname!r} scored boltz={_xx_n_score:.4f}"
@@ -2679,6 +2719,22 @@ async def run_miner(config: argparse.Namespace) -> None:
 
     _cleanup_boltz_cache(state['boltz_cache_db'], keep_protein=config.weekly_target)
     bt.logging.info(f"Boltz persistent cache initialised: {state['boltz_cache_db']}")
+
+    # §BBBBB: Restore adaptive timing from disk so fast-GPU miners (A100/H100) use
+    # the correct boltz_trigger_blocks from epoch 1 after a process restart instead
+    # of defaulting to 100 blocks (20 min) and wasting 12–16 min of PSICHIC streaming.
+    _bbbbb_tpm = _load_miner_state(state['boltz_cache_db'], 'boltz_time_per_mol')
+    _bbbbb_trg = _load_miner_state(state['boltz_cache_db'], 'boltz_trigger_blocks')
+    if _bbbbb_tpm is not None and _bbbbb_tpm > 0:
+        state['boltz_time_per_mol'] = _bbbbb_tpm
+        bt.logging.info(
+            f"[§BBBBB] Restored boltz_time_per_mol={_bbbbb_tpm:.1f}s from disk."
+        )
+    if _bbbbb_trg is not None and _bbbbb_trg >= 30:
+        state['boltz_trigger_blocks'] = int(_bbbbb_trg)
+        bt.logging.info(
+            f"[§BBBBB] Restored boltz_trigger_blocks={int(_bbbbb_trg)} from disk."
+        )
 
     # Warm epoch start (§AA): pre-populate candidate_product from best cached result.
     # On first run the cache is empty; on subsequent runs this gives an immediate
