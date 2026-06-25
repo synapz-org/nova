@@ -1,5 +1,87 @@
 # Boltz-2 Miner Integration
 
+## Current Status (as of 2026-06-25)
+
+§CCCCCC added 2026-06-25: Persist Winning Reaction Class Across Process Restarts.
+
+**§CCCCCC — Persist `best_boltz_rxn_class` Across Restarts (`neurons/miner.py`)**
+
+**Problem:** The §YY reaction-class bias stores the SAVI-2020 reaction template that produced
+the best Boltz-validated molecule (e.g. `"rxn:5"`) in `state['best_boltz_rxn_class']`.
+`stream_random_chunk_from_dataset` uses this to apply a 2× weight to CSV files from that
+reaction class, increasing the probability of sampling structurally similar candidates on
+subsequent epochs.  However, `best_boltz_rxn_class` is in-memory only.  After any process
+restart (crash, auto-updater, CUDA OOM recovery), the state resets to `None`, and the first
+post-restart epoch falls back to uniform SAVI-2020 sampling — discarding the epoch-over-epoch
+learning of which reaction template produces the best Boltz binders.
+
+**Fix:** Extended `_init_boltz_cache_db` to add a `value_text TEXT` column to the existing
+`miner_state` table (introduced by §BBBBB):
+
+```sql
+ALTER TABLE miner_state ADD COLUMN value_text TEXT;
+```
+
+Wrapped in `try/except` — silently ignored on already-migrated databases.
+
+Two new text-state helpers:
+
+| Function | Purpose |
+|----------|---------|
+| `_load_miner_state_text(db_path, key)` | Return `str` from `miner_state.value_text` by key, or `None` on miss |
+| `_save_miner_state_text(db_path, key, text_value)` | Upsert `(key, 0.0, text_value)` — sets `value=0.0` to satisfy the `NOT NULL` constraint on the REAL column |
+
+**Save** — in the §YY tracking block at the end of `run_boltz_prescoring`, immediately
+after `state['best_boltz_rxn_class'] = _yy_rxn`:
+
+```python
+_save_miner_state_text(
+    state.get('boltz_cache_db', BOLTZ_CACHE_DB),
+    'best_boltz_rxn_class',
+    _yy_rxn,
+)
+```
+
+**Load at startup** — in `run_miner`, directly after the §BBBBB timing-restore block:
+
+```python
+_cccccc_rxn = _load_miner_state_text(state['boltz_cache_db'], 'best_boltz_rxn_class')
+if _cccccc_rxn:
+    state['best_boltz_rxn_class'] = _cccccc_rxn
+    bt.logging.info(
+        f"[§CCCCCC] Restored best_boltz_rxn_class={_cccccc_rxn!r} from disk — "
+        f"SAVI streaming pre-biased toward this reaction class."
+    )
+```
+
+**Expected benefit:**
+
+| Scenario | Before §CCCCCC | After §CCCCCC |
+|----------|----------------|---------------|
+| First-ever run | No bias (correct) | No bias (correct) |
+| Process restart, same target week | Uniform sampling for 1 epoch | 2× bias toward best-class immediately |
+| Auto-updater restart mid-week | Uniform sampling until next Boltz win | Bias restored in <1 second |
+| New target week | Prior target's class loaded then immediately overwritten on first Boltz win | Same — overwrite happens correctly |
+
+The 2× streaming weight means ~33% of SAVI chunks now come from the winning reaction
+class (vs. a 1/N_files baseline of <1%).  On week-3+ runs where the same target persists
+and the miner has found a reaction class that consistently produces high-scoring candidates,
+each restart-free epoch benefits from pre-biased sampling from the very first chunk.
+
+**Zero regression risk:** `best_boltz_rxn_class` defaults to `None` when the database key
+is absent (first run) or when the stored class no longer matches any SAVI-2020 CSV filename
+(target rotation — the `stream_random_chunk_from_dataset` function silently falls back to
+uniform sampling when no file matches the bias string).  The §BBBBB `miner_state` table is
+already present in all deployed databases; the `ALTER TABLE ADD COLUMN` is a safe additive
+migration.
+
+**Files changed:** `neurons/miner.py` — `_init_boltz_cache_db` (add `value_text` column
+migration); new `_load_miner_state_text` and `_save_miner_state_text` helpers; §CCCCCC
+load block in `run_miner`; §CCCCCC save call in §YY tracking block inside
+`run_boltz_prescoring`.
+
+---
+
 ## Current Status (as of 2026-06-24)
 
 §BBBBB added 2026-06-24: Persist Adaptive Timing Across Process Restarts.

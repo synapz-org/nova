@@ -87,6 +87,11 @@ def _init_boltz_cache_db(db_path: str) -> None:
                 ts    INTEGER DEFAULT (strftime('%s','now'))
             )
         """)
+        # §CCCCCC: extend miner_state with a text column for string state values.
+        try:
+            conn.execute("ALTER TABLE miner_state ADD COLUMN value_text TEXT")
+        except Exception:
+            pass
 
 
 def _disk_cache_get(db_path: str, smiles: str, protein: str) -> Optional[float]:
@@ -236,6 +241,30 @@ def _save_miner_state(db_path: str, key: str, value: float) -> None:
             conn.execute(
                 "INSERT OR REPLACE INTO miner_state (key, value) VALUES (?,?)",
                 (key, value),
+            )
+    except Exception:
+        pass
+
+
+def _load_miner_state_text(db_path: str, key: str) -> Optional[str]:
+    """§CCCCCC: Return a persisted text miner state value, or None on miss/error."""
+    try:
+        with sqlite3.connect(db_path) as conn:
+            row = conn.execute(
+                "SELECT value_text FROM miner_state WHERE key=?", (key,)
+            ).fetchone()
+        return str(row[0]) if row and row[0] is not None else None
+    except Exception:
+        return None
+
+
+def _save_miner_state_text(db_path: str, key: str, text_value: str) -> None:
+    """§CCCCCC: Persist a text miner state value (silently ignores errors)."""
+    try:
+        with sqlite3.connect(db_path) as conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO miner_state (key, value, value_text) VALUES (?,?,?)",
+                (key, 0.0, text_value),
             )
     except Exception:
         pass
@@ -2619,6 +2648,12 @@ async def run_boltz_prescoring(state: Dict[str, Any], max_candidates: int = 5) -
                     f"[YY] Winning reaction class: {_yy_rxn!r} "
                     f"— SAVI streaming biased toward this class next epoch."
                 )
+                # §CCCCCC: persist across restarts so the bias survives crashes/auto-updates.
+                _save_miner_state_text(
+                    state.get('boltz_cache_db', BOLTZ_CACHE_DB),
+                    'best_boltz_rxn_class',
+                    _yy_rxn,
+                )
     except Exception as _yy_err:
         bt.logging.debug(f"[YY] rxn_class extraction failed (non-fatal): {_yy_err}")
 
@@ -2734,6 +2769,18 @@ async def run_miner(config: argparse.Namespace) -> None:
         state['boltz_trigger_blocks'] = int(_bbbbb_trg)
         bt.logging.info(
             f"[§BBBBB] Restored boltz_trigger_blocks={int(_bbbbb_trg)} from disk."
+        )
+
+    # §CCCCCC: Restore winning reaction class so §YY SAVI streaming bias survives restarts.
+    # Without this, every restart resets best_boltz_rxn_class=None and falls back to
+    # uniform SAVI sampling for one full epoch, discarding the epoch-over-epoch learning
+    # of which reaction template produces the best Boltz-validated binders.
+    _cccccc_rxn = _load_miner_state_text(state['boltz_cache_db'], 'best_boltz_rxn_class')
+    if _cccccc_rxn:
+        state['best_boltz_rxn_class'] = _cccccc_rxn
+        bt.logging.info(
+            f"[§CCCCCC] Restored best_boltz_rxn_class={_cccccc_rxn!r} from disk — "
+            f"SAVI streaming pre-biased toward this reaction class."
         )
 
     # Warm epoch start (§AA): pre-populate candidate_product from best cached result.
