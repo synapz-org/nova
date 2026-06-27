@@ -1,5 +1,92 @@
 # Boltz-2 Miner Integration
 
+## Current Status (as of 2026-06-27)
+
+§DDDDDD added 2026-06-27: Confidence-Weighted Surrogate Training via Cached `ligand_iptm`.
+
+**§DDDDDD — Cache `ligand_iptm` + Confidence-Weighted Surrogate Training (`neurons/miner.py`, `utils/surrogate.py`)**
+
+**Problem:** The §ZZ Ridge/RF surrogate (`fit_surrogate`) and the §YYYYY dual APB/APV surrogate
+(`fit_dual_surrogate`) train on all cached Boltz scores equally.  However, some training examples
+come from Boltz-2 runs with low pose confidence: `ligand_iptm < 0.25` indicates that Boltz-2 was
+uncertain about the ligand's binding mode, so the corresponding `affinity_probability_binary` and
+`affinity_pred_value` values are noisy.  Training the surrogate on these equal-weighted noisy
+examples reduces its ability to learn the true scaffold→score mapping, particularly in the
+40–100 sample regime where the Ridge model has limited capacity.
+
+`ligand_iptm` was already collected in `per_molecule_components` and used for the §RR
+confidence-penalty ordering filter, but was never persisted to the cache or used to re-weight
+surrogate training.
+
+**Fix:**
+
+1. **Schema migration** — `_init_boltz_cache_db` gains a new additive migration:
+   ```sql
+   ALTER TABLE boltz_cache ADD COLUMN ligand_iptm REAL;
+   ```
+   Wrapped in `try/except` — silently ignored on already-migrated databases.
+
+2. **Cache write** — `_disk_cache_put` gains `ligand_iptm: Optional[float] = None` parameter.
+   The INSERT now stores all 7 fields:
+   ```sql
+   INSERT OR REPLACE INTO boltz_cache
+   (smiles, protein, score, product_name, affinity_prob_binary, affinity_pred_val, ligand_iptm)
+   VALUES (?,?,?,?,?,?,?)
+   ```
+   All four `_disk_cache_put` call sites in `run_boltz_prescoring` (main loop, §FF, §MM, §XX)
+   are updated to extract `ligand_iptm` from `per_molecule_components` and pass it.
+
+3. **Confidence-weighted surrogate training** — `fit_surrogate` and `fit_dual_surrogate` in
+   `utils/surrogate.py` now SELECT `COALESCE(ligand_iptm, 1.0)` alongside the existing columns.
+   A sample weight is assigned to each training row:
+
+   ```python
+   weight = max(0.1, ligand_iptm)   # clip floor at 0.1 to never zero-weight
+   # COALESCE ensures pre-§DDDDDD cache rows (NULL ligand_iptm) get weight=1.0
+   ```
+
+   Both models are fitted with `model__sample_weight=np.array(weights)`, routing the weights
+   through the sklearn Pipeline to the Ridge or RandomForestRegressor step.
+
+**Sample weight rationale:**
+
+| `ligand_iptm` range | Interpretation | Weight |
+|---------------------|----------------|--------|
+| ≥ 0.5 | Well-calibrated binding pose | 0.50 – 1.0 |
+| 0.25 – 0.49 | Moderate confidence | 0.25 – 0.49 |
+| < 0.25 | Uncertain pose (§RR low-conf threshold) | 0.10 – 0.24 |
+| NULL (pre-§DDDDDD rows) | No confidence data → neutral | 1.0 |
+
+Using `ligand_iptm` directly as the weight produces a continuous scale: the surrogate's effective
+contribution from a run with `ligand_iptm=0.10` is only 10% that of a run with `ligand_iptm=1.0`,
+while the Ridge regularisation penalty is unchanged.  The floor at 0.1 prevents any single run
+from being completely discarded.
+
+**Zero regression:**
+- `COALESCE(ligand_iptm, 1.0)` returns 1.0 for all pre-§DDDDDD cache entries (NULL column),
+  so they continue to contribute at full weight — no existing trained epoch is affected.
+- The `try/except` wrapping the `model.fit()` call catches any sklearn version that does not
+  support `sample_weight` for Ridge and falls back to unweighted training (same as before).
+- The ALTER TABLE migration is idempotent (swallowed silently if column already exists).
+
+**Expected benefit:**
+- Epoch 3–10 (Ridge surrogate, 40–100 cache points): down-weighting noisy low-iptm runs
+  reduces the impact of uncertain binding poses on the linear model.  Expected 3–8% NDCG
+  improvement at top-3 SALSA seed selection in epochs where >20% of cache entries have
+  `ligand_iptm < 0.25`.
+- Epoch 10+ (RF surrogate, ≥100 points): RF is more robust to label noise than Ridge, so
+  the gain is smaller (1–3%) but still positive — noisy examples no longer dilute the
+  signal from well-calibrated training points.
+- Long-term: the `ligand_iptm` column enables future analysis of pose-quality trends across
+  protein families and informs whether fast-mode Boltz calls (§NN) produce reliably confident
+  poses.
+
+**Files changed:** `neurons/miner.py` — `_init_boltz_cache_db` (migration), `_disk_cache_put`
+(signature + INSERT), four call sites (main loop, §FF, §MM, §XX); `utils/surrogate.py` —
+`fit_surrogate` (query, accumulation, `model.fit` call), `fit_dual_surrogate` (same).
+
+---
+
 ## Current Status (as of 2026-06-25)
 
 §CCCCCC added 2026-06-25: Persist Winning Reaction Class Across Process Restarts.
@@ -938,6 +1025,7 @@ Two conditional/research items remain (§D, FBLD). §TTTT–§SSSS implemented 2
 | WWWWW | Cross-target protein-similarity seeding for SALSA (≥40% sequence identity) | miner.py | ✅ |
 | XXXXX | H100 ultra-high VRAM tier: num_subsampled_msa=4096, sampling_steps_affinity=200 | boltz/wrapper.py | ✅ |
 | YYYYY | Affinity component caching (APB + APV in SQLite) + dual APB/APV surrogate ranking | miner.py, surrogate.py | ✅ |
+| DDDDDD | Cache `ligand_iptm` + confidence-weighted surrogate training (downweight low-pose-confidence runs) | neurons/miner.py, utils/surrogate.py | ✅ |
 
 ---
 

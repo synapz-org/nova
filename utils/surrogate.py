@@ -116,7 +116,8 @@ def fit_surrogate(db_path: str, protein: str, min_points: int = 40):
     try:
         with sqlite3.connect(db_path) as conn:
             rows = conn.execute(
-                "SELECT smiles, score FROM boltz_cache WHERE protein=?",
+                # §DDDDDD: COALESCE ligand_iptm to 1.0 for pre-§DDDDDD cache rows.
+                "SELECT smiles, score, COALESCE(ligand_iptm, 1.0) FROM boltz_cache WHERE protein=?",
                 (protein,),
             ).fetchall()
     except Exception:
@@ -125,12 +126,17 @@ def fit_surrogate(db_path: str, protein: str, min_points: int = 40):
     if len(rows) < min_points:
         return None
 
-    X, y = [], []
-    for smiles, score in rows:
+    # §DDDDDD: weight each training example by ligand_iptm — Boltz's confidence in
+    # the binding pose.  Noisy runs (ligand_iptm < 0.25) contribute up to 4× less
+    # than well-calibrated runs (ligand_iptm ≈ 1.0), reducing surrogate overfitting
+    # to uncertain measurements.  NULL → 1.0 so pre-§DDDDDD cache rows are unaffected.
+    X, y, weights = [], [], []
+    for smiles, score, lig_iptm in rows:
         vec = _descriptor_vector(smiles)
         if vec is not None:
             X.append(vec)
             y.append(float(score))
+            weights.append(max(0.1, float(lig_iptm)))
 
     if len(X) < min_points:
         return None
@@ -150,7 +156,7 @@ def fit_surrogate(db_path: str, protein: str, min_points: int = 40):
             ('scaler', StandardScaler()),
             ('model', learner),
         ])
-        model.fit(X, y)
+        model.fit(X, y, model__sample_weight=np.array(weights))
         return model
     except Exception:
         return None
@@ -293,7 +299,8 @@ def fit_dual_surrogate(db_path: str, protein: str, min_points: int = 40):
     try:
         with sqlite3.connect(db_path) as conn:
             rows = conn.execute(
-                "SELECT smiles, affinity_prob_binary, affinity_pred_val "
+                # §DDDDDD: COALESCE ligand_iptm to 1.0 for pre-§DDDDDD cache rows.
+                "SELECT smiles, affinity_prob_binary, affinity_pred_val, COALESCE(ligand_iptm, 1.0) "
                 "FROM boltz_cache "
                 "WHERE protein=? "
                 "  AND affinity_prob_binary IS NOT NULL "
@@ -306,13 +313,15 @@ def fit_dual_surrogate(db_path: str, protein: str, min_points: int = 40):
     if len(rows) < min_points:
         return None
 
-    X, y_apb, y_apv = [], [], []
-    for smiles, apb, apv in rows:
+    # §DDDDDD: confidence-weighted training — same rationale as fit_surrogate.
+    X, y_apb, y_apv, weights = [], [], [], []
+    for smiles, apb, apv, lig_iptm in rows:
         vec = _descriptor_vector(smiles)
         if vec is not None:
             X.append(vec)
             y_apb.append(float(apb))
             y_apv.append(float(apv))
+            weights.append(max(0.1, float(lig_iptm)))
 
     if len(X) < min_points:
         return None
@@ -327,10 +336,11 @@ def fit_dual_surrogate(db_path: str, protein: str, min_points: int = 40):
         return Pipeline([('scaler', StandardScaler()), ('model', learner)])
 
     try:
+        _w = np.array(weights)
         model_apb = _make_pipeline(len(X))
-        model_apb.fit(X, y_apb)
+        model_apb.fit(X, y_apb, model__sample_weight=_w)
         model_apv = _make_pipeline(len(X))
-        model_apv.fit(X, y_apv)
+        model_apv.fit(X, y_apv, model__sample_weight=_w)
         return (model_apb, model_apv)
     except Exception:
         return None
