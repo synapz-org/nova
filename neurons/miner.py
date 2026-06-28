@@ -10,6 +10,7 @@ import traceback
 import base64
 import difflib
 import hashlib
+import json
 import sqlite3
 
 from rdkit import Chem
@@ -277,6 +278,59 @@ def _save_miner_state_text(db_path: str, key: str, text_value: str) -> None:
         pass
 
 
+def _save_rxn_class_scores(db_path: str, rxn_class: str, score: float) -> None:
+    """
+    §EEEEEE: Append *score* to the per-reaction-class Boltz score history.
+
+    History is stored in the `miner_state` table under key
+    'rxn_class_scores_json' as a JSON object mapping rxn_class → [score, ...].
+    Each list is capped at 50 entries (most-recent-first) to prevent unbounded
+    growth.  Silently ignores all errors so a DB write failure never interrupts
+    the main loop.
+    """
+    try:
+        raw = _load_miner_state_text(db_path, 'rxn_class_scores_json') or '{}'
+        data: Dict[str, list] = json.loads(raw)
+        scores = data.get(rxn_class, [])
+        scores.append(round(score, 6))
+        data[rxn_class] = scores[-50:]
+        _save_miner_state_text(db_path, 'rxn_class_scores_json', json.dumps(data))
+    except Exception:
+        pass
+
+
+def _load_rxn_class_weights(db_path: str) -> Dict[str, float]:
+    """
+    §EEEEEE: Compute per-class SAVI sampling weights from persisted score history.
+
+    Reads the JSON history written by _save_rxn_class_scores, computes the mean
+    Boltz score per class, then assigns rank-based sampling weights:
+
+        top-1 class → 4×   (highest mean score)
+        top-2 class → 2×
+        top-3 class → 1.5×
+        all others  → 1×   (unchanged from baseline uniform)
+
+    Returns an empty dict when no history exists or on any error — callers fall
+    back to the §YY single-class 2× bias or uniform sampling in that case.
+    """
+    try:
+        raw = _load_miner_state_text(db_path, 'rxn_class_scores_json')
+        if not raw:
+            return {}
+        data: Dict[str, list] = json.loads(raw)
+        means = {k: sum(v) / len(v) for k, v in data.items() if v}
+        if not means:
+            return {}
+        ranked = sorted(means, key=means.get, reverse=True)
+        weights: Dict[str, float] = {cls: 1.0 for cls in means}
+        for i, cls in enumerate(ranked[:3]):
+            weights[cls] = [4.0, 2.0, 1.5][i]
+        return weights
+    except Exception:
+        return {}
+
+
 def _cross_target_seeds_from_cache(
     db_path: str,
     current_protein: str,
@@ -485,7 +539,7 @@ _SAVI_FILE_CACHE: dict = {}   # repo_url -> sorted list of CSV filenames (popula
 _SAVI_SEEN_FILES: dict = {}   # repo_url -> set of files used this epoch (reset externally)
 
 
-def stream_random_chunk_from_dataset(dataset_repo: str, chunk_size: int, rxn_bias: Optional[str] = None) -> Any:
+def stream_random_chunk_from_dataset(dataset_repo: str, chunk_size: int, rxn_bias: Optional[str] = None, rxn_weights: Optional[Dict[str, float]] = None) -> Any:
     """
     Streams a random chunk from the specified Hugging Face dataset repo.
 
@@ -515,10 +569,21 @@ def stream_random_chunk_from_dataset(dataset_repo: str, chunk_size: int, rxn_bia
         seen.clear()
         available = files
     # §YY: 2× weight for files whose path contains the winning reaction class.
-    # Biases the sampling toward the chemical family that produced the best
-    # Boltz-validated molecule in prior epochs.  Falls back to uniform when
-    # rxn_bias is None (first epoch) or no file matches the class string.
-    if rxn_bias:
+    # §EEEEEE: when rxn_weights (per-class score history) is available, apply
+    # rank-based weights (4×/2×/1.5×/1×) for the top-3 classes instead of the
+    # binary 2×/1× used by §YY — captures multi-modal binding landscapes where
+    # more than one reaction class consistently produces good Boltz binders.
+    # Falls back to §YY (single-class 2×) then uniform when not populated.
+    if rxn_weights:
+        _eeeeee_w = []
+        for f in available:
+            best_w = 1.0
+            for cls, w in rxn_weights.items():
+                if cls in f and w > best_w:
+                    best_w = w
+            _eeeeee_w.append(best_w)
+        random_file = random.choices(available, weights=_eeeeee_w, k=1)[0]
+    elif rxn_bias:
         _yy_weights = [2.0 if rxn_bias in f else 1.0 for f in available]
         random_file = random.choices(available, weights=_yy_weights, k=1)[0]
     else:
@@ -587,6 +652,7 @@ async def run_psichic_model_loop(state: Dict[str, Any]) -> None:
                 dataset_repo=state['hugging_face_dataset_repo'],
                 chunk_size=state['chunk_size'],
                 rxn_bias=state.get('best_boltz_rxn_class'),
+                rxn_weights=state.get('rxn_class_weights') or None,
             )
             for chunk in dataset_iter:
                 if state['shutdown_event'].is_set():
@@ -2665,11 +2731,27 @@ async def run_boltz_prescoring(state: Dict[str, Any], max_candidates: int = 5) -
                     f"— SAVI streaming biased toward this class next epoch."
                 )
                 # §CCCCCC: persist across restarts so the bias survives crashes/auto-updates.
-                _save_miner_state_text(
-                    state.get('boltz_cache_db', BOLTZ_CACHE_DB),
-                    'best_boltz_rxn_class',
-                    _yy_rxn,
+                _db_yy = state.get('boltz_cache_db', BOLTZ_CACHE_DB)
+                _save_miner_state_text(_db_yy, 'best_boltz_rxn_class', _yy_rxn)
+                # §EEEEEE: also record the winning Boltz score for this class so the
+                # per-class history drives top-K rank-weighted SAVI sampling next epoch.
+                # Use the best finite score in all_scores (the score that caused this class
+                # to win) as the representative score for this run.
+                _yy_best = max(
+                    (v for v in all_scores.values() if math.isfinite(v)), default=None
                 )
+                if _yy_best is not None and _yy_best > 0:
+                    _save_rxn_class_scores(_db_yy, _yy_rxn, _yy_best)
+                    state['rxn_class_weights'] = _load_rxn_class_weights(_db_yy)
+                    _ee_top = sorted(
+                        state['rxn_class_weights'],
+                        key=state['rxn_class_weights'].get,
+                        reverse=True,
+                    )[:3]
+                    bt.logging.debug(
+                        f"[§EEEEEE] Updated rxn scores: {_yy_rxn}={_yy_best:.4f} | "
+                        f"top-3 weights: {[(c, state['rxn_class_weights'][c]) for c in _ee_top]}"
+                    )
     except Exception as _yy_err:
         bt.logging.debug(f"[YY] rxn_class extraction failed (non-fatal): {_yy_err}")
 
@@ -2728,6 +2810,7 @@ async def run_miner(config: argparse.Namespace) -> None:
         'best_ga_smiles': None,          # §BBB: best SMILES found by GradientGA this epoch
         'chembl_seeds': [],              # §SS: ChEMBL known actives, fetched at startup
         'best_boltz_rxn_class': None,    # §YY: winning rxn class for SAVI streaming bias (persists across epochs)
+        'rxn_class_weights': {},          # §EEEEEE: {rxn_class: weight} for top-K multi-class sampling bias
         'best_score': float('-inf'),
         'boltz_prescored': False,
         'last_submitted_product': None,
@@ -2797,6 +2880,19 @@ async def run_miner(config: argparse.Namespace) -> None:
         bt.logging.info(
             f"[§CCCCCC] Restored best_boltz_rxn_class={_cccccc_rxn!r} from disk — "
             f"SAVI streaming pre-biased toward this reaction class."
+        )
+
+    # §EEEEEE: Load per-class score history and compute rank-based sampling weights.
+    # When history exists (epoch 2+), this replaces the §YY single-class 2× bias with
+    # a richer 4×/2×/1.5×/1× gradient across the top-3 reaction classes.
+    _eeeeee_weights = _load_rxn_class_weights(state['boltz_cache_db'])
+    if _eeeeee_weights:
+        state['rxn_class_weights'] = _eeeeee_weights
+        _eeeeee_top = sorted(_eeeeee_weights, key=_eeeeee_weights.get, reverse=True)[:3]
+        bt.logging.info(
+            "[§EEEEEE] Restored rxn class weights from disk — "
+            f"top-3: {_eeeeee_top} "
+            f"(weights {[_eeeeee_weights[c] for c in _eeeeee_top]})"
         )
 
     # Warm epoch start (§AA): pre-populate candidate_product from best cached result.

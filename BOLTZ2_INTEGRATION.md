@@ -1,5 +1,101 @@
 # Boltz-2 Miner Integration
 
+## Current Status (as of 2026-06-28)
+
+§EEEEEE added 2026-06-28: Top-K Reaction Class Score Weighting for SAVI Sampling Bias.
+
+**§EEEEEE — Top-K Reaction Class Score Weighting (`neurons/miner.py`)**
+
+**Problem:** The §YY/§CCCCCC reaction-class bias tracks only the SINGLE best reaction class
+(the one that produced the highest-scoring Boltz molecule this session) and applies a fixed
+2× sampling weight to CSV files from that class.  This fails in two ways:
+
+1. **Single-class tunnel vision.** A protein target may have multiple distinct binding
+   scaffolds, each arising from different SAVI-2020 reaction classes.  Tracking only the
+   single best winner means that a second reaction class that consistently produces
+   moderately-scoring molecules (e.g. average 0.035 vs best-class average 0.042) receives
+   NO bias — its files are sampled with the same 1× weight as completely unexplored classes.
+
+2. **Noise sensitivity.** A single lucky Boltz run from an atypical class can overwrite the
+   stored `best_boltz_rxn_class`, collapsing all subsequent sampling to that noisy winner
+   until a new best is found.  The 2×/1× binary switch has no memory of prior evidence.
+
+**Fix:**
+
+1. **Per-class score history** — two new helpers in `neurons/miner.py`:
+
+   | Function | Purpose |
+   |----------|---------|
+   | `_save_rxn_class_scores(db_path, rxn_class, score)` | Append the winning Boltz score to a JSON list for this class, capped at 50 entries, stored in `miner_state.value_text` under key `rxn_class_scores_json` |
+   | `_load_rxn_class_weights(db_path)` | Load the JSON history, compute per-class mean score, return rank-based weight dict |
+
+   Rank-based weight assignment (applied after sorting classes by mean score):
+
+   | Rank | Mean-score order | Sampling weight |
+   |------|-----------------|-----------------|
+   | 1 | Highest mean | 4× |
+   | 2 | Second highest | 2× |
+   | 3 | Third highest | 1.5× |
+   | ≥4 | All others | 1× (unchanged) |
+
+   The rank-based approach avoids the numerical sensitivity of raw softmax over the small
+   score differences typical of Boltz outputs (Δ ≈ 0.005–0.02).  The 4×/2×/1.5×/1× ladder
+   concentrates sampling on top classes without hard-excluding lower classes — a class at
+   rank 4 still gets sampled at the baseline rate.
+
+2. **Stream function update** — `stream_random_chunk_from_dataset` gains a new
+   `rxn_weights: Optional[Dict[str, float]] = None` parameter.  When populated, files are
+   weighted using `max(rxn_weights.get(cls, 1.0) for cls matching file)`, superseding the
+   §YY binary 2×/1× logic.  Falls back to §YY then uniform when empty:
+
+   ```
+   if rxn_weights → §EEEEEE 4×/2×/1.5×/1× rank weights
+   elif rxn_bias  → §YY 2×/1× single-class bias
+   else           → uniform
+   ```
+
+3. **§YY block extension** — after every successful Boltz prescoring, the §YY block now
+   calls `_save_rxn_class_scores` with the best finite score from `all_scores`, then
+   reloads weights into `state['rxn_class_weights']`.
+
+4. **Startup restoration** — mirrors the §BBBBB/§CCCCCC pattern: on process start,
+   `_load_rxn_class_weights` reads the history and populates `state['rxn_class_weights']`
+   so the multi-class bias is active from the first SAVI streaming chunk.
+
+**Example evolution over 4 epochs (same target):**
+
+| After epoch | rxn_class_scores_json (mean) | Sampling weights |
+|-------------|------------------------------|-----------------|
+| 1 | `{rxn:5: [0.041]}` | §YY: rxn:5=2×, others=1× |
+| 2 | `{rxn:5: [0.041, 0.039], rxn:12: [0.036]}` | §EEEEEE: rxn:5=4×, rxn:12=2×, others=1× |
+| 3 | `{rxn:5: [0.041,0.039,0.043], rxn:12: [0.036,0.038], rxn:1: [0.031]}` | rxn:5=4×, rxn:12=2×, rxn:1=1.5×, others=1× |
+| 4 | `{rxn:12: now avg 0.044, rxn:5: avg 0.041, …}` | rxn:12 promoted to 4× |
+
+**Zero regression risk:**
+- `state['rxn_class_weights']` initialises to `{}`, so on first run there is no
+  `rxn_weights` dict and the existing §YY bias takes effect unchanged.
+- `_save_rxn_class_scores` is wrapped in `try/except` — any JSON parse or DB error is
+  silently ignored and does not interrupt the §YY block.
+- The `rxn_class_scores_json` key uses the existing `miner_state.value_text` column
+  added by §CCCCCC — no schema migration required.
+- `_load_rxn_class_weights` returns `{}` on any error, causing the streaming function to
+  fall back to §YY bias.
+
+**Expected benefit:**
+
+| Scenario | Before §EEEEEE | After §EEEEEE |
+|----------|----------------|---------------|
+| Multi-modal target (2+ valid scaffolds) | Only scaffold from top-1 class resampled | Top-3 classes all receive boosted sampling |
+| Noisy epoch (lucky fluke from rare class) | §YY overwrites to fluke class | Fluke gets appended to its class history; if avg stays low, rank drops below established classes |
+| Week-3+ run on same target | 2× single-class bias | 4×/2×/1.5× gradient across 3 best classes |
+
+**Files changed:** `neurons/miner.py` — `import json` added; new `_save_rxn_class_scores` and
+`_load_rxn_class_weights` helpers; `stream_random_chunk_from_dataset` signature + §EEEEEE
+weighting block; `run_psichic_model_loop` call site; `run_miner` state init (`rxn_class_weights`)
+and §EEEEEE startup restoration block; §YY block extended with score-save + weight-reload calls.
+
+---
+
 ## Current Status (as of 2026-06-27)
 
 §DDDDDD added 2026-06-27: Confidence-Weighted Surrogate Training via Cached `ligand_iptm`.
