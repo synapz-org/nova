@@ -1,5 +1,82 @@
 # Boltz-2 Miner Integration
 
+## Current Status (as of 2026-06-29)
+
+§FFFFFF added 2026-06-29: Batch Fast-Screen in §FF and §MM.
+
+**§FFFFFF — Batch Fast-Screen for §FF and §MM (`neurons/miner.py`)**
+
+**Problem:** The §NN two-phase screening pattern used in both §FF (Boltz-guided SALSA) and
+§MM (multi-round iterative hill-climbing) calls `score_molecules_target` once per SALSA hit
+during the fast-screen phase.  With 3 scaffold-diverse candidates per round (§NNNN), this
+means 3 sequential `score_molecules_target` calls, each of which:
+
+1. Creates a new `BoltzWrapper` call to `predict()` which calls
+   `Boltz2.load_from_checkpoint()` — reading and deserializing the checkpoint from disk
+   into GPU memory.
+2. Sets up a new PyTorch Lightning `Trainer` and `Boltz2InferenceDataModule`.
+3. Runs inference on 1 molecule.
+4. Cleans up output files.
+
+Steps 1–2 are fixed overhead per call regardless of molecule count.  With 3 sequential
+single-molecule calls, we pay this overhead 3 times per §MM round.
+
+**Fix:**
+
+1. **Collect cache misses first** — the §NN Phase 1 loop is split into two passes:
+   - Pass 1 (loop): classify each SALSA hit as cache-hit or cache-miss.  Cache hits
+     populate `_ff_screen` / `_mm_screen` directly as before.
+   - Cache misses are collected into `_ff_misses` / `_mm_misses` lists.
+
+2. **One batch call** — after the loop, if any cache misses exist, build a
+   `valid_molecules_by_uid` dict with one UID per miss molecule:
+   ```python
+   _ff_batch_vmbu = {
+       uid: {"smiles": [sm], "names": [row.get('product_name', '')]}
+       for uid, (sm, row) in enumerate(_ff_misses)
+   }
+   ```
+   Then call `score_molecules_target` ONCE with all misses.  The wrapper's
+   `preprocess_data_for_boltz` writes one YAML per UID; `predict()` processes all
+   YAML files in a single DataLoader pass with one checkpoint load.  Scores are
+   extracted from `wrapper.per_molecule_metric[uid][smiles]`.
+
+**Zero regression:**
+- Cache hits follow the identical fast path as before.
+- Time guard fires once before the batch (vs. once per molecule before) — slightly
+  less granular but acceptable since fast-mode inference is much shorter than the
+  guard threshold (5 blocks ≈ 60 s).
+- On exception, `_mm_screen.setdefault(sm, -math.inf)` fills missing scores with
+  -inf, which prevents the failed molecule from winning the fast-screen.
+- When all 3 SALSA hits are already in cache (common in later §MM rounds where the
+  neighbourhood has been explored), `_ff_misses` / `_mm_misses` is empty and the
+  batch path is a no-op.
+
+**Expected benefit:**
+
+The Boltz-2 affinity checkpoint (`boltz2_aff.ckpt`) deserialization and CUDA tensor
+allocation happens once per batch call instead of once per molecule.  For 3 cache-miss
+molecules in a §MM round:
+
+| Approach | Checkpoint loads | Total overhead |
+|----------|-----------------|----------------|
+| Before §FFFFFF | 3 | 3 × (load + inference) |
+| After §FFFFFF | 1 | 1 × load + 3 × inference |
+
+Estimated checkpoint load time: 5–15 s (model is large; even with OS page-cache the
+tensor deserialization and CUDA allocation are non-trivial).  Saving 2 loads per §MM
+round × 10 rounds = 100–300 s per epoch.  On A100 where fast inference is ~25 s/mol,
+this translates to **1–2 additional §MM rounds per epoch** at no extra GPU compute cost.
+
+Benefit is largest in early §MM rounds (rounds 1–5) where few cache hits exist and
+all 3 SALSA hits are new.  In later rounds (convergence regime) most hits are cached,
+so `_mm_misses` is short or empty and the gain is smaller.
+
+**Files changed:** `neurons/miner.py` — §FF fast-screen loop (split into cache-check
++ batch call); §MM fast-screen loop (same); log tags added for `[§FFFFFF]`.
+
+---
+
 ## Current Status (as of 2026-06-28)
 
 §EEEEEE added 2026-06-28: Top-K Reaction Class Score Weighting for SAVI Sampling Bias.
@@ -1122,6 +1199,8 @@ Two conditional/research items remain (§D, FBLD). §TTTT–§SSSS implemented 2
 | XXXXX | H100 ultra-high VRAM tier: num_subsampled_msa=4096, sampling_steps_affinity=200 | boltz/wrapper.py | ✅ |
 | YYYYY | Affinity component caching (APB + APV in SQLite) + dual APB/APV surrogate ranking | miner.py, surrogate.py | ✅ |
 | DDDDDD | Cache `ligand_iptm` + confidence-weighted surrogate training (downweight low-pose-confidence runs) | neurons/miner.py, utils/surrogate.py | ✅ |
+| EEEEEE | Top-K reaction class score weighting for SAVI sampling bias (4×/2×/1.5×/1× rank ladder) | neurons/miner.py | ✅ |
+| FFFFFF | Batch fast-screen in §FF and §MM: N cache-miss molecules → 1 score_molecules_target call | neurons/miner.py | ✅ |
 
 ---
 

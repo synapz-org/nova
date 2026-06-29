@@ -1794,8 +1794,11 @@ async def run_boltz_prescoring(state: Dict[str, Any], max_candidates: int = 5) -
                     # §NN Phase 1: fast-screen all hits (cache hits reuse full score; misses use
                     # fast Boltz with reduced sampling steps so we can screen more hits cheaply).
                     # Fast scores are NOT stored in the persistent cache — only full scores are.
+                    # §FFFFFF: cache misses are batched into ONE score_molecules_target call so
+                    # the expensive Boltz2 checkpoint load happens once, not N times per round.
                     _ff_screen: Dict[str, float] = {}  # smiles -> score (cached full or fast)
                     _ff_rows: Dict[str, Any] = {}      # smiles -> row for later lookup
+                    _ff_misses: List[Tuple[str, Any]] = []  # (smiles, row) for cache-miss molecules
                     for _, _ff_row in ff_salsa_hits.iterrows():
                         _ff_smiles = _ff_row['product_smiles']
                         _ff_canon = get_canonical_smiles(_ff_smiles)
@@ -1805,26 +1808,34 @@ async def run_boltz_prescoring(state: Dict[str, Any], max_candidates: int = 5) -
                             _ff_screen[_ff_smiles] = boltz_cache[_ff_key]
                             bt.logging.debug(f"§FF §NN cache hit: {boltz_cache[_ff_key]:.4f}")
                         else:
-                            try:
-                                _curr_blk2 = await state['subtensor'].get_current_block()
-                                _next_ep2 = ((_curr_blk2 // state['epoch_length']) + 1) * state['epoch_length']
-                                if _next_ep2 - _curr_blk2 < 5:
-                                    bt.logging.info("§FF §NN: epoch ends in <5 blocks -- stopping.")
-                                    break
-                            except Exception:
-                                pass
-                            _ff_uid_s = 0
-                            _ff_vmbu_s = {_ff_uid_s: {"smiles": [_ff_smiles], "names": [_ff_row['product_name']]}}
-                            _ff_sd_s = {_ff_uid_s: {}}
-                            try:
+                            _ff_misses.append((_ff_smiles, _ff_row))
+                    # §FFFFFF: batch all cache-miss fast-screens into ONE Boltz call.
+                    if _ff_misses:
+                        try:
+                            _curr_blk2 = await state['subtensor'].get_current_block()
+                            _next_ep2 = ((_curr_blk2 // state['epoch_length']) + 1) * state['epoch_length']
+                            if _next_ep2 - _curr_blk2 < 5:
+                                bt.logging.info("§FF §NN: epoch ends in <5 blocks -- stopping.")
+                            else:
+                                _ff_batch_vmbu = {
+                                    _uid: {"smiles": [_sm], "names": [_row.get('product_name', '')]}
+                                    for _uid, (_sm, _row) in enumerate(_ff_misses)
+                                }
+                                _ff_batch_sd: Dict[str, Any] = {_uid: {} for _uid in _ff_batch_vmbu}
                                 await asyncio.to_thread(
                                     wrapper.score_molecules_target,
-                                    _ff_vmbu_s, _ff_sd_s, subnet_config, '0x' + '0' * 64, True,
+                                    _ff_batch_vmbu, _ff_batch_sd, subnet_config, '0x' + '0' * 64, True,
                                 )
-                                _ff_screen[_ff_smiles] = wrapper.per_molecule_metric.get(_ff_uid_s, {}).get(_ff_smiles, -math.inf)
-                            except Exception as _ff_es:
-                                bt.logging.error(f"§FF §NN fast-screen error: {_ff_es}")
-                                _ff_screen[_ff_smiles] = -math.inf
+                                for _uid, (_sm, _row) in enumerate(_ff_misses):
+                                    _ff_screen[_sm] = wrapper.per_molecule_metric.get(_uid, {}).get(_sm, -math.inf)
+                                bt.logging.info(
+                                    f"§FF §NN §FFFFFF: batch fast-screened {len(_ff_misses)} "
+                                    f"cache-miss molecules in 1 Boltz call"
+                                )
+                        except Exception as _ff_es:
+                            bt.logging.error(f"§FF §NN batch fast-screen error: {_ff_es}")
+                            for _sm, _ in _ff_misses:
+                                _ff_screen.setdefault(_sm, -math.inf)
 
                     # §NN Phase 2: full-score only the best fast-screened candidate.
                     _ff_winner = max(
@@ -1998,8 +2009,11 @@ async def run_boltz_prescoring(state: Dict[str, Any], max_candidates: int = 5) -
 
             # §NN Phase 1: fast-screen each round's SALSA hits.
             # Cache hits reuse the stored full score; misses run fast Boltz (no cache store).
+            # §FFFFFF: cache misses are batched into ONE score_molecules_target call so the
+            # expensive Boltz2 checkpoint load is paid once per round instead of N times.
             _mm_screen: Dict[str, float] = {}  # smiles -> score
             _mm_row_map: Dict[str, Any] = {}   # smiles -> row
+            _mm_misses: List[Tuple[str, Any]] = []  # (smiles, row) for cache-miss molecules
             for _, _mm_row in _mm_salsa_hits.iterrows():
                 if _mm_stop:
                     break
@@ -2011,27 +2025,35 @@ async def run_boltz_prescoring(state: Dict[str, Any], max_candidates: int = 5) -
                     _mm_screen[_mm_smiles] = boltz_cache[_mm_key]
                     bt.logging.debug(f"§MM §NN cache hit: {boltz_cache[_mm_key]:.4f}")
                 else:
-                    try:
-                        _mm_blk2 = await state['subtensor'].get_current_block()
-                        _mm_ep2 = ((_mm_blk2 // state['epoch_length']) + 1) * state['epoch_length']
-                        if _mm_ep2 - _mm_blk2 < 5:
-                            bt.logging.info("§MM §NN: epoch ends in <5 blocks — stopping.")
-                            _mm_stop = True
-                            break
-                    except Exception:
-                        pass
-                    _mm_uid_s = 0
-                    _mm_vmbu_s = {_mm_uid_s: {"smiles": [_mm_smiles], "names": [_mm_row['product_name']]}}
-                    _mm_sd_s: Dict[str, Any] = {_mm_uid_s: {}}
-                    try:
+                    _mm_misses.append((_mm_smiles, _mm_row))
+            # §FFFFFF: batch all cache-miss fast-screens into ONE Boltz call.
+            if _mm_misses and not _mm_stop:
+                try:
+                    _mm_blk2 = await state['subtensor'].get_current_block()
+                    _mm_ep2 = ((_mm_blk2 // state['epoch_length']) + 1) * state['epoch_length']
+                    if _mm_ep2 - _mm_blk2 < 5:
+                        bt.logging.info("§MM §NN: epoch ends in <5 blocks — stopping.")
+                        _mm_stop = True
+                    else:
+                        _mm_batch_vmbu = {
+                            _uid: {"smiles": [_sm], "names": [_row.get('product_name', '')]}
+                            for _uid, (_sm, _row) in enumerate(_mm_misses)
+                        }
+                        _mm_batch_sd: Dict[str, Any] = {_uid: {} for _uid in _mm_batch_vmbu}
                         await asyncio.to_thread(
                             wrapper.score_molecules_target,
-                            _mm_vmbu_s, _mm_sd_s, subnet_config, '0x' + '0' * 64, True,
+                            _mm_batch_vmbu, _mm_batch_sd, subnet_config, '0x' + '0' * 64, True,
                         )
-                        _mm_screen[_mm_smiles] = wrapper.per_molecule_metric.get(_mm_uid_s, {}).get(_mm_smiles, -math.inf)
-                    except Exception as _mm_es:
-                        bt.logging.error(f"§MM §NN fast-screen error: {_mm_es}")
-                        _mm_screen[_mm_smiles] = -math.inf
+                        for _uid, (_sm, _row) in enumerate(_mm_misses):
+                            _mm_screen[_sm] = wrapper.per_molecule_metric.get(_uid, {}).get(_sm, -math.inf)
+                        bt.logging.info(
+                            f"§MM §NN §FFFFFF [{_mm_round_idx + 1}/{_mm_max_rounds}]: "
+                            f"batch fast-screened {len(_mm_misses)} cache-miss molecules in 1 Boltz call"
+                        )
+                except Exception as _mm_es:
+                    bt.logging.error(f"§MM §NN batch fast-screen error: {_mm_es}")
+                    for _sm, _ in _mm_misses:
+                        _mm_screen.setdefault(_sm, -math.inf)
 
             if _mm_stop:
                 break
