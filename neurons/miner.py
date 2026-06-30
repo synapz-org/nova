@@ -1540,6 +1540,14 @@ async def run_boltz_prescoring(state: Dict[str, Any], max_candidates: int = 5) -
     # §RR: confidence-adjusted ordering scores (same as all_scores except for very low-
     # confidence GPU inference results; never written to cache or used by §CC/§MM).
     _rr_eff_scores: Dict[str, float] = {}
+    # §GGGGGG: Epoch-scoped fast-screen cache — stores fast-mode (50-step) Boltz scores
+    # keyed by canonical SMILES for the current prescoring pass.  Unlike boltz_cache
+    # (full-quality, persisted to disk), this is ephemeral and intentionally low-fidelity.
+    # Purpose: when §FF or a later §MM round generates the same SALSA hit as an earlier
+    # round, skip the GPU fast-screen call and reuse the previously computed fast score.
+    # Zero regression: fast scores are only used for within-round ranking decisions, not
+    # cached to disk, and full-quality scores always supersede them when available.
+    _epoch_fast_cache: Dict[str, float] = {}
 
     def _reorder_submission(scores: Dict[str, float]) -> None:
         """Put the best Boltz-scored molecule first in state['candidate_product']."""
@@ -1807,6 +1815,13 @@ async def run_boltz_prescoring(state: Dict[str, Any], max_candidates: int = 5) -
                         if _ff_key in boltz_cache:
                             _ff_screen[_ff_smiles] = boltz_cache[_ff_key]
                             bt.logging.debug(f"§FF §NN cache hit: {boltz_cache[_ff_key]:.4f}")
+                        elif _ff_canon in _epoch_fast_cache:
+                            # §GGGGGG: molecule was fast-screened in an earlier §FF or §MM
+                            # round this epoch — reuse the fast score, saving one batch slot.
+                            _ff_screen[_ff_smiles] = _epoch_fast_cache[_ff_canon]
+                            bt.logging.debug(
+                                f"§FF §NN §GGGGGG fast-cache hit: {_epoch_fast_cache[_ff_canon]:.4f}"
+                            )
                         else:
                             _ff_misses.append((_ff_smiles, _ff_row))
                     # §FFFFFF: batch all cache-miss fast-screens into ONE Boltz call.
@@ -1832,6 +1847,11 @@ async def run_boltz_prescoring(state: Dict[str, Any], max_candidates: int = 5) -
                                     f"§FF §NN §FFFFFF: batch fast-screened {len(_ff_misses)} "
                                     f"cache-miss molecules in 1 Boltz call"
                                 )
+                                # §GGGGGG: store fast-screen scores so §MM rounds can
+                                # reuse them without re-running 50-step Boltz inference.
+                                for _uid, (_sm, _row) in enumerate(_ff_misses):
+                                    _fc = get_canonical_smiles(_sm)
+                                    _epoch_fast_cache[_fc] = _ff_screen.get(_sm, -math.inf)
                         except Exception as _ff_es:
                             bt.logging.error(f"§FF §NN batch fast-screen error: {_ff_es}")
                             for _sm, _ in _ff_misses:
@@ -2024,6 +2044,13 @@ async def run_boltz_prescoring(state: Dict[str, Any], max_candidates: int = 5) -
                 if _mm_key in boltz_cache:
                     _mm_screen[_mm_smiles] = boltz_cache[_mm_key]
                     bt.logging.debug(f"§MM §NN cache hit: {boltz_cache[_mm_key]:.4f}")
+                elif _mm_canon in _epoch_fast_cache:
+                    # §GGGGGG: molecule was already fast-screened this epoch (in §FF or
+                    # an earlier §MM round) — reuse the cached fast score.
+                    _mm_screen[_mm_smiles] = _epoch_fast_cache[_mm_canon]
+                    bt.logging.debug(
+                        f"§MM §NN §GGGGGG fast-cache hit: {_epoch_fast_cache[_mm_canon]:.4f}"
+                    )
                 else:
                     _mm_misses.append((_mm_smiles, _mm_row))
             # §FFFFFF: batch all cache-miss fast-screens into ONE Boltz call.
@@ -2050,6 +2077,11 @@ async def run_boltz_prescoring(state: Dict[str, Any], max_candidates: int = 5) -
                             f"§MM §NN §FFFFFF [{_mm_round_idx + 1}/{_mm_max_rounds}]: "
                             f"batch fast-screened {len(_mm_misses)} cache-miss molecules in 1 Boltz call"
                         )
+                        # §GGGGGG: populate fast-cache so later §MM rounds skip re-screening
+                        # molecules already evaluated in this pass.
+                        for _uid, (_sm, _row) in enumerate(_mm_misses):
+                            _fc = get_canonical_smiles(_sm)
+                            _epoch_fast_cache[_fc] = _mm_screen.get(_sm, -math.inf)
                 except Exception as _mm_es:
                     bt.logging.error(f"§MM §NN batch fast-screen error: {_mm_es}")
                     for _sm, _ in _mm_misses:

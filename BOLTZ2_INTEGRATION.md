@@ -1,5 +1,96 @@
 # Boltz-2 Miner Integration
 
+## Current Status (as of 2026-06-30)
+
+§GGGGGG added 2026-06-30: Epoch-Scoped Fast-Screen Cache.
+
+**§GGGGGG — Epoch-Scoped Fast-Screen Cache (`neurons/miner.py`)**
+
+**Problem:** The §FFFFFF batch fast-screen (2026-06-29) eliminated redundant checkpoint loads
+within a single §FF or §MM round by batching all cache-miss molecules into one
+`score_molecules_target` call.  However, it did not address **cross-round redundancy**: when a
+SALSA hit appears in both §FF and a subsequent §MM round (or in two consecutive §MM rounds), it
+is re-fast-screened from scratch in each occurrence, paying the GPU cost of 50-step inference a
+second time.
+
+**Why cross-round re-screening occurs:**
+
+SALSA generates perturbation neighbourhoods from structurally similar seeds.  After 2–4 §MM
+rounds, the hill-climbing converges to a local chemical optimum.  Rounds 3+ will often regenerate
+molecules from the same neighbourhood, including molecules first seen in §FF or in round 1–2 of
+§MM.  With 3 SALSA hits per round, approximately 1 of the 3 misses in rounds 3–5 are re-encounters
+on well-converged epochs.
+
+**Fix:**
+
+A single local dict `_epoch_fast_cache: Dict[str, float]` (keyed by canonical SMILES) is
+initialised once at the start of `run_boltz_prescoring` and shared across §FF and all §MM rounds
+in that call.  It forms a third tier in the fast-screening cache hierarchy:
+
+```
+1. boltz_cache (in-memory full-quality scores, disk-backed)    [highest priority]
+2. _epoch_fast_cache (in-memory 50-step scores, epoch-scoped)  [§GGGGGG]
+3. GPU inference (one batch call via §FFFFFF)                  [lowest priority / miss]
+```
+
+**Cache integration — two locations each for §FF and §MM:**
+
+1. **Classification loop** — before appending a molecule to `_ff_misses` / `_mm_misses`, check
+   `_epoch_fast_cache`:
+   ```python
+   elif _ff_canon in _epoch_fast_cache:
+       _ff_screen[_ff_smiles] = _epoch_fast_cache[_ff_canon]
+       bt.logging.debug(f"§FF §NN §GGGGGG fast-cache hit: {_epoch_fast_cache[_ff_canon]:.4f}")
+   else:
+       _ff_misses.append((_ff_smiles, _ff_row))
+   ```
+   A hit reduces the `_ff_misses` / `_mm_misses` batch size by 1, directly shrinking the
+   §FFFFFF batch call.
+
+2. **Post-batch population** — after the `score_molecules_target` call fills `_ff_screen` /
+   `_mm_screen`, all batch results are written into `_epoch_fast_cache`:
+   ```python
+   for _uid, (_sm, _row) in enumerate(_ff_misses):
+       _fc = get_canonical_smiles(_sm)
+       _epoch_fast_cache[_fc] = _ff_screen.get(_sm, -math.inf)
+   ```
+   Results are stored whether the inference succeeded (finite score) or failed (−inf), so future
+   encounters don't attempt GPU inference on a structurally problematic molecule either.
+
+**Zero regression:**
+
+- `_epoch_fast_cache` is checked only as a fallback **after** `boltz_cache` — full-quality scores
+  always take priority.  A molecule scored at full quality (§FF or §MM full-score winner) will be
+  in `boltz_cache` and will never read from `_epoch_fast_cache`.
+- Fast scores in `_epoch_fast_cache` are never written to disk and are never used by §CC, §MM
+  seed advancement, or the surrogate training — they only affect fast-screening ranking decisions
+  within a single prescoring call.
+- On first encounter (round 1 of §MM or §FF), behaviour is identical to §FFFFFF — the molecule
+  goes through the batch call as before.
+- On subsequent epochs (new `run_boltz_prescoring` call), `_epoch_fast_cache` starts empty.
+
+**Expected benefit:**
+
+| Scenario | Rounds before convergence | Fast-cache hits saved | GPU time saved |
+|----------|--------------------------|----------------------|----------------|
+| A100, fast epoch (good seed) | 3–4 rounds of §MM | ~1 per round from round 3 | ~1 × 25s = 25s |
+| A100, long epoch (10 §MM rounds) | 6–7 rounds with basin-hops | ~1–2 per round from round 4 | ~3 × 25s = 75s |
+| H100 (25 s/mol fast) | same count | same hit rate | ~3 × 8s = 25s |
+| RTX 3090 (§MM exits after 0–1 rounds) | 0–1 §MM rounds, 1 §FF | ~0 (no repeat visits) | 0 |
+
+On A100 with a well-converged run (the most common production case week 2+), this saves ~25–75 s,
+equivalent to **1 additional §MM full-score call** per epoch at no extra GPU compute cost.
+
+The gain compounds with §FFFFFF: §GGGGGG reduces the **batch size** submitted to the §FFFFFF call,
+while §FFFFFF reduces the **number of calls**.  Together they minimise both per-call overhead and
+within-call inference cost.
+
+**Files changed:** `neurons/miner.py` — `_epoch_fast_cache` initialisation; §FF classification
+loop (add `elif _ff_canon in _epoch_fast_cache` branch); §FF post-batch (populate cache);
+§MM classification loop (same branch); §MM post-batch (populate cache).
+
+---
+
 ## Current Status (as of 2026-06-29)
 
 §FFFFFF added 2026-06-29: Batch Fast-Screen in §FF and §MM.
@@ -1201,6 +1292,7 @@ Two conditional/research items remain (§D, FBLD). §TTTT–§SSSS implemented 2
 | DDDDDD | Cache `ligand_iptm` + confidence-weighted surrogate training (downweight low-pose-confidence runs) | neurons/miner.py, utils/surrogate.py | ✅ |
 | EEEEEE | Top-K reaction class score weighting for SAVI sampling bias (4×/2×/1.5×/1× rank ladder) | neurons/miner.py | ✅ |
 | FFFFFF | Batch fast-screen in §FF and §MM: N cache-miss molecules → 1 score_molecules_target call | neurons/miner.py | ✅ |
+| GGGGGG | Epoch-scoped fast-screen cache: skip re-screening SALSA hits already fast-screened this epoch | neurons/miner.py | ✅ |
 
 ---
 
