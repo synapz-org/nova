@@ -1,5 +1,78 @@
 # Boltz-2 Miner Integration
 
+## Current Status (as of 2026-07-01)
+
+§HHHHHH added 2026-07-01: Surrogate-Blended SALSA Pool Score for §FF/§MM Hill-Climbing.
+
+**§HHHHHH — Surrogate-Blended SALSA Score Column (`utils/surrogate.py`, `neurons/miner.py`)**
+
+**Problem:** §FF and §MM run `run_salsa_search` with `score_col='combined_score'` — a PSICHIC-derived
+metric that reflects general protein-ligand binding affinity.  PSICHIC and Boltz-2 correlate
+imperfectly: a molecule PSICHIC ranks 1st may score 3rd under Boltz-2's `(APB - APV) / HA` formula.
+
+In §MM rounds 2+, the miner has already Boltz-scored 3-15 molecules for the current target.  This
+historical data is stored in the disk cache and used by the dual RF surrogate (§YYYYY/§AAAAAA) to
+predict which structural features correlate with high Boltz scores.  Until §HHHHHH, this structural
+knowledge was only used for PSICHIC pool re-ranking before the initial Boltz pass — not during
+SALSA hill-climbing itself.  So §FF and §MM were effectively ignoring this target-specific learning
+when deciding which direction to explore next.
+
+**Fix:**
+
+A new `augment_pool_with_surrogate_blend(pool_df, dual_model, alpha=0.6)` function in
+`utils/surrogate.py` adds a `surrogate_salsa_score` column to the SAVI stream pool:
+
+```
+surrogate_salsa_score = 0.4 * norm(combined_score) + 0.6 * norm(surrogate)
+```
+
+where `norm()` is min-max normalisation to `[0, 1]` and `surrogate = (apb_pred - apv_pred) / ha`
+using the dual RF models.  Both signals are normalised before blending so neither dominates due to
+scale differences.
+
+In `run_boltz_prescoring`, the augmented pool is computed **once** (before §FF) and stored in
+`_hhhhhh_pool`.  Both §FF and §MM then use this augmented pool and pass `_hhhhhh_score_col`
+(`'surrogate_salsa_score'`) as SALSA's `score_col`, so hill-climbing is guided by the blended
+signal rather than pure PSICHIC.
+
+**Safety guards:**
+
+1. **RF-only activation.** `augment_pool_with_surrogate_blend` returns the pool unchanged if either
+   dual model uses Ridge instead of RandomForest.  Ridge at <100 training points generalises poorly
+   across 5000+ SAVI molecules and would mislead SALSA.  The RF tier (>=100 pts, §QQQQ) has enough
+   structural diversity in training data to extrapolate reliably across the pool.
+
+2. **Graceful fallback.** When `augment_pool_with_surrogate_blend` returns the original pool (no
+   `surrogate_salsa_score` column), `_hhhhhh_pool` stays `None` and `_hhhhhh_score_col` stays
+   `'combined_score'`.  §FF and §MM use `state.get('savi_stream_pool')` and `'combined_score'`
+   exactly as before — zero regression on epoch 1 or new targets.
+
+3. **Boltz still validates.** The `score_col` only determines which SALSA hits are returned and in
+   what order.  The actual selection for Boltz scoring goes through §NN fast-screening and full
+   Boltz inference.  Even if the surrogate misleads SALSA, Boltz-2 correctly evaluates each
+   candidate; any poorly predicted molecule is filtered out in §NN.
+
+**Expected benefit:**
+
+| Scenario | §MM rounds | Effect |
+|----------|-----------|--------|
+| Epoch 1, new target | All (Ridge, <100 pts) | None — pure PSICHIC fallback |
+| Epoch 2, target familiar | 40-99 pts (Ridge) | None — fallback |
+| Epoch 3+, mature cache | >=100 pts (RF active) | SALSA converges 1-2 rounds faster to the Boltz-optimal region |
+| Epoch 4+, rich cache | 200+ pts | Larger structural signal - stronger directional benefit |
+
+On A100 hardware where §MM typically runs 4-7 rounds, saving 1 §MM round of non-optimal
+exploration corresponds to 45-90 s of GPU time that can be spent on a genuinely better candidate.
+Net effect: at or above 1 additional §MM round's worth of quality improvement per epoch from
+epoch 3+ onward.
+
+**Files changed:**
+- `utils/surrogate.py`: added `augment_pool_with_surrogate_blend`
+- `neurons/miner.py`: import update; §HHHHHH augmentation block before §FF; §FF and §MM pool
+  source and `score_col` updated to use `_hhhhhh_pool` / `_hhhhhh_score_col`
+
+---
+
 ## Current Status (as of 2026-06-30)
 
 §GGGGGG added 2026-06-30: Epoch-Scoped Fast-Screen Cache.

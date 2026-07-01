@@ -46,7 +46,7 @@ from utils.msa import ensure_msa
 from utils.salsa import run_salsa_search
 from utils.genetic import run_gradient_ga
 from utils.chembl import get_chembl_seeds
-from utils.surrogate import fit_surrogate, rank_pool_by_surrogate, ucb_rank_pool, fit_dual_surrogate, dual_surrogate_rank_pool, dual_surrogate_ucb_rank_pool
+from utils.surrogate import fit_surrogate, rank_pool_by_surrogate, ucb_rank_pool, fit_dual_surrogate, dual_surrogate_rank_pool, dual_surrogate_ucb_rank_pool, augment_pool_with_surrogate_blend
 from PSICHIC.wrapper import PsichicWrapper
 from boltz.wrapper import BoltzWrapper
 from btdr import QuicknetBittensorDrandTimelock
@@ -1750,6 +1750,31 @@ async def run_boltz_prescoring(state: Dict[str, Any], max_candidates: int = 5) -
         f"{len(valid_scores)}/{len(candidates)} molecules scored."
     )
 
+    # §HHHHHH: Pre-compute surrogate-blended SAVI pool for §FF/§MM SALSA hill-climbing.
+    # When the dual RF surrogate (§YYYYY/§AAAAAA) has >=100 cache points, augment the
+    # SAVI stream pool with a 'surrogate_salsa_score' column that blends PSICHIC's
+    # combined_score (40%) with the surrogate's predicted (APB - APV) / HA (60%), both
+    # min-max normalised.  Passing this column as SALSA's score_col makes hill-climbing
+    # converge toward molecules the miner has learned score well under Boltz-2 for THIS
+    # target's chemistry -- complementing the general-purpose PSICHIC signal.
+    # Falls back to 'combined_score' (pure PSICHIC) when the surrogate is unavailable,
+    # uses Ridge (<100 pts), or augmentation fails -- zero regression in that case.
+    _hhhhhh_pool: Optional[pd.DataFrame] = None
+    _hhhhhh_score_col: str = 'combined_score'
+    _hhhhhh_base = state.get('savi_stream_pool')
+    if _dual is not None and _hhhhhh_base is not None and not _hhhhhh_base.empty:
+        try:
+            _aug = augment_pool_with_surrogate_blend(_hhhhhh_base, _dual)
+            if 'surrogate_salsa_score' in _aug.columns:
+                _hhhhhh_pool = _aug
+                _hhhhhh_score_col = 'surrogate_salsa_score'
+                bt.logging.info(
+                    f"[§HHHHHH] SAVI pool ({len(_aug)} mols) augmented with surrogate-blend "
+                    f"score -- §FF/§MM SALSA will hill-climb on blended Boltz signal."
+                )
+        except Exception as _hhhhhh_err:
+            bt.logging.debug(f"[§HHHHHH] Pool augmentation skipped: {_hhhhhh_err}")
+
     # §FF: Boltz-guided SALSA -- second SALSA pass seeded from the best Boltz molecule.
     # The main loop above uses the PSICHIC-ranked candidate pool as seeds; PSICHIC and
     # Boltz-2 correlate imperfectly, so the validated Boltz winner may occupy a different
@@ -1758,7 +1783,7 @@ async def run_boltz_prescoring(state: Dict[str, Any], max_candidates: int = 5) -
     # even better -- without any additional PSICHIC overhead.
     # Only fires when the epoch has >=2 mol-lengths + 2 min of runway remaining.
     _ff_best_smiles = max(all_scores, key=lambda s: all_scores.get(s, -math.inf), default=None)
-    _savi_pool_ff = state.get('savi_stream_pool')
+    _savi_pool_ff = _hhhhhh_pool if _hhhhhh_pool is not None else state.get('savi_stream_pool')
     if (
         _ff_best_smiles is not None
         and math.isfinite(all_scores.get(_ff_best_smiles, -math.inf))
@@ -1782,7 +1807,7 @@ async def run_boltz_prescoring(state: Dict[str, Any], max_candidates: int = 5) -
                     2,   # rounds (fewer -- time is limited)
                     200, # n_perturb — full operator coverage (ring walk + terminal removal)
                     5,   # top_k — §NNNN: wider net for scaffold-diversity selection below
-                    'combined_score',
+                    _hhhhhh_score_col,  # §HHHHHH: surrogate-blended or 'combined_score' fallback
                     'product_smiles',
                     'product_name',
                     _salsa_operator_weights(_ff_best_smiles),  # §ZZZZZ
@@ -1955,7 +1980,7 @@ async def run_boltz_prescoring(state: Dict[str, Any], max_candidates: int = 5) -
         )
         if _mm_all_scored else None
     )
-    _mm_savi_pool = state.get('savi_stream_pool')
+    _mm_savi_pool = _hhhhhh_pool if _hhhhhh_pool is not None else state.get('savi_stream_pool')
     # 10 rounds: on A100 the time guard fires after ~7 rounds anyway; on RTX 3090
     # it fires after 0-1 rounds.  The higher cap lets fast hardware fully utilise
     # the epoch budget without artificially stopping early.
@@ -2006,7 +2031,7 @@ async def run_boltz_prescoring(state: Dict[str, Any], max_candidates: int = 5) -
                     2,   # rounds — neighbourhood exploration
                     200, # n_perturb — full operator coverage (ring walk + terminal removal)
                     5,   # top_k — §NNNN: wider net for scaffold-diversity selection below
-                    'combined_score',
+                    _hhhhhh_score_col,  # §HHHHHH: surrogate-blended or 'combined_score' fallback
                     'product_smiles',
                     'product_name',
                     _salsa_operator_weights(_mm_seed_smiles),  # §ZZZZZ

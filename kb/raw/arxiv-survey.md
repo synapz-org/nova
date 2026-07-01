@@ -380,6 +380,7 @@ All items 1–10 are **implemented**. Items 5 and 7 remain as conditional/resear
 | 16 | §CCCCCC: Persist §YY winning reaction class (`best_boltz_rxn_class`) across restarts | 40 lines | ✅ Done | 2× SAVI streaming bias toward best reaction template active immediately after restart |
 | 17 | §DDDDDD: Cache `ligand_iptm` + confidence-weighted surrogate training | 30 lines | ✅ Done | 3–8% NDCG improvement via down-weighting uncertain-pose training examples |
 | 18 | §EEEEEE: Top-K reaction class score weighting (4×/2×/1.5×/1× vs binary 2×/1×) | 60 lines | ✅ Done | Multi-modal SAVI sampling; fluke-resistant via running mean; active from epoch 2+ |
+| 19 | §HHHHHH: Surrogate-blended SALSA pool score for §FF/§MM hill-climbing | 90 lines | ✅ Done | SALSA converges 1-2 rounds faster to Boltz-optimal region from epoch 3+ (RF tier) |
 
 All approaches share the same submission constraint: molecules must map to valid SAVI-2020
 product names. SALSA and GradientGA both solve this via nearest-neighbour SAVI-2020 lookup.

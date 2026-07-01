@@ -479,3 +479,87 @@ def dual_surrogate_ucb_rank_pool(
         )
     except Exception:
         return dual_surrogate_rank_pool(pool_df, dual_model, smiles_col, ha_col)
+
+
+def augment_pool_with_surrogate_blend(
+    pool_df,
+    dual_model,
+    alpha: float = 0.6,
+    smiles_col: str = 'product_smiles',
+    psichic_col: str = 'combined_score',
+    ha_col: str = 'heavy_atoms',
+):
+    """
+    §HHHHHH: Augment pool_df with a surrogate-PSICHIC blended score column.
+
+    Adds 'surrogate_salsa_score' = (1-alpha) * norm(psichic) + alpha * norm(surrogate)
+    where norm() is min-max normalisation to [0, 1].  Both signals are placed on the
+    same scale before blending so neither dominates due to magnitude differences.
+
+    The surrogate component is (apb_pred - apv_pred) / ha using the dual RF models from
+    §YYYYY — the same formula the validator uses to score Boltz-2 outputs.  Feeding this
+    into SALSA's score_col makes hill-climbing converge toward molecules the miner has
+    already learned correlate with high Boltz scores for the weekly target.
+
+    Only activates when BOTH dual models are RandomForestRegressors (>=100 cache points,
+    §QQQQ/§YYYYY): Ridge surrogates at low data density (<100 pts) generalize poorly
+    across the large SAVI pool and would mislead SALSA more than help.
+
+    Returns pool_df unchanged (without 'surrogate_salsa_score') when:
+    - dual_model is None
+    - either model uses Ridge rather than RF
+    - descriptor computation fails for >50% of pool rows
+    - any exception is raised
+    """
+    if dual_model is None:
+        return pool_df
+
+    try:
+        from sklearn.ensemble import RandomForestRegressor
+        model_apb, model_apv = dual_model
+        if not (
+            isinstance(model_apb.named_steps.get('model'), RandomForestRegressor)
+            and isinstance(model_apv.named_steps.get('model'), RandomForestRegressor)
+        ):
+            return pool_df
+    except Exception:
+        return pool_df
+
+    try:
+        vecs = [_descriptor_vector(s) for s in pool_df[smiles_col]]
+        n_valid = sum(1 for v in vecs if v is not None)
+        if n_valid < max(1, len(pool_df) * 0.5):
+            return pool_df
+
+        placeholder = [0.0] * _N_FEATURES
+        X = [v if v is not None else placeholder for v in vecs]
+
+        apb_preds = model_apb.predict(X)
+        apv_preds = model_apv.predict(X)
+
+        if ha_col in pool_df.columns:
+            ha_vals = pool_df[ha_col].fillna(25).values.astype(float)
+        else:
+            from utils.molecules import get_heavy_atom_count
+            ha_vals = np.array([float(get_heavy_atom_count(s) or 25) for s in pool_df[smiles_col]])
+        ha_vals = np.where(ha_vals > 0, ha_vals, 25.0)
+
+        surrogate_raw = (apb_preds - apv_preds) / ha_vals
+
+        def _minmax(arr):
+            lo, hi = arr.min(), arr.max()
+            span = hi - lo
+            return (arr - lo) / span if span > 1e-9 else np.zeros_like(arr)
+
+        psichic_vals = (
+            pool_df[psichic_col].fillna(0.0).values.astype(float)
+            if psichic_col in pool_df.columns
+            else np.zeros(len(pool_df))
+        )
+        blended = (1.0 - alpha) * _minmax(psichic_vals) + alpha * _minmax(surrogate_raw)
+
+        pool_copy = pool_df.copy()
+        pool_copy['surrogate_salsa_score'] = blended
+        return pool_copy
+    except Exception:
+        return pool_df
