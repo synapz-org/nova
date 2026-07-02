@@ -2165,6 +2165,34 @@ async def run_boltz_prescoring(state: Dict[str, Any], max_candidates: int = 5) -
                                 f"{_mm_w_row.get('product_name', '?')} boltz={_mm_score:.4f} "
                                 f"(screened {len(_mm_screen)} hits)"
                             )
+                            # §IIIIII: Online surrogate refresh — retrain the dual surrogate
+                            # immediately after each new §MM full-score so subsequent rounds
+                            # benefit from the freshest possible Boltz-calibrated signal.
+                            # Only updates _mm_savi_pool when the RF tier is active (≥100 cache
+                            # points); Ridge surrogates ignore additional points almost entirely.
+                            try:
+                                _ii_dual = fit_dual_surrogate(db_path, protein)
+                                if _ii_dual is not None:
+                                    _ii_src = (
+                                        _mm_savi_pool
+                                        if _mm_savi_pool is not None
+                                        else state.get('savi_stream_pool')
+                                    )
+                                    if _ii_src is not None and not _ii_src.empty:
+                                        _ii_pool = augment_pool_with_surrogate_blend(
+                                            _ii_src, _ii_dual
+                                        )
+                                        if 'surrogate_salsa_score' in _ii_pool.columns:
+                                            _mm_savi_pool = _ii_pool
+                                            _hhhhhh_score_col = 'surrogate_salsa_score'
+                                            bt.logging.debug(
+                                                f"[§IIIIII] Surrogate refreshed after §MM "
+                                                f"round {_mm_round_idx + 1} — pool re-blended."
+                                            )
+                            except Exception as _ii_exc:
+                                bt.logging.debug(
+                                    f"[§IIIIII] Surrogate refresh (non-fatal): {_ii_exc}"
+                                )
                     except Exception as _mm_e:
                         bt.logging.error(f"§MM §NN full-score error: {_mm_e}")
                         _mm_score = -math.inf

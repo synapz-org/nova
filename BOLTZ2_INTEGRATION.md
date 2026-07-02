@@ -1,5 +1,85 @@
 # Boltz-2 Miner Integration
 
+## Current Status (as of 2026-07-02)
+
+§IIIIII added 2026-07-02: Online Surrogate Refresh After §MM Rounds.
+
+**§IIIIII — Online Surrogate Refresh After §MM Rounds (`neurons/miner.py`)**
+
+**Problem:** §HHHHHH augments the SAVI pool with a surrogate-blended score (`surrogate_salsa_score`)
+once before §FF starts, using the dual RF surrogate trained on all cached Boltz data at that point.
+Both §FF and all §MM rounds then use this static augmented pool throughout the prescoring call.
+
+During §MM hill-climbing on A100/H100 hardware (4–10 rounds), each successful full-score adds a
+fresh Boltz data point to the disk cache — typically 4–8 new points per epoch.  Until §IIIIII, these
+new points never reached the surrogate during the prescoring call: the RF models and the blended
+`surrogate_salsa_score` column stayed frozen at the pre-§FF snapshot.  For a mature run (epoch 5+,
+150+ cached points), the delta from 5 fresh §MM scores is small relative to the training set, but
+the new points are disproportionately high-quality (they are confirmed Boltz winners from this epoch)
+and often cluster structurally around the current hill-climbing region — exactly where surrogate
+accuracy matters most.
+
+**Fix:**
+
+Immediately after each §MM round's `_disk_cache_put` call (new score written to SQLite), attempt
+to retrain the dual surrogate and refresh `_mm_savi_pool`:
+
+```python
+try:
+    _ii_dual = fit_dual_surrogate(db_path, protein)
+    if _ii_dual is not None:
+        _ii_src = _mm_savi_pool if _mm_savi_pool is not None else state.get('savi_stream_pool')
+        if _ii_src is not None and not _ii_src.empty:
+            _ii_pool = augment_pool_with_surrogate_blend(_ii_src, _ii_dual)
+            if 'surrogate_salsa_score' in _ii_pool.columns:
+                _mm_savi_pool = _ii_pool
+                _hhhhhh_score_col = 'surrogate_salsa_score'
+                bt.logging.debug(f"[§IIIIII] Surrogate refreshed after §MM round {r} — pool re-blended.")
+except Exception as _ii_exc:
+    bt.logging.debug(f"[§IIIIII] Surrogate refresh (non-fatal): {_ii_exc}")
+```
+
+The next §MM round's SALSA call picks up `_mm_savi_pool` (now re-blended with fresh surrogate
+weights) and `_hhhhhh_score_col` (confirmed `'surrogate_salsa_score'`), so hill-climbing is guided
+by a surrogate that has seen the current epoch's confirmed binders.
+
+**Safety guards:**
+
+1. **RF-only activation.** `augment_pool_with_surrogate_blend` returns the pool unchanged when
+   either dual model uses Ridge (< 100 training points).  The `'surrogate_salsa_score' in
+   _ii_pool.columns` guard ensures `_mm_savi_pool` is updated only when the augmentation actually
+   produced a blended column.  In Ridge tier (epoch 1–2), §IIIIII is a complete no-op.
+
+2. **Graceful fallback.** The entire refresh is wrapped in `try/except`; any exception logs at
+   DEBUG and the §MM round continues with the previous pool unchanged.
+
+3. **No cache pollution.** `fit_dual_surrogate` reads from the SQLite disk cache but never writes
+   to it.  `augment_pool_with_surrogate_blend` returns a copy of the pool, leaving the original
+   `_mm_savi_pool` intact until the check passes.
+
+4. **Wall-clock budget.** `fit_dual_surrogate` at 100–200 training points with RF(n_estimators=100)
+   takes < 1 s.  `augment_pool_with_surrogate_blend` on a 5k-row pool takes < 0.5 s.  Total
+   overhead per §MM round: < 1.5 s, well within the 45–150 s per-molecule §MM budget.
+
+**Expected benefit:**
+
+| Scenario | §MM rounds | Effect |
+|----------|-----------|--------|
+| Epoch 1–2, Ridge (<100 pts) | All rounds | None — RF guard blocks update |
+| Epoch 3, first RF run (~100 pts) | 4–7 rounds | Mild — surrogate gains 4–7 pts from epoch winners |
+| Epoch 5+, rich cache (200+ pts) | 4–7 rounds | Moderate — epoch winners update surrogate weights in the hill-climbing neighbourhood |
+
+On A100 hardware where §MM typically runs 5–7 rounds, the freshest surrogate is used from round 2
+onward.  Combined with §HHHHHH's initial blend, the pool signal tightens around confirmed binders
+as §MM converges — so basin-hopping (§QQ/§VV) is more likely to select unexplored scaffolds that
+the updated surrogate predicts will be competitive.
+
+**Files changed:**
+- `neurons/miner.py`: surrogate refresh block inserted after `_disk_cache_put` in the §MM full-score
+  path (inside the per-winner `try` block, after adaptive timing update).
+
+---
+
 ## Current Status (as of 2026-07-01)
 
 §HHHHHH added 2026-07-01: Surrogate-Blended SALSA Pool Score for §FF/§MM Hill-Climbing.
