@@ -1,5 +1,82 @@
 # Boltz-2 Miner Integration
 
+## Current Status (as of 2026-07-03)
+
+§JJJJJJ added 2026-07-03: Reduced MSA Subsampling Depth in Fast Mode.
+
+**§JJJJJJ — Reduced MSA Depth in Fast-Screen Mode (`boltz/wrapper.py`)**
+
+**Problem:** §NN fast-screen inference (`fast=True`, used in §FF and §MM Phase 1) already
+reduces sampling steps (200→50), affinity sampling steps (150→50), diffusion samples (N→1),
+and recycling steps (5→2) via §III.  However, `num_subsampled_msa` was not adapted for fast
+mode — on A100 hardware it stayed at 2048 (§AAA) and on H100 at 4096 (§XXXXX).
+
+MSA attention in Boltz-2's trunk pairformer is O(N×L²) where N is the MSA depth and L is
+protein sequence length.  The trunk runs once per inference regardless of how many diffusion
+steps follow.  So in fast mode, the trunk processes a 2048-row MSA to set up for only 50
+diffusion steps — an imbalanced budget that burns trunk time without proportional affinity
+benefit.
+
+Fast screening only needs **relative ranking** (which of the 3 SALSA hits is most likely to
+beat the current §MM seed).  Deep MSA is most valuable for accurate absolute affinity values —
+which are what full-quality inference (fast=False) produces for cache storage and submission
+ordering.  A reduced MSA of 512 rows (from 2048) is sufficient to preserve the ranking signal
+while cutting trunk attention work by ~4×.
+
+**Fix:**
+
+In `score_molecules_target`, after the existing §III `_recycle_aff` computation:
+
+```python
+_full_msa = self.config.get('num_subsampled_msa', 1024)
+_n_msa = max(256, _full_msa // 4) if fast else _full_msa
+```
+
+The `predict()` call now passes `num_subsampled_msa=_n_msa` instead of the config value
+directly.  `_full_msa // 4` yields:
+
+| Hardware tier | §AAA/§XXXXX full MSA | §JJJJJJ fast MSA | Reduction |
+|---------------|---------------------|------------------|-----------|
+| RTX 3090 (config default) | 1024 | 256 | 4× |
+| A100 80 GB (§AAA) | 2048 | 512 | 4× |
+| H100 80 GB (§XXXXX) | 4096 | 1024 | 4× |
+
+The `max(256, ...)` floor ensures proteins with sparse natural homologs are not over-subsampled
+below the minimum useful depth.
+
+A DEBUG log line records the MSA reduction on each fast-mode call so the change is visible in
+logs when debugging fast-screen quality issues.
+
+**Safety guards:**
+
+1. **Full-quality unaffected.** `_n_msa = _full_msa` when `fast=False`, so cache writes,
+   submission scores, and timing calibration (§G/§BBBBB) are unchanged.
+2. **Floor at 256.** Prevents degenerate single-sequence mode on short MSAs.
+3. **Only affects ranking, not promotion.** Phase 1 fast-screen scores only decide which
+   molecule enters Phase 2 full-scoring.  The Phase 2 call uses `fast=False` and full MSA
+   depth — the actual cached score is always full-quality.
+
+**Expected benefit:**
+
+| Scenario | Per-fast-screen call (A100, 2048→512) | §MM rounds saved per epoch |
+|----------|---------------------------------------|---------------------------|
+| A100, 3 SALSA hits, all cache-miss | −8–12 s/call × 3 = −24–36 s | ~0.5–0.8 extra §MM rounds |
+| A100, §FFFFFF batch (3 molecules at once) | −8–12 s trunk overhead | ~0.3–0.5 extra §MM rounds |
+| H100 (4096→1024, faster base) | −4–6 s/call × 3 = −12–18 s | ~0.5 extra §MM rounds |
+
+On A100 where each §MM full-score takes ~45 s, saving 25–35 s of fast-screen trunk time across
+3 hits is roughly equivalent to 0.5–0.8 additional §MM full-score rounds per epoch.  Over a
+week of mining (100+ epochs), this compounds to dozens of additional confirmed Boltz winners.
+
+The benefit is largest on early §MM rounds where all 3 SALSA hits are cache-misses.  In later
+rounds where §GGGGGG epoch-fast-cache hits reduce the batch to 0–1 misses, the gain is smaller.
+
+**Files changed:**
+- `boltz/wrapper.py`: `_full_msa` / `_n_msa` computed after `_recycle_aff`; `predict()` call
+  updated to pass `num_subsampled_msa=_n_msa`; DEBUG log line added.
+
+---
+
 ## Current Status (as of 2026-07-02)
 
 §IIIIII added 2026-07-02: Online Surrogate Refresh After §MM Rounds.

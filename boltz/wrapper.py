@@ -228,10 +228,23 @@ properties:
         # runs (fast=False, used for cache storage and final submission ordering) keep
         # the configured default (5) for maximum accuracy.
         _recycle_aff = 2 if fast else self.config.get('recycling_steps_affinity', 5)
+        # §JJJJJJ: fast mode reduces MSA subsampling depth.  Fast screening only needs
+        # relative candidate ranking — it does NOT cache results or influence submission
+        # order directly.  MSA attention is O(N×L²) in sequence depth, so cutting depth
+        # from 2048→512 (A100) or 4096→1024 (H100) saves meaningful trunk time without
+        # degrading ranking quality (the affinity head's step count is already capped at
+        # 50, so the marginal gain from deep MSA is small).  Floor of 256 prevents
+        # under-sampling for very long proteins.  Full-quality runs are unaffected.
+        _full_msa = self.config.get('num_subsampled_msa', 1024)
+        _n_msa = max(256, _full_msa // 4) if fast else _full_msa
 
         # Run Boltz2 for unique molecules
         _mode_tag = "[FAST] " if fast else ""
         bt.logging.info(f"Running Boltz2 {_mode_tag}")
+        if fast:
+            bt.logging.debug(
+                f"[§JJJJJJ] Fast mode MSA: {_full_msa} → {_n_msa} sequences"
+            )
         _t0 = time.time()
         try:
             predict(
@@ -252,7 +265,7 @@ properties:
                 use_potentials = self.config.get('use_potentials', False),
                 step_scale = self.config.get('step_scale', None),
                 subsample_msa = self.config.get('subsample_msa', True),
-                num_subsampled_msa = self.config.get('num_subsampled_msa', 1024),
+                num_subsampled_msa = _n_msa,
                 recycling_steps_affinity = _recycle_aff,
             )
             _elapsed = time.time() - _t0

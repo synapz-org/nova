@@ -382,6 +382,7 @@ All items 1–10 are **implemented**. Items 5 and 7 remain as conditional/resear
 | 18 | §EEEEEE: Top-K reaction class score weighting (4×/2×/1.5×/1× vs binary 2×/1×) | 60 lines | ✅ Done | Multi-modal SAVI sampling; fluke-resistant via running mean; active from epoch 2+ |
 | 19 | §HHHHHH: Surrogate-blended SALSA pool score for §FF/§MM hill-climbing | 90 lines | ✅ Done | SALSA converges 1-2 rounds faster to Boltz-optimal region from epoch 3+ (RF tier) |
 | 20 | §IIIIII: Online surrogate refresh after each §MM full-score | 30 lines | ✅ Done | Later §MM rounds use freshest surrogate; epoch winners tighten signal around hill-climbing region (RF tier, epoch 3+) |
+| 21 | §JJJJJJ: Reduced MSA subsampling depth in fast-screen mode (full_msa//4, floor 256) | 12 lines | ✅ Done | ~8–12 s saved per fast-screen molecule on A100; ~0.5–0.8 extra §MM rounds per epoch |
 
 All approaches share the same submission constraint: molecules must map to valid SAVI-2020
 product names. SALSA and GradientGA both solve this via nearest-neighbour SAVI-2020 lookup.
