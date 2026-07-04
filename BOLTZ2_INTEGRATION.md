@@ -1,5 +1,73 @@
 # Boltz-2 Miner Integration
 
+## Current Status (as of 2026-07-04)
+
+§KKKKKK added 2026-07-04: Hardware-Adaptive §MM Max Rounds for H100 Tier.
+
+**§KKKKKK — Hardware-Adaptive `_mm_max_rounds` for H100 (`neurons/miner.py`)**
+
+**Problem:** `_mm_max_rounds = 10` was a hardcoded cap applied uniformly across all GPU tiers.
+On H100 (≥70 GiB VRAM, ~25 s/mol inference vs A100's ~45 s/mol), the first-epoch budget
+supports up to ~17 §MM rounds, but the cap of 10 left ~7 rounds unused — discarding roughly
+40 % of the available hill-climbing budget on the most competitive hardware.
+
+Budget analysis (first epoch, 1200 s trigger window, all cache misses):
+
+| Hardware | t_mol | Initial prescoring | §FF | §MM budget | Possible rounds | Old cap | New cap |
+|----------|-------|---------------------|-----|------------|-----------------|---------|---------|
+| H100 (≥70 GiB) | ~25 s | 5 × 25 = 125 s | ~75 s | ~1 000 s | ~17 | **10 (binding!)** | **20** |
+| A100 (≥38 GiB) | ~45 s | 5 × 45 = 225 s | ~100 s | ~875 s | ~9–10 | 10 (at ceiling) | 10 |
+| RTX 3090 | ~150 s | — | — | ~0 s | 0–2 | 10 (not binding) | 10 |
+
+On epochs 2+ the adaptive trigger fires earlier and the warm disk cache cuts GPU time in the
+initial prescoring pass; in that regime §MM gets 1–3 rounds on all tiers and the cap is not
+binding regardless of its value.
+
+**Fix:**
+
+After `wrapper = BoltzWrapper()` is instantiated inside `run_boltz_prescoring`, read back
+the patched `num_subsampled_msa` value that §AAA/§XXXXX wrote at init time.  This reuses the
+existing VRAM probe without a second `torch.cuda` call and stays exactly consistent with the
+tier boundaries already established by those earlier sections:
+
+```python
+_kkkkkk_msa = wrapper.config.get('num_subsampled_msa', 1024)
+if _kkkkkk_msa >= 4096:    # §XXXXX H100 tier (≥70 GiB VRAM)
+    _mm_max_rounds = 20
+    bt.logging.info("[§KKKKKK] H100 tier detected → _mm_max_rounds=20")
+else:
+    _mm_max_rounds = 10    # A100 / RTX 3090 / default — time guard is active limit
+```
+
+**Safety guards:**
+
+1. **Time guard unchanged.** The loop's primary stopping condition —
+   `_mm_remaining_s < _mm_t_mol * 2 + 120` — still fires before the cap on all hardware
+   tiers.  The cap is a backstop against infinite loops, not the active limiter on any
+   current GPU.  Raising it for H100 allows the time guard to run freely up to 20 rounds
+   instead of 10.
+
+2. **Zero effect on A100 and below.**  `num_subsampled_msa < 4096` on all non-H100 hardware,
+   so `_mm_max_rounds` remains 10 and behaviour is identical to before.
+
+3. **No new imports.**  The `wrapper` object is already in scope at the point of the change;
+   no `import torch` needed in `miner.py`.
+
+**Expected benefit:**
+
+On H100 hardware with an empty disk cache (week-1 epoch 1 on a new target), the miner can
+now complete up to 7 additional §MM full-score rounds per epoch.  Each §MM round discovers
+whether a SALSA-generated candidate beats the current best, advancing the hill-climbing seed
+if it does.  Over a full week (100+ first-epoch-equivalent runs after target rotations or
+miner restarts with cleared cache), this compounds to dozens of additional confirmed Boltz
+winners that were previously left as untested SALSA hits.
+
+**Files changed:**
+- `neurons/miner.py`: replaced hardcoded `_mm_max_rounds = 10` with §KKKKKK hardware-adaptive
+  block; updated preceding comment to document the budget analysis per tier.
+
+---
+
 ## Current Status (as of 2026-07-03)
 
 §JJJJJJ added 2026-07-03: Reduced MSA Subsampling Depth in Fast Mode.

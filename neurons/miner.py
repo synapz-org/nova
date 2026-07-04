@@ -1981,10 +1981,27 @@ async def run_boltz_prescoring(state: Dict[str, Any], max_candidates: int = 5) -
         if _mm_all_scored else None
     )
     _mm_savi_pool = _hhhhhh_pool if _hhhhhh_pool is not None else state.get('savi_stream_pool')
-    # 10 rounds: on A100 the time guard fires after ~7 rounds anyway; on RTX 3090
-    # it fires after 0-1 rounds.  The higher cap lets fast hardware fully utilise
-    # the epoch budget without artificially stopping early.
-    _mm_max_rounds = 10
+    # §KKKKKK: Hardware-adaptive §MM max rounds.  BoltzWrapper (instantiated above)
+    # already probed VRAM and patched config: §XXXXX sets num_subsampled_msa=4096 on
+    # H100 (≥70 GiB); §AAA sets 2048 on A100 (≥38 GiB).  Reading back the patched
+    # config value reuses that detection without a second GPU probe and stays consistent
+    # with the VRAM tiers used throughout the wrapper.
+    #
+    # Budget analysis (first epoch, 1200 s trigger window, all cache misses):
+    #   H100 (~25 s/mol): initial 125 s + §FF 75 s → 1000 s §MM budget → ~17 rounds
+    #                     Previous cap of 10 left ~7 rounds unused on H100.
+    #   A100 (~45 s/mol): initial 225 s + §FF 100 s → 875 s §MM budget → ~9–10 rounds
+    #                     Cap of 10 coincides with time ceiling on A100.
+    #   RTX 3090 (~150 s/mol): time guard fires after 0–2 rounds — cap not relevant.
+    #
+    # Epochs 2+ (adaptive trigger, warm disk cache): §MM gets 1–3 rounds on all
+    # hardware tiers due to the shorter trigger window; cap is not binding.
+    _kkkkkk_msa = wrapper.config.get('num_subsampled_msa', 1024)
+    if _kkkkkk_msa >= 4096:    # §XXXXX H100 tier (≥70 GiB VRAM)
+        _mm_max_rounds = 20
+        bt.logging.info("[§KKKKKK] H100 tier detected → _mm_max_rounds=20")
+    else:
+        _mm_max_rounds = 10    # A100 / RTX 3090 / default — time guard is active limit
     _mm_stop = False
 
     if (
