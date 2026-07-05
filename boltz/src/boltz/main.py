@@ -1048,7 +1048,7 @@ def predict(  # noqa: C901, PLR0915, PLR0912
             "recycling_steps": recycling_steps_affinity,
             "sampling_steps": sampling_steps_affinity,
             "diffusion_samples": diffusion_samples_affinity,
-            "max_parallel_samples": 1,
+            "max_parallel_samples": max_parallel_samples,
             "write_confidence_summary": False,
             "write_full_pae": False,
             "write_full_pde": False,

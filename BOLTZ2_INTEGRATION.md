@@ -4855,3 +4855,76 @@ winner has strictly lower target_LE.  All other paths are unaffected.
 
 **Files changed:** `neurons/miner.py` — §VVVV guard block inserted before the name-lookup /
 swap logic inside the `if len(_uuuu_selectivity) >= 2:` block of §UUUU.
+
+---
+
+## Current Status (as of 2026-07-05)
+
+§LLLLLL added 2026-07-05: Parallel Affinity Diffusion Samples on H100 + Bug Fix.
+
+**§LLLLLL — `max_parallel_samples` H100 Tier + Hardcoded-1 Bug Fix (`boltz/src/boltz/main.py`, `boltz/wrapper.py`, `boltz/boltz_config.yaml`)**
+
+**Bug found:**
+
+`boltz/src/boltz/main.py` in the `predict()` function builds two separate argument dicts — one for structure prediction and one for affinity prediction.  The structure dict correctly passed the function parameter:
+
+```python
+max_parallel_samples = max_parallel_samples,   # structure — correct
+```
+
+But the affinity dict hardcoded:
+
+```python
+"max_parallel_samples": 1,   # affinity — BUG: ignores function parameter
+```
+
+This meant that even with `diffusion_samples_affinity=3` (our default), all three affinity diffusion samples always ran **serially** — the parallelism parameter was accepted by `predict()` but silently discarded at the affinity path.  On H100 (≥70 GiB) where 3 samples fit in a single memory-efficient batch, this wastes ~2/3 of affinity inference throughput.
+
+**Fix — three files changed:**
+
+**1. `boltz/src/boltz/main.py` (line ~1054)**
+```python
+# Before
+"max_parallel_samples": 1,
+# After
+"max_parallel_samples": max_parallel_samples,
+```
+
+**2. `boltz/wrapper.py` — H100 hardware-adaptive block in `__init__`**
+```python
+# §LLLLLL: H100 can batch all 3 affinity diffusion samples simultaneously.
+# This is safe now that the bug (hardcoded 1 in boltz/src/boltz/main.py) is fixed.
+if vram_gib >= 70:
+    self.config['max_parallel_samples'] = 3
+    bt.logging.info("[§LLLLLL] H100 tier: max_parallel_samples=3 for parallel affinity diffusion")
+```
+
+**3. `boltz/wrapper.py` — `predict()` call in `score_molecules_target`**
+```python
+max_parallel_samples = self.config.get('max_parallel_samples', 1),
+```
+
+**4. `boltz/boltz_config.yaml`**
+```yaml
+max_parallel_samples: 1   # §LLLLLL: set to 3 automatically on H100 ≥70 GiB
+```
+
+**Expected impact:**
+
+| Hardware | `diffusion_samples_affinity` | Before §LLLLLL | After §LLLLLL |
+|----------|------------------------------|----------------|---------------|
+| H100 ≥70 GiB | 3 | 3 serial batches | 1 batch (3 samples together) |
+| A100 / RTX | 3 | 3 serial (correct — stays serial) | unchanged |
+
+On H100, affinity scoring throughput for `diffusion_samples_affinity=3` improves ~2–3×.
+Each §MM round or fast-screen call that was paying for 3 serial affinity passes now pays for ~1.3–1.5×
+(one batch + overhead).  Net: ~1–2 additional §MM rounds per epoch on H100-class hardware.
+
+**Zero regression:** Default `max_parallel_samples=1` is unchanged for all non-H100 hardware.
+The config key defaults to 1 via `self.config.get('max_parallel_samples', 1)` so the call is always safe.
+The bug fix in `boltz/src/boltz/main.py` has zero effect on hardware where `max_parallel_samples` remains 1.
+
+**Files changed:**
+- `boltz/src/boltz/main.py`: `"max_parallel_samples": 1` → `"max_parallel_samples": max_parallel_samples` in `predict_affinity_args`
+- `boltz/wrapper.py`: §LLLLLL block in `__init__` H100 tier; `max_parallel_samples` kwarg added to `predict()` call
+- `boltz/boltz_config.yaml`: `max_parallel_samples: 1` config key with comment

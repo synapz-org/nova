@@ -45,6 +45,15 @@ step_scale: null
 subsample_msa: true
 num_subsampled_msa: 1024
 
+# Parallel diffusion samples for affinity prediction.
+# When diffusion_samples_affinity > 1, controls how many samples run simultaneously.
+# max_parallel_samples=1 (default): serial, lowest memory.
+# max_parallel_samples=3: all samples in one batch — ~2-3x faster on H100 80 GB;
+#   set automatically via §LLLLLL hardware-adaptive logic in wrapper.py on ≥70 GiB GPUs.
+# Note: structure prediction always uses 1 sample (diffusion_samples=1), so this
+# parameter only matters for the affinity model.
+max_parallel_samples: 1
+
 # I/O parallelism for data loading and preprocessing.
 # Increase on machines with many CPU cores and fast NVMe storage.
 # Reduce to 1/1 if PSICHIC and Boltz share CPU workers and cause contention.

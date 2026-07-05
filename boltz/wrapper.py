@@ -92,6 +92,26 @@ class BoltzWrapper:
                                 f"[§XXXXX] H100 tier affinity steps: {vram_gib:.0f} GiB VRAM → "
                                 f"sampling_steps_affinity=200"
                             )
+                        # §LLLLLL: Parallel affinity samples on H100.
+                        # diffusion_samples_affinity=3 generates 3 independent binding-energy
+                        # estimates that are averaged to reduce variance.  With max_parallel_samples=1
+                        # (the library default and prior hardcoded value in main.py predict_affinity_args),
+                        # these run SERIALLY — the H100 spends 2/3 of its affinity budget doing
+                        # identical sequential passes.  Setting max_parallel_samples=3 batches all
+                        # 3 samples into one forward pass, reducing affinity wall time by ~2-3× at
+                        # the cost of 3× the activation memory for the diffusion state tensors.
+                        # H100 80 GB HBM3 has ample headroom even at num_subsampled_msa=4096:
+                        # model weights (~10 GB) + MSA attention (~20 GB) + 3× diffusion state
+                        # (~15-24 GB) ≈ 45-54 GB — well within 80 GB.
+                        # A100 80 GB is intentionally excluded: with use_potentials=True and
+                        # num_subsampled_msa=2048 the memory budget is tighter; enable with
+                        # empirical testing by setting max_parallel_samples: 3 in boltz_config.yaml.
+                        if self.config.get('max_parallel_samples', 1) < 3:
+                            self.config['max_parallel_samples'] = 3
+                            bt.logging.info(
+                                f"[§LLLLLL] H100 tier parallel samples: {vram_gib:.0f} GiB VRAM → "
+                                f"max_parallel_samples=3 (affinity 3× faster)"
+                            )
         except Exception:
             pass
 
@@ -267,6 +287,7 @@ properties:
                 subsample_msa = self.config.get('subsample_msa', True),
                 num_subsampled_msa = _n_msa,
                 recycling_steps_affinity = _recycle_aff,
+                max_parallel_samples = self.config.get('max_parallel_samples', 1),
             )
             _elapsed = time.time() - _t0
             if not fast:
