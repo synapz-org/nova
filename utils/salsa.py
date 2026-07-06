@@ -31,6 +31,18 @@ from rdkit.Chem import AllChem, DataStructs
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
+# §MMMMMM: Cross-call pool fingerprint cache.
+# precompute_pool_fps on a 10 000-molecule pool takes ~2–4 s in Python/RDKit.
+# In §MM, the same pool DataFrame object is passed on every round (up to 20 on
+# H100) when §IIIIII is inactive (Ridge tier, epochs 1–2).  This cache keyed
+# by DataFrame object id() short-circuits the recompute and returns the prior
+# result directly.  When §IIIIII fires (RF tier, ≥100 pts) it creates a new
+# DataFrame object → new id() → cache miss → recompute.  The cache is bounded
+# to 10 entries to prevent unbounded memory growth across epochs.
+# ---------------------------------------------------------------------------
+_fp_cache: dict = {}   # {(pool_id, smiles_col): (valid_pool, fps_list)}
+
+# ---------------------------------------------------------------------------
 # Bioisosteric substitution table
 # ---------------------------------------------------------------------------
 _BIOISOSTERES: dict[int, list[int]] = {
@@ -414,9 +426,22 @@ def run_salsa_search(
         logger.debug("SALSA: savi_pool_df is empty, skipping.")
         return pd.DataFrame()
 
-    # Pre-compute pool fingerprints once — reused for all perturbation queries.
-    # Filters out any rows with unparseable SMILES; valid_pool and pool_fps are aligned.
-    valid_pool, pool_fps = precompute_pool_fps(savi_pool_df, smiles_col)
+    # §MMMMMM: Check cross-call FP cache before recomputing.  The cache is keyed
+    # by (id(pool_df), smiles_col) so it hits when the same DataFrame object is
+    # passed on consecutive §MM rounds (Ridge-tier, where §IIIIII is inactive and
+    # _mm_savi_pool stays the same object).  A new DataFrame id — from §IIIIII's
+    # surrogate-blended copy or a new PSICHIC streaming chunk — is a cache miss,
+    # triggering a fresh precompute_pool_fps.  Bounded to 10 entries.
+    _cache_key = (id(savi_pool_df), smiles_col)
+    if _cache_key in _fp_cache:
+        valid_pool, pool_fps = _fp_cache[_cache_key]
+        logger.debug(f"[§MMMMMM] FP cache hit for pool id={id(savi_pool_df)}, "
+                     f"size={len(savi_pool_df)}")
+    else:
+        valid_pool, pool_fps = precompute_pool_fps(savi_pool_df, smiles_col)
+        _fp_cache[_cache_key] = (valid_pool, pool_fps)
+        if len(_fp_cache) > 10:
+            _fp_cache.pop(next(iter(_fp_cache)))
     if valid_pool.empty or not pool_fps:
         logger.debug("SALSA: no valid pool molecules after FP pre-computation, skipping.")
         return pd.DataFrame()

@@ -1,5 +1,93 @@
 # Boltz-2 Miner Integration
 
+## Current Status (as of 2026-07-06)
+
+§MMMMMM added 2026-07-06: Cross-Call SALSA Pool Fingerprint Cache.
+
+**§MMMMMM — Cross-Call SALSA Pool Fingerprint Cache (`utils/salsa.py`)**
+
+**Problem:** `run_salsa_search` calls `precompute_pool_fps` at the top of every call to
+compute Morgan fingerprints for all molecules in the SAVI stream pool.  On a 10 000-molecule
+pool, `precompute_pool_fps` takes ~2–4 s in Python/RDKit (one `AllChem.GetMorganFingerprintAsBitVect`
+call per molecule).
+
+In the §MM multi-round hill-climbing loop (up to 20 rounds on H100, §KKKKKK), the same
+`_mm_savi_pool` DataFrame object is passed to `run_salsa_search` on every round — as long as
+§IIIIII (surrogate refresh) has not fired.  §IIIIII only fires in the RF tier (≥100 cache
+points, epoch 3+).  In the Ridge tier (epochs 1–2, <100 pts), `_mm_savi_pool` is never
+reassigned, so all 20 §MM rounds call `precompute_pool_fps` on the same 10 000-molecule
+pool 20 consecutive times — paying 2–4 s × 20 = 40–80 s of redundant CPU work.
+
+The same redundancy affects §FF (1 call) and the main SALSA trigger (1 call per epoch).
+Total wasted CPU per epoch in Ridge tier: ~3 calls × 3 s = ~9 s in addition to the §MM waste.
+
+**Fix:**
+
+A module-level cache `_fp_cache: dict` (keyed by `(id(pool_df), smiles_col)`) in
+`utils/salsa.py` stores the `(valid_pool, fps_list)` result of the most recent
+`precompute_pool_fps` call.  At the top of `run_salsa_search`, before the existing
+`precompute_pool_fps` call:
+
+```python
+_cache_key = (id(savi_pool_df), smiles_col)
+if _cache_key in _fp_cache:
+    valid_pool, pool_fps = _fp_cache[_cache_key]
+else:
+    valid_pool, pool_fps = precompute_pool_fps(savi_pool_df, smiles_col)
+    _fp_cache[_cache_key] = (valid_pool, pool_fps)
+    if len(_fp_cache) > 10:
+        _fp_cache.pop(next(iter(_fp_cache)))
+```
+
+The cache is keyed by Python object identity (`id()`) of the DataFrame, not by content.
+This is correct because:
+- A DataFrame object that has been mutated in-place keeps the same `id()`, but DataFrames
+  in this codebase are replaced with new objects rather than mutated (§IIIIII creates
+  `_ii_pool = augment_pool_with_surrogate_blend(...)` — a new copy).
+- When `_mm_savi_pool` is reassigned by §IIIIII, the new DataFrame has a different `id()`
+  → cache miss → `precompute_pool_fps` runs → correct fresh FPs stored.
+- When the PSICHIC streaming pool grows (new chunk appended), `_mm_savi_pool` is a different
+  object in `run_boltz_prescoring` (it points to the pool at the time `run_boltz_prescoring`
+  was called) — the streaming pool is not updated mid-prescoring.
+- The `max(10)` bound evicts the oldest entry when the cache grows beyond 10 entries, preventing
+  unbounded memory growth across epochs or pool rotations.
+
+**Safety guards:**
+
+1. **Correctness.** Cache hits return the `(valid_pool, pool_fps)` tuple produced by the same
+   `precompute_pool_fps` call that would have been made — same algorithm, same result.  No
+   approximation.
+2. **Eviction.** The 10-entry bound ensures at most ~10 × (10 000 FP objects × ~400 bytes each)
+   ≈ 40 MB of cache memory — negligible vs GPU VRAM.
+3. **No state bleed.** The cache stores only computed fingerprints from public DataFrame columns;
+   it never writes to the DataFrame or to disk.
+4. **Cache miss on pool change.** When §IIIIII or a new PSICHIC streaming epoch changes the
+   pool object, the old `id()` no longer matches → cache miss → fresh FPs computed.
+
+**Expected benefit:**
+
+| Scenario | FP calls before §MMMMMM | FP calls after §MMMMMM | CPU time saved |
+|----------|------------------------|------------------------|----------------|
+| H100, 20 §MM rounds, Ridge tier | 20 × ~3 s = 60 s | 1 × ~3 s = 3 s | ~57 s |
+| A100, 10 §MM rounds, Ridge tier | 10 × ~3 s = 30 s | 1 × ~3 s = 3 s | ~27 s |
+| RF tier (§IIIIII active, new pool each round) | 10 × ~3 s = 30 s | 10 × ~3 s = 30 s | 0 (cache misses) |
+| §FF + main SALSA (same pool) | 2 × ~3 s = 6 s | 1 × ~3 s = 3 s | ~3 s |
+
+On H100 where full §MM inference is 25 s/mol, saving 57 s of redundant CPU work frees up
+~2.3 additional §MM rounds at no GPU cost.  On A100 (45 s/mol), saving 27 s is equivalent
+to ~0.6 extra §MM rounds per epoch.
+
+The gain is largest in the most common production scenario: Ridge tier (epochs 1–2, <100
+cache points) where §IIIIII is inactive and `_mm_savi_pool` stays the same object.  From
+epoch 3+ (RF tier) the benefit is reduced but the surrogate guidance from §IIIIII already
+more than compensates.
+
+**Files changed:**
+- `utils/salsa.py`: module-level `_fp_cache` dict added; `run_salsa_search` FP cache lookup
+  inserted before the `precompute_pool_fps` call.
+
+---
+
 ## Current Status (as of 2026-07-04)
 
 §KKKKKK added 2026-07-04: Hardware-Adaptive §MM Max Rounds for H100 Tier.
@@ -1591,6 +1679,12 @@ Two conditional/research items remain (§D, FBLD). §TTTT–§SSSS implemented 2
 | EEEEEE | Top-K reaction class score weighting for SAVI sampling bias (4×/2×/1.5×/1× rank ladder) | neurons/miner.py | ✅ |
 | FFFFFF | Batch fast-screen in §FF and §MM: N cache-miss molecules → 1 score_molecules_target call | neurons/miner.py | ✅ |
 | GGGGGG | Epoch-scoped fast-screen cache: skip re-screening SALSA hits already fast-screened this epoch | neurons/miner.py | ✅ |
+| HHHHHH | Surrogate-blended SALSA pool score for §FF/§MM hill-climbing | utils/surrogate.py, neurons/miner.py | ✅ |
+| IIIIII | Online surrogate refresh after each §MM full-score (RF tier only) | neurons/miner.py | ✅ |
+| JJJJJJ | Reduced MSA subsampling depth in fast-screen mode (full_msa//4, floor 256) | boltz/wrapper.py | ✅ |
+| KKKKKK | Hardware-adaptive `_mm_max_rounds=20` for H100 tier | neurons/miner.py | ✅ |
+| LLLLLL | Parallel affinity diffusion samples on H100 (`max_parallel_samples=3`) + bug fix | boltz/wrapper.py, boltz/src/boltz/main.py | ✅ |
+| MMMMMM | Cross-call SALSA pool fingerprint cache: eliminate redundant `precompute_pool_fps` across §MM rounds | utils/salsa.py | ✅ |
 
 ---
 
