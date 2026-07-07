@@ -1,6 +1,61 @@
 # Boltz-2 Miner Integration
 
-## Current Status (as of 2026-07-06)
+## Current Status (as of 2026-07-07)
+
+§NNNNNN added 2026-07-07: §NN Two-Phase Screening + FP Cache for §XX Tautomer Search.
+
+**§NNNNNN — §NN Two-Phase Screening + FP Cache for §XX Tautomer Search (`neurons/miner.py`, `utils/salsa.py`)**
+
+**Problem:** The §XX tautomer search scored each tautomer SAVI neighbour with a separate
+full-quality Boltz-2 call (up to 6 sequential full calls).  Two additional inefficiencies:
+
+1. **FP cache bypass:** §XX called `precompute_pool_fps` directly, bypassing the §MMMMMM
+   module-level `_fp_cache`.  Since §XX runs after §MM, the FP cache was already warm from
+   §MM rounds on the same DataFrame object — yet §XX recomputed all fingerprints from scratch,
+   wasting ~2–4 s of CPU.
+
+2. **No two-phase screening:** Instead of batch fast-screening candidates to find the best
+   before committing a full Boltz call, §XX scored tautomers one by one in a sequential
+   loop — paying full Boltz cost (100 diffusion steps + 5 recycling steps) for every
+   candidate regardless of quality.  With 6 candidates this means up to 6 full Boltz calls
+   where only 1 is needed.
+
+3. **Conservative time guard:** The outer time check used `> _xx_t_mol + 60 s`, which meant
+   §XX would skip entirely on shorter epochs even though the two-phase approach only needs
+   `1 fast-batch + 1 full call` ≈ `_xx_t_mol + 30 s`.
+
+**Fix:**
+
+Two changes:
+
+*`utils/salsa.py`* — adds `get_cached_pool_fps(pool_df, smiles_col)` as a public cache-backed
+wrapper for `precompute_pool_fps`.  It checks the same `_fp_cache` dict used by
+`run_salsa_search`, stores the result on miss, and enforces the 10-entry LRU bound.
+Callers outside `run_salsa_search` (§XX, future stages) can now reuse warm FPs without
+re-importing or duplicating the cache logic.
+
+*`neurons/miner.py` §XX section* — restructured into three phases:
+
+- **Phase 0:** collect all ≤6 unique SAVI neighbours upfront (no Boltz calls yet), using
+  `get_cached_pool_fps` instead of `precompute_pool_fps`.
+- **Phase 1:** for each candidate, check `boltz_cache` → `_epoch_fast_cache` (§GGGGGG) →
+  add to miss list.  Batch all misses into a single `score_molecules_target(..., fast=True)`
+  call (§FFFFFF pattern), then populate `_epoch_fast_cache` with results.
+- **Phase 2:** `winner = max(_xx_screen, key=score)` → full-score only the winner (1 Boltz
+  call).  Cache winner score to `boltz_cache` + disk (same as before).
+
+Time guard lowered from `> _xx_t_mol + 60` to `> _xx_t_mol + 30` since only one full Boltz
+call is now required.
+
+**Expected savings per epoch (typical):**
+- FP cache hit: saves ~2–4 s CPU (§MMMMMM FP recompute avoided)
+- Fast-screen batch: saves 2–5 full Boltz calls (~5–12 min GPU time per epoch on RTX 3090)
+- Total: §XX now costs `1 fast-batch (~30 s) + 1 full call (~150 s)` vs `up to 6 full
+  calls (~900 s)` — ~5× reduction in §XX Boltz budget, freeing more time for §WW / §UUUU.
+
+---
+
+## Previous Entries
 
 §MMMMMM added 2026-07-06: Cross-Call SALSA Pool Fingerprint Cache.
 

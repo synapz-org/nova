@@ -107,6 +107,27 @@ def precompute_pool_fps(
     return valid_df, fps
 
 
+def get_cached_pool_fps(
+    pool_df: pd.DataFrame,
+    smiles_col: str = 'product_smiles',
+) -> Tuple[pd.DataFrame, List]:
+    """
+    §NNNNNN: Cache-backed wrapper for precompute_pool_fps.
+    Uses the same module-level _fp_cache (§MMMMMM) as run_salsa_search, so
+    callers outside run_salsa_search (e.g., §XX in miner.py) can reuse pool
+    FPs already computed during §MM rounds on the same DataFrame object.
+    """
+    _cache_key = (id(pool_df), smiles_col)
+    if _cache_key in _fp_cache:
+        logger.debug(f"[§NNNNNN/get_cached_pool_fps] FP cache hit for pool id={id(pool_df)}")
+        return _fp_cache[_cache_key]
+    valid_pool, pool_fps = precompute_pool_fps(pool_df, smiles_col)
+    _fp_cache[_cache_key] = (valid_pool, pool_fps)
+    if len(_fp_cache) > 10:
+        _fp_cache.pop(next(iter(_fp_cache)))
+    return valid_pool, pool_fps
+
+
 # ---------------------------------------------------------------------------
 # Perturbation operators
 # ---------------------------------------------------------------------------
