@@ -385,6 +385,8 @@ All items 1–10 are **implemented**. Items 5 and 7 remain as conditional/resear
 | 21 | §JJJJJJ: Reduced MSA subsampling depth in fast-screen mode (full_msa//4, floor 256) | 12 lines | ✅ Done | ~8–12 s saved per fast-screen molecule on A100; ~0.5–0.8 extra §MM rounds per epoch |
 | 22 | §LLLLLL: Parallel affinity diffusion samples on H100 (max_parallel_samples=3) | 8 lines | ✅ Done | ~2–3× throughput for diffusion_samples_affinity=3 on H100 ≥70 GiB; also fixed bug where `max_parallel_samples` was hardcoded to 1 in `boltz/src/boltz/main.py` regardless of config |
 | 23 | §MMMMMM: Cross-call SALSA pool FP cache — eliminate redundant `precompute_pool_fps` across §MM rounds | 15 lines | ✅ Done | ~57 s saved on H100 (20 rounds, Ridge tier); ~27 s on A100 (10 rounds); ~2–3 extra §MM rounds on H100 at no GPU cost |
+| 24 | §NNNNNN: §NN two-phase screening + FP cache for §XX tautomer search | 60 lines | ✅ Done | §XX reduced from up to 6 full Boltz calls to 1 fast-batch + 1 full call; ~5× GPU time reduction per epoch |
+| 25 | §OOOOOO: Cache-evidence adaptive §TTTT fragment quota (500/1000/2500 based on per-bucket Boltz LE) | 45 lines | ✅ Done | Protein-adaptive fragment slot sizing; more small-molecule diversity when ≤18-HA molecules historically outperform |
 
 All approaches share the same submission constraint: molecules must map to valid SAVI-2020
 product names. SALSA and GradientGA both solve this via nearest-neighbour SAVI-2020 lookup.

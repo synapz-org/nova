@@ -331,6 +331,43 @@ def _load_rxn_class_weights(db_path: str) -> Dict[str, float]:
         return {}
 
 
+def _compute_ha_bucket_le(db_path: str, protein: str) -> tuple:
+    """
+    §OOOOOO: Return (avg_le_frag, avg_le_drug, n_frag, n_drug) from the Boltz
+    disk cache for *protein*.  'frag' = ≤18 heavy atoms; 'drug' = >18.
+
+    Used to adapt the §TTTT fragment-slot quota toward evidence-based sizing:
+    if historical small-molecule Boltz scores consistently exceed drug-like scores,
+    more pool slots should be reserved for the ≤18-HA bucket.
+
+    Returns (None, None, 0, 0) when the cache is empty, unavailable, or the
+    SMILES cannot be parsed — all safe fallback cases for the caller.
+    """
+    try:
+        with sqlite3.connect(db_path) as conn:
+            rows = conn.execute(
+                "SELECT smiles, score FROM boltz_cache WHERE protein=? AND score > -1e9",
+                (protein,),
+            ).fetchall()
+        if not rows:
+            return (None, None, 0, 0)
+        frag_scores: List[float] = []
+        drug_scores: List[float] = []
+        for smiles, score in rows:
+            ha = get_heavy_atom_count(smiles)
+            if ha is None:
+                continue
+            if ha <= 18:
+                frag_scores.append(score)
+            else:
+                drug_scores.append(score)
+        avg_frag = sum(frag_scores) / len(frag_scores) if frag_scores else None
+        avg_drug = sum(drug_scores) / len(drug_scores) if drug_scores else None
+        return (avg_frag, avg_drug, len(frag_scores), len(drug_scores))
+    except Exception:
+        return (None, None, 0, 0)
+
+
 def _cross_target_seeds_from_cache(
     db_path: str,
     current_protein: str,
@@ -790,9 +827,11 @@ async def run_psichic_model_loop(state: Dict[str, Any]) -> None:
                         # HA) fill the remaining 9,000 slots sorted by combined_score.
                         # NaN heavy_atoms (should not occur but defensive) are treated as
                         # drug-like (25 HA assumed) to avoid accidental fragment mis-count.
+                        # §OOOOOO: quota adapts at startup from Boltz cache evidence.
+                        _tttt_quota = state.get('tttt_fragment_quota', 1000)
                         _tttt_ha = _pool_combined['heavy_atoms'].fillna(25)
-                        _tttt_frags = _pool_combined[_tttt_ha <= 18].head(1000)
-                        _tttt_rest  = _pool_combined[_tttt_ha  > 18].head(9000)
+                        _tttt_frags = _pool_combined[_tttt_ha <= 18].head(_tttt_quota)
+                        _tttt_rest  = _pool_combined[_tttt_ha  > 18].head(10000 - _tttt_quota)
                         _pool_capped = pd.concat([_tttt_frags, _tttt_rest], ignore_index=True)
                         _pool_capped.drop_duplicates(subset=['product_name'], inplace=True)
                         _pool_capped.sort_values('combined_score', ascending=False, inplace=True)
@@ -3047,6 +3086,10 @@ async def run_miner(config: argparse.Namespace) -> None:
         # §WWWWW: SMILES from homologous prior-target proteins (populated before
         # cache cleanup so prior-protein rows are still readable).
         'cross_target_seeds': [],
+
+        # §OOOOOO: Adaptive §TTTT fragment-slot quota (adapted at startup from
+        # Boltz cache evidence; 1000 default until sufficient data exists).
+        'tttt_fragment_quota': 1000,
     }
 
     # Ensure persistent Boltz cache DB exists
@@ -3109,6 +3152,44 @@ async def run_miner(config: argparse.Namespace) -> None:
             f"top-3: {_eeeeee_top} "
             f"(weights {[_eeeeee_weights[c] for c in _eeeeee_top]})"
         )
+
+    # §OOOOOO: Adapt §TTTT fragment-slot quota using Boltz cache evidence.
+    # Default: 1000/10000 slots for ≤18-HA molecules (§TTTT).
+    # With ≥10 scored fragments AND ≥10 scored drug-like molecules in cache:
+    #   avg_le_frag > avg_le_drug × 1.20 → quota=2500 (fragments outperform)
+    #   avg_le_frag < avg_le_drug          → quota=500  (drug-like outperform)
+    #   otherwise                           → quota=1000 (parity, keep default)
+    # Requires ≥10 data points per bucket to avoid adapting on a handful of noisy
+    # measurements.  Falls back to 1000 silently on insufficient data or any error.
+    _oooooo_af, _oooooo_ad, _oooooo_nf, _oooooo_nd = _compute_ha_bucket_le(
+        state['boltz_cache_db'], config.weekly_target
+    )
+    if (
+        _oooooo_af is not None and _oooooo_ad is not None
+        and _oooooo_nf >= 10 and _oooooo_nd >= 10
+    ):
+        if _oooooo_af > _oooooo_ad * 1.20:
+            state['tttt_fragment_quota'] = 2500
+            bt.logging.info(
+                f"[§OOOOOO] Fragments outperform drug-like "
+                f"(avg_LE {_oooooo_af:.4f} vs {_oooooo_ad:.4f}, "
+                f"n={_oooooo_nf}/{_oooooo_nd}) → §TTTT quota=2500"
+            )
+        elif _oooooo_af < _oooooo_ad:
+            state['tttt_fragment_quota'] = 500
+            bt.logging.info(
+                f"[§OOOOOO] Drug-like outperform fragments "
+                f"(avg_LE {_oooooo_af:.4f} vs {_oooooo_ad:.4f}, "
+                f"n={_oooooo_nf}/{_oooooo_nd}) → §TTTT quota=500"
+            )
+        else:
+            state['tttt_fragment_quota'] = 1000
+            bt.logging.info(
+                f"[§OOOOOO] Fragment/drug-like parity "
+                f"(avg_LE {_oooooo_af:.4f} vs {_oooooo_ad:.4f}) → §TTTT quota=1000"
+            )
+    else:
+        state['tttt_fragment_quota'] = 1000  # insufficient cache data — keep default
 
     # Warm epoch start (§AA): pre-populate candidate_product from best cached result.
     # On first run the cache is empty; on subsequent runs this gives an immediate

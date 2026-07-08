@@ -1,6 +1,12 @@
 # Boltz-2 Miner Integration
 
-## Current Status (as of 2026-07-07)
+## Current Status (as of 2026-07-08)
+
+§OOOOOO added 2026-07-08: Cache-Evidence Adaptive §TTTT Fragment Quota.
+
+---
+
+## Previous Status (as of 2026-07-07)
 
 §NNNNNN added 2026-07-07: §NN Two-Phase Screening + FP Cache for §XX Tautomer Search.
 
@@ -56,6 +62,89 @@ call is now required.
 ---
 
 ## Previous Entries
+
+§OOOOOO added 2026-07-08: Cache-Evidence Adaptive §TTTT Fragment Quota.
+
+**§OOOOOO — Cache-Evidence Adaptive §TTTT Fragment-Slot Quota (`neurons/miner.py`)**
+
+**Problem:** §TTTT reserves a static 1,000 of the 10,000 `savi_stream_pool` slots for
+≤18-HA molecules.  This default was chosen to ensure fragments appear in the pool even
+though they are numerically rarer in SAVI-2020 than drug-like compounds.
+
+However, the optimal quota is protein-dependent:
+- On targets where small molecules bind efficiently (e.g. a shallow, lipophilic pocket),
+  fragments frequently outscore drug-like molecules under the LE formula
+  `(APB − APV) / HA`.  Reserving only 1,000 slots for them may leave good fragments
+  crowded out, even when their PSICHIC-LE scores are high.
+- On targets where deep, buried binding sites favour larger ligands, fragment Boltz scores
+  are lower on average and reserving 2,500 slots costs diversity in the drug-like region
+  without benefit.
+
+The §OOOOOO optimisation makes the quota **data-driven**: after two or more epochs the
+Boltz disk cache contains per-molecule scores that reveal which HA bucket actually
+produces higher LE values for the current protein.
+
+**Fix:**
+
+Two changes:
+
+*`neurons/miner.py` — `_compute_ha_bucket_le(db_path, protein)`* — new helper function
+that queries the SQLite Boltz cache for all cached `(smiles, score)` pairs for `protein`,
+computes `heavy_atom_count` per SMILES via RDKit, and returns
+`(avg_le_frag, avg_le_drug, n_frag, n_drug)` where frag = ≤18 HA, drug = >18 HA.
+Returns `(None, None, 0, 0)` on empty cache or parse failures.
+
+*`neurons/miner.py` startup* — after §EEEEEE weights are loaded (which also queries the
+cache), call `_compute_ha_bucket_le` and set `state['tttt_fragment_quota']`:
+
+| Condition | Quota | Rationale |
+|-----------|-------|-----------|
+| avg_le_frag > avg_le_drug × 1.20 AND n_frag ≥ 10 AND n_drug ≥ 10 | 2500 | Fragments clearly outperform |
+| avg_le_frag < avg_le_drug AND n_frag ≥ 10 AND n_drug ≥ 10 | 500 | Drug-like outperform |
+| parity or insufficient data (< 10 per bucket) | 1000 | Default; no reliable signal |
+
+The 20% margin for the upper tier prevents noisy early-cache data from prematurely
+inflating the quota based on a handful of lucky fragment scores.
+
+*`neurons/miner.py` §TTTT section* — replace hardcoded `1000` and `9000` with:
+```python
+_tttt_quota = state.get('tttt_fragment_quota', 1000)
+_tttt_frags = _pool_combined[_tttt_ha <= 18].head(_tttt_quota)
+_tttt_rest  = _pool_combined[_tttt_ha  > 18].head(10000 - _tttt_quota)
+```
+
+**Safety guards:**
+
+1. **Epoch-0 safety.** When the cache is empty (first epoch, new target), both bucket
+   counts are 0 → falls back to `quota=1000` → identical to pre-§OOOOOO behaviour.
+2. **Minimum-sample guard.** Requires ≥ 10 scores per bucket before adapting.  Prevents
+   over-fitting to 2–3 lucky fragment hits in the first epoch.
+3. **Pool size unchanged.** Total pool remains capped at 10,000; only the internal split
+   between fragment and drug-like slots changes.
+4. **No cache writes.** Read-only query; does not alter cached scores or state entries.
+5. **Per-protein adaptation.** The adaptation reads from the current `config.weekly_target`
+   so a target rotation resets the quota to 1000 (empty cache for new protein) and then
+   adapts from fresh evidence over subsequent epochs.
+
+**Expected benefit:**
+
+| Scenario | Fragment slots | Drug-like slots | Effect |
+|----------|---------------|-----------------|--------|
+| Protein with efficient fragment binding (confirmed over 2+ epochs) | 2500 | 7500 | SALSA finds more ≤18-HA SAVI products; better LE ceiling |
+| Protein where larger ligands dominate (confirmed over 2+ epochs) | 500 | 9500 | More drug-like diversity; no slot wasted on fragments |
+| First epoch on any protein | 1000 | 9000 | Unchanged from §TTTT baseline |
+
+On targets where the ≤18-HA Boltz LE consistently exceeds the >18-HA average by >20%,
+the 2500-slot setting provides SALSA with 1500 additional fragment candidates to search
+over.  In a 10,000-molecule pool with 3 SALSA rounds × 200 perturbations each, an extra
+1500 fragment neighbours meaningfully expands the NN search footprint in the low-HA region.
+
+**Files changed:**
+- `neurons/miner.py`: `_compute_ha_bucket_le` helper added after `_load_rxn_class_weights`;
+  §OOOOOO startup block added after §EEEEEE weights block; `state` initialisation includes
+  `'tttt_fragment_quota': 1000`; §TTTT pool section uses `_tttt_quota` variable.
+
+---
 
 §MMMMMM added 2026-07-06: Cross-Call SALSA Pool Fingerprint Cache.
 
