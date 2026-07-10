@@ -37,6 +37,8 @@ from config.config_loader import load_config
 from utils import (
     get_sequence_from_protein_code,
     upload_file_to_github,
+    upload_boltz_cache_export,
+    download_boltz_cache_export,
     get_challenge_params_from_blockhash,
     get_heavy_atom_count,
     compute_maccs_entropy,
@@ -1278,6 +1280,17 @@ async def submit_response(state: Dict[str, Any]) -> None:
                     bt.logging.info(f"File uploaded successfully to {commit_content}")
                     state['last_submitted_product'] = candidate_product
                     state['last_submission_time'] = datetime.datetime.now()
+                    # §PPPPPP: Export Boltz cache to GitHub so it survives container
+                    # restarts (boltz_score_cache.db is gitignored and ephemeral).
+                    try:
+                        _pp_db = state.get('boltz_cache_db', BOLTZ_CACHE_DB)
+                        _pp_protein = state['config'].weekly_target
+                        if upload_boltz_cache_export(_pp_db, _pp_protein):
+                            bt.logging.info("[§PPPPPP] Boltz cache exported to GitHub.")
+                        else:
+                            bt.logging.debug("[§PPPPPP] Cache export skipped or failed.")
+                    except Exception as _pp_err:
+                        bt.logging.warning(f"[§PPPPPP] Cache export non-fatal: {_pp_err}")
                 else:
                     bt.logging.error(f"Failed to upload file to GitHub for {commit_content}")
             except Exception as e:
@@ -3111,6 +3124,55 @@ async def run_miner(config: argparse.Namespace) -> None:
 
     _cleanup_boltz_cache(state['boltz_cache_db'], keep_protein=config.weekly_target)
     bt.logging.info(f"Boltz persistent cache initialised: {state['boltz_cache_db']}")
+
+    # §PPPPPP: Download and import Boltz cache export from the miner's GitHub repo.
+    # boltz_score_cache.db is gitignored and ephemeral: every fresh container start
+    # loses all scored molecules, making §BBBBB/§CCCCCC/§EEEEEE start cold for epoch 1.
+    # §PPPPPP uploads a compact JSON export (top-500 entries + miner_state) at each
+    # successful submission and re-imports it here so the surrogate, adaptive timing,
+    # and reaction-class weights are warm from the very first epoch of any new session.
+    # Runs BEFORE §BBBBB/§CCCCCC/§EEEEEE so those restores find populated miner_state
+    # rows even on a fresh container with an otherwise empty SQLite DB.
+    try:
+        _pppppp_data = download_boltz_cache_export(config.weekly_target)
+        if _pppppp_data:
+            _pppppp_entries = _pppppp_data.get('entries', [])
+            _pppppp_imported = 0
+            if _pppppp_entries:
+                with sqlite3.connect(state['boltz_cache_db']) as _pp_conn:
+                    for _e in _pppppp_entries:
+                        try:
+                            cur = _pp_conn.execute(
+                                "INSERT OR IGNORE INTO boltz_cache "
+                                "(smiles, protein, score, ts, product_name, "
+                                "affinity_prob_binary, affinity_pred_val, ligand_iptm) "
+                                "VALUES (?,?,?,?,?,?,?,?)",
+                                (
+                                    _e['smiles'], config.weekly_target,
+                                    _e['score'], 0,
+                                    _e.get('product_name') or '',
+                                    _e.get('apb'), _e.get('apv'), _e.get('ligand_iptm'),
+                                ),
+                            )
+                            if cur.rowcount:
+                                _pppppp_imported += 1
+                        except Exception:
+                            pass
+            _pppppp_state = _pppppp_data.get('state', {})
+            for _pk in ('boltz_time_per_mol', 'boltz_trigger_blocks'):
+                if _pk in _pppppp_state and _load_miner_state(state['boltz_cache_db'], _pk) is None:
+                    _save_miner_state(state['boltz_cache_db'], _pk, float(_pppppp_state[_pk]))
+            for _pk in ('best_boltz_rxn_class', 'rxn_class_scores_json'):
+                if _pk in _pppppp_state and _load_miner_state_text(state['boltz_cache_db'], _pk) is None:
+                    _save_miner_state_text(state['boltz_cache_db'], _pk, str(_pppppp_state[_pk]))
+            bt.logging.info(
+                f"[§PPPPPP] Imported {_pppppp_imported}/{len(_pppppp_entries)} cache entries "
+                f"from GitHub export (protein={config.weekly_target!r})."
+            )
+        else:
+            bt.logging.debug("[§PPPPPP] No GitHub cache export found for current protein — cold start.")
+    except Exception as _pppppp_err:
+        bt.logging.warning(f"[§PPPPPP] Cache import failed (non-fatal): {_pppppp_err}")
 
     # §BBBBB: Restore adaptive timing from disk so fast-GPU miners (A100/H100) use
     # the correct boltz_trigger_blocks from epoch 1 after a process restart instead

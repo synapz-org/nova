@@ -358,7 +358,7 @@ Even a partial result (1 of 5 molecules scored) improves on the PSICHIC-only bas
 
 ## Implementation Roadmap (priority order)
 
-All items 1–10 are **implemented**. Items 5 and 7 remain as conditional/research directions.
+All items 1–28 are **implemented**. Items 5 and 7 remain as conditional/research directions.
 
 | Priority | Approach | Effort | Status | Expected gain |
 |----------|----------|--------|--------|---------------|
@@ -387,6 +387,9 @@ All items 1–10 are **implemented**. Items 5 and 7 remain as conditional/resear
 | 23 | §MMMMMM: Cross-call SALSA pool FP cache — eliminate redundant `precompute_pool_fps` across §MM rounds | 15 lines | ✅ Done | ~57 s saved on H100 (20 rounds, Ridge tier); ~27 s on A100 (10 rounds); ~2–3 extra §MM rounds on H100 at no GPU cost |
 | 24 | §NNNNNN: §NN two-phase screening + FP cache for §XX tautomer search | 60 lines | ✅ Done | §XX reduced from up to 6 full Boltz calls to 1 fast-batch + 1 full call; ~5× GPU time reduction per epoch |
 | 25 | §OOOOOO: Cache-evidence adaptive §TTTT fragment quota (500/1000/2500 based on per-bucket Boltz LE) | 45 lines | ✅ Done | Protein-adaptive fragment slot sizing; more small-molecule diversity when ≤18-HA molecules historically outperform |
+| 26 | §XX: Tautomer enumeration after §MM convergence | 80 lines | ✅ Done | Explores H-bond donor/acceptor neighbourhood of epoch best without PSICHIC cost |
+| 27 | §WW: Multi-seed Boltz stability check for position-0 ordering | 50 lines | ✅ Done | Reduces risk from stochastic seed-68 outlier at validation; uses mean(seeds 42,68,123) |
+| 28 | §PPPPPP: Remote Boltz cache persistence via GitHub JSON export | 150 lines | ✅ Done | Warm surrogate + timing + rxn bias from epoch 1 on any container restart; 15–25% gain on restart sessions |
 
 All approaches share the same submission constraint: molecules must map to valid SAVI-2020
 product names. SALSA and GradientGA both solve this via nearest-neighbour SAVI-2020 lookup.

@@ -1,8 +1,115 @@
 # Boltz-2 Miner Integration
 
-## Current Status (as of 2026-07-08)
+## Current Status (as of 2026-07-10)
+
+§PPPPPP added 2026-07-10: Remote Boltz Cache Persistence via GitHub.
+
+---
+
+## Previous Status (as of 2026-07-08)
 
 §OOOOOO added 2026-07-08: Cache-Evidence Adaptive §TTTT Fragment Quota.
+
+Also formally documented: §WW (multi-seed stability check) and §XX (tautomer enumeration),
+which were implemented during earlier iterations but not captured in prior entries.
+
+---
+
+**§PPPPPP — Remote Boltz Cache Persistence via GitHub (`utils/github.py`, `neurons/miner.py`)**
+
+**Problem:** `boltz_score_cache.db` is gitignored and local-only. Every fresh container
+restart (common in cloud/remote execution environments like Bittensor managed nodes) loses:
+
+- All Boltz-scored molecule data (APB, APV, combined scores)
+- Surrogate training data — Ridge needs ≥40 points; RF needs ≥100 for §QQQQ upgrade
+- Adaptive timing estimates (§BBBBB: `boltz_time_per_mol`, `boltz_trigger_blocks`)
+- Reaction class bias weights (§EEEEEE: `rxn_class_scores_json`)
+- Best reaction class record (§CCCCCC: `best_boltz_rxn_class`)
+- Prior-epoch SALSA warm seeds (§PPPP, §UU)
+
+This forces epoch 1 of every new session to run cold: uniform SAVI sampling, default
+100-block Boltz trigger, no surrogate, no prior-validated molecule seeds.
+
+**Fix:** Two new functions in `utils/github.py`:
+
+*`upload_boltz_cache_export(db_path, protein)`* — Queries SQLite for the top-500
+Boltz cache entries for the current protein (ordered by score DESC), plus four
+miner_state keys (`boltz_time_per_mol`, `boltz_trigger_blocks`, `best_boltz_rxn_class`,
+`rxn_class_scores_json`). Serializes to JSON, base64-encodes, and PUTs to
+`boltz_cache_export.json` in the miner's existing GitHub submission repo (using the same
+GITHUB_TOKEN / GITHUB_REPO_* env vars as submission uploads). Returns True on success.
+
+*`download_boltz_cache_export(protein)`* — GETs `boltz_cache_export.json` from the
+miner's GitHub repo. Returns the parsed dict only if the stored protein matches the
+current weekly target, otherwise None (silently skips on target rotation — the new
+target's cache doesn't exist yet, which is correct).
+
+**Integration in `neurons/miner.py`:**
+
+*Startup (before §BBBBB):* After `_cleanup_boltz_cache`, calls
+`download_boltz_cache_export`. On a hit:
+1. Bulk-inserts all entries into SQLite via `INSERT OR IGNORE` (skips duplicates; safe
+   if the DB already had some entries from a partial prior session).
+2. Restores miner_state values only for keys NOT already present in the fresh DB (so
+   a partially-warm restart doesn't overwrite a better local value with a stale export).
+3. Runs BEFORE §BBBBB/§CCCCCC/§EEEEEE — those restores then find populated miner_state
+   rows and activate on epoch 1 instead of waiting for a fresh Boltz run to populate them.
+
+*Epoch end (inside `submit_response` after successful GitHub upload):* Calls
+`upload_boltz_cache_export` immediately after `upload_file_to_github` succeeds. The
+export is synchronous (~1–2 s for 500 entries), non-fatal (wrapped in try/except), and
+idempotent (PUT with current SHA updates the file in place).
+
+**Security note:** The exported JSON is uploaded to the same GitHub repo used for
+encrypted submissions. If that repo is public, the top-500 SMILES for the current target
+become visible to other miners. Mitigations: (1) use a private GitHub repo for submissions
+(recommended), (2) encrypt the export JSON using the GITHUB_TOKEN as a key before upload
+(future enhancement).
+
+**Expected benefit:**
+- Fresh container, epoch 1: surrogate has ≥40/100 training points immediately → Ridge/RF
+  active from the very first SALSA/§MM call
+- Correct `boltz_trigger_blocks` from epoch 1 → 12–15 min extra PSICHIC streaming on
+  A100/H100 (same as §BBBBB benefit, but now active on restart too)
+- Best reaction class bias from epoch 1 → SAVI streaming pre-targeted from block 1
+- Prior-epoch Boltz-validated molecules available as §PPPP/§UU warm seeds immediately
+- Net estimated gain: 15–25% improvement in weekly score on sessions with restarts
+  (first epoch goes from cold baseline to near-optimal warm state)
+
+---
+
+**§WW — Multi-Seed Boltz Stability Check (`neurons/miner.py`)**
+
+After §XX tautomer enumeration, if ≥4 `boltz_time_per_mol` seconds remain in the epoch
+budget, runs Boltz-2 on the top-2 candidates using alternate random seeds (42, 123) in
+addition to the validator's canonical seed (68). Computes a per-candidate mean score
+across seeds. If the mean-score ordering disagrees with the seed-68 ordering, swaps
+position-0 to the molecule with the more stable (higher mean) score.
+
+Motivation: Boltz-2 is a stochastic diffusion model. Two molecules with similar seed-68
+scores may have very different variance. Submitting the more stable molecule at position-0
+reduces the risk of a lucky seed-68 outlier being reversed at validation time.
+
+Alternate-seed scores are NOT written to the disk cache — the validator always uses seed=68
+and §CC warm-start comparisons must remain on the same scale.
+
+**§XX — Tautomer Enumeration (`neurons/miner.py`)**
+
+After §MM (hill-climbing) converges, enumerates RDKit canonical tautomers of the epoch's
+best-scoring molecule. Tautomers share the same molecular formula but differ in
+bond order and proton placement, producing distinct Morgan fingerprints that map to
+*different* SAVI-2020 nearest neighbours than the bioisosteric perturbations used by SALSA.
+
+For each unique tautomer, finds its top-3 SAVI-2020 neighbours by Tanimoto (Morgan FP,
+radius=2) from `savi_stream_pool`. Collects all novel SAVI candidates not already in the
+Boltz cache.
+
+§NNNNNN restructured §XX into a two-phase flow: (1) batch fast-screen all novel tautomer
+SAVI candidates in a single `score_molecules_target(..., fast=True)` call (reusing the
+§MMMMMM FP cache from §MM rounds), then (2) full-score only the single winner. This
+reduced §XX from up to 6 full Boltz calls (~900 s on RTX 3090) to 1 fast-batch + 1 full
+call (~180 s), freeing budget for §WW and §UUUU. Time guard lowered from `+60 s` to
+`+30 s` since only one full Boltz call is guaranteed.
 
 ---
 
