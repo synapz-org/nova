@@ -109,6 +109,32 @@ def upload_boltz_cache_export(db_path: str, protein: str) -> bool:
             ).fetchone()
             if row and row[0] is not None:
                 state_out[key] = row[0]
+
+        # §RRRRRR: Include top-20 entries for up to 2 prior proteins so that when
+        # the weekly target rotates, a fresh container can still seed §WWWWW
+        # cross-target search from GitHub history (local SQLite is empty on restart).
+        history: dict = {}
+        try:
+            prior_rows = c.execute(
+                "SELECT DISTINCT protein FROM boltz_cache WHERE protein!=? "
+                "ORDER BY ts DESC LIMIT 2",
+                (protein,),
+            ).fetchall()
+            for (pp,) in prior_rows:
+                c.execute(
+                    "SELECT smiles, score, affinity_prob_binary, affinity_pred_val, "
+                    "ligand_iptm, product_name "
+                    "FROM boltz_cache WHERE protein=? ORDER BY score DESC LIMIT 20",
+                    (pp,),
+                )
+                history[pp] = [
+                    {"smiles": r[0], "score": r[1], "apb": r[2], "apv": r[3],
+                     "ligand_iptm": r[4], "product_name": r[5]}
+                    for r in c.fetchall()
+                ]
+        except Exception:
+            pass
+
         conn.close()
 
         export = {
@@ -116,6 +142,7 @@ def upload_boltz_cache_export(db_path: str, protein: str) -> bool:
             "ts": int(_time.time()),
             "entries": entries,
             "state": state_out,
+            "history": history,
         }
         content = base64.b64encode(json.dumps(export).encode()).decode()
 
@@ -178,10 +205,13 @@ def download_boltz_cache_export(protein: str) -> Optional[dict]:
         if data.get("protein") != protein:
             bt.logging.info(
                 f"[§PPPPPP] Export protein={data.get('protein')!r} "
-                f"!= current={protein!r} — skipping import."
+                f"!= current={protein!r} — main entries skipped; history available."
             )
-            return None
+            # §RRRRRR: return data anyway so caller can process cross-target history.
+            data["_protein_matched"] = False
+            return data
 
+        data["_protein_matched"] = True
         return data
     except Exception as e:
         bt.logging.warning(f"[§PPPPPP] Cache download error: {e}")

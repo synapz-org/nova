@@ -3136,41 +3136,81 @@ async def run_miner(config: argparse.Namespace) -> None:
     try:
         _pppppp_data = download_boltz_cache_export(config.weekly_target)
         if _pppppp_data:
-            _pppppp_entries = _pppppp_data.get('entries', [])
-            _pppppp_imported = 0
-            if _pppppp_entries:
-                with sqlite3.connect(state['boltz_cache_db']) as _pp_conn:
-                    for _e in _pppppp_entries:
-                        try:
-                            cur = _pp_conn.execute(
-                                "INSERT OR IGNORE INTO boltz_cache "
-                                "(smiles, protein, score, ts, product_name, "
-                                "affinity_prob_binary, affinity_pred_val, ligand_iptm) "
-                                "VALUES (?,?,?,?,?,?,?,?)",
-                                (
-                                    _e['smiles'], config.weekly_target,
-                                    _e['score'], 0,
-                                    _e.get('product_name') or '',
-                                    _e.get('apb'), _e.get('apv'), _e.get('ligand_iptm'),
-                                ),
-                            )
-                            if cur.rowcount:
-                                _pppppp_imported += 1
-                        except Exception:
-                            pass
-            _pppppp_state = _pppppp_data.get('state', {})
-            for _pk in ('boltz_time_per_mol', 'boltz_trigger_blocks'):
-                if _pk in _pppppp_state and _load_miner_state(state['boltz_cache_db'], _pk) is None:
-                    _save_miner_state(state['boltz_cache_db'], _pk, float(_pppppp_state[_pk]))
-            for _pk in ('best_boltz_rxn_class', 'rxn_class_scores_json'):
-                if _pk in _pppppp_state and _load_miner_state_text(state['boltz_cache_db'], _pk) is None:
-                    _save_miner_state_text(state['boltz_cache_db'], _pk, str(_pppppp_state[_pk]))
-            bt.logging.info(
-                f"[§PPPPPP] Imported {_pppppp_imported}/{len(_pppppp_entries)} cache entries "
-                f"from GitHub export (protein={config.weekly_target!r})."
-            )
+            _pppppp_matched = _pppppp_data.get('_protein_matched', True)
+            if _pppppp_matched:
+                _pppppp_entries = _pppppp_data.get('entries', [])
+                _pppppp_imported = 0
+                if _pppppp_entries:
+                    with sqlite3.connect(state['boltz_cache_db']) as _pp_conn:
+                        for _e in _pppppp_entries:
+                            try:
+                                cur = _pp_conn.execute(
+                                    "INSERT OR IGNORE INTO boltz_cache "
+                                    "(smiles, protein, score, ts, product_name, "
+                                    "affinity_prob_binary, affinity_pred_val, ligand_iptm) "
+                                    "VALUES (?,?,?,?,?,?,?,?)",
+                                    (
+                                        _e['smiles'], config.weekly_target,
+                                        _e['score'], 0,
+                                        _e.get('product_name') or '',
+                                        _e.get('apb'), _e.get('apv'), _e.get('ligand_iptm'),
+                                    ),
+                                )
+                                if cur.rowcount:
+                                    _pppppp_imported += 1
+                            except Exception:
+                                pass
+                _pppppp_state = _pppppp_data.get('state', {})
+                for _pk in ('boltz_time_per_mol', 'boltz_trigger_blocks'):
+                    if _pk in _pppppp_state and _load_miner_state(state['boltz_cache_db'], _pk) is None:
+                        _save_miner_state(state['boltz_cache_db'], _pk, float(_pppppp_state[_pk]))
+                for _pk in ('best_boltz_rxn_class', 'rxn_class_scores_json'):
+                    if _pk in _pppppp_state and _load_miner_state_text(state['boltz_cache_db'], _pk) is None:
+                        _save_miner_state_text(state['boltz_cache_db'], _pk, str(_pppppp_state[_pk]))
+                bt.logging.info(
+                    f"[§PPPPPP] Imported {_pppppp_imported}/{len(_pppppp_entries)} cache entries "
+                    f"from GitHub export (protein={config.weekly_target!r})."
+                )
+            # §RRRRRR: Import cross-target history regardless of protein match.
+            # On fresh container + protein rotation, §WWWWW found nothing (empty SQLite).
+            # History entries for prior proteins enable a second §WWWWW pass here so
+            # SALSA gets Boltz-validated seeds from structurally related prior targets
+            # even when the current target's own cache is missing.
+            _rrrrrr_history = _pppppp_data.get('history', {})
+            if _rrrrrr_history:
+                import time as _rr_time
+                _rr_ts = int(_rr_time.time())
+                with sqlite3.connect(state['boltz_cache_db']) as _rr_conn:
+                    for _rr_protein, _rr_entries in _rrrrrr_history.items():
+                        for _e in _rr_entries:
+                            try:
+                                _rr_conn.execute(
+                                    "INSERT OR IGNORE INTO boltz_cache "
+                                    "(smiles, protein, score, ts, product_name, "
+                                    "affinity_prob_binary, affinity_pred_val, ligand_iptm) "
+                                    "VALUES (?,?,?,?,?,?,?,?)",
+                                    (
+                                        _e['smiles'], _rr_protein,
+                                        _e['score'], _rr_ts,
+                                        _e.get('product_name') or '',
+                                        _e.get('apb'), _e.get('apv'), _e.get('ligand_iptm'),
+                                    ),
+                                )
+                            except Exception:
+                                pass
+                # Re-run cross-target seeding now that history entries are in SQLite.
+                _rrrrrr_seeds = _cross_target_seeds_from_cache(
+                    state['boltz_cache_db'], config.weekly_target
+                )
+                _rrrrrr_new = [s for s in _rrrrrr_seeds if s not in state['cross_target_seeds']]
+                if _rrrrrr_new:
+                    state['cross_target_seeds'].extend(_rrrrrr_new)
+                    bt.logging.info(
+                        f"[§RRRRRR] {len(_rrrrrr_new)} cross-target seed(s) from "
+                        f"GitHub history ({len(_rrrrrr_history)} prior protein(s))."
+                    )
         else:
-            bt.logging.debug("[§PPPPPP] No GitHub cache export found for current protein — cold start.")
+            bt.logging.debug("[§PPPPPP] No GitHub cache export found — cold start.")
     except Exception as _pppppp_err:
         bt.logging.warning(f"[§PPPPPP] Cache import failed (non-fatal): {_pppppp_err}")
 

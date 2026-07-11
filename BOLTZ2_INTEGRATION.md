@@ -1,6 +1,81 @@
 # Boltz-2 Miner Integration
 
-## Current Status (as of 2026-07-10)
+## Current Status (as of 2026-07-11)
+
+§RRRRRR added 2026-07-11: Cross-Target History in GitHub Cache Export.
+
+---
+
+**§RRRRRR — Cross-Target History in GitHub Cache Export (`utils/github.py`, `neurons/miner.py`)**
+
+**Problem:** §PPPPPP (remote cache persistence) exports and imports the top-500 Boltz
+entries for the **current** weekly protein only.  When the protein rotates and a fresh
+container starts:
+
+1. Local SQLite is empty → §WWWWW `_cross_target_seeds_from_cache` returns `[]`.
+2. §PPPPPP download finds protein mismatch → returns `None` → no import.
+3. SALSA starts epoch 1 completely cold, with no cross-target seeds.
+
+§RRRRRR closes this gap by piggybacking **historical molecule data** in the existing
+GitHub export, so structurally-related prior-target molecules are available as
+§WWWWW seeds even on a fresh container with an empty SQLite.
+
+**Fix — two files changed:**
+
+*`utils/github.py` — `upload_boltz_cache_export`:*
+
+After exporting the current protein's top-500, queries the SQLite for up to 2 other
+proteins that have cache entries (ordered by recency).  For each, fetches the top-20
+rows and adds them under `"history": {"PRIOR_PROTEIN_A": [...], "PRIOR_PROTEIN_B": [...]}`
+in the export JSON.  Size impact is negligible (~2–3 KB for 40 additional entries).
+
+*`utils/github.py` — `download_boltz_cache_export`:*
+
+Removes the early `return None` on protein mismatch.  Instead, adds
+`"_protein_matched": False` to the returned dict and returns it so the caller can
+still access `"history"`.  Protein-matched downloads gain `"_protein_matched": True`.
+
+*`neurons/miner.py` — §PPPPPP startup block:*
+
+The caller now checks `_pppppp_data.get('_protein_matched', True)` before importing
+the main `"entries"` and `"state"` (existing §PPPPPP behavior is preserved).
+
+Unconditionally after the protein-match check, processes `_pppppp_data.get('history', {})`:
+1. Bulk-inserts all history entries into local SQLite with `ts=int(time.time())` (so
+   they survive the 14-day age filter within the current session).
+2. Re-runs `_cross_target_seeds_from_cache` to pick up any homologous cross-target seeds
+   from the freshly-inserted history rows (40% sequence-identity threshold, as in §WWWWW).
+3. Appends novel seeds to `state['cross_target_seeds']` and logs count.
+
+**Interaction with §WWWWW:**
+
+On restart with non-empty SQLite (same-machine restart, protein unchanged):
+- §WWWWW (line 3116) already finds cross-target seeds from SQLite → no change.
+- §RRRRRR re-inserts history → duplicate seeds are filtered by `INSERT OR IGNORE` and
+  the `not in state['cross_target_seeds']` check → no duplicate seeds added.
+
+On fresh container + protein rotation (the new case):
+- §WWWWW returns `[]` → `state['cross_target_seeds'] = []`.
+- §RRRRRR inserts 20 × 2 = ≤40 history entries, re-runs cross-target seeding, and
+  appends matching seeds (≥40% identity only) to `state['cross_target_seeds']`.
+- SALSA round 1 now has Boltz-validated seeds from prior structurally-related targets.
+
+**Expected benefit:**
+
+- Epoch 1 after protein rotation + container restart: surrogate starts cold (history
+  entries are for other proteins, not imported into the current-protein training set),
+  but SALSA starts from known-good scaffolds instead of random SAVI-2020 molecules.
+- Estimated gain (when a homologous prior target exists): +3–8% Boltz score on epoch 1
+  because SALSA begins in a high-LE region rather than an unexplored region.  No effect
+  when no homolog is present (threshold 40%) or when the SQLite was already populated.
+
+**Security:** History entries are top-20 SMILES per prior protein — a small additional
+disclosure if the GitHub repo is public.  Same mitigation applies as §PPPPPP: use a
+private GitHub repo for submissions.
+
+---
+
+## Previous Status (as of 2026-07-10)
 
 §PPPPPP added 2026-07-10: Remote Boltz Cache Persistence via GitHub.
 
