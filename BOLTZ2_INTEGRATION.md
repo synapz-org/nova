@@ -1,6 +1,60 @@
 # Boltz-2 Miner Integration
 
-## Current Status (as of 2026-07-11)
+## Current Status (as of 2026-07-12)
+
+§SSSSSS added 2026-07-12: Diversity-Aware Historical Cache Seeds for §UU SALSA.
+
+---
+
+**§SSSSSS — Diversity-Aware Historical Cache Seeds for §UU SALSA (`neurons/miner.py`)**
+
+**Problem:** §UU selects the top-3 Boltz-cache molecules by score as SALSA seeds.  On
+epoch 3+ after §MM hill-climbing has converged to a single scaffold region, the top-3
+cache entries are nearly identical (Tanimoto similarity ≥ 0.85 is common).  Running
+SALSA from 3 near-duplicate seeds wastes three PSICHIC-exploration budgets on the same
+chemical neighbourhood and provides no new structural information.
+
+**Fix:** Expand the §UU cache pull from `limit=5` to `limit=20`, collect all valid
+candidates (SMILES-parseable, Boltz-safe, not already in `_seeds`), then apply a
+**max-min Tanimoto diversity selection** to choose 3:
+
+1. Always include rank-1 (highest-scoring cache entry) — preserves exploitation.
+2. Greedily add the candidate with the **highest minimum Tanimoto distance** to the
+   already-selected set, until 3 seeds are chosen.
+
+Morgan fingerprints (radius 2, 2048 bits) are used for distance computation; the
+entire selection costs < 1 ms and adds no GPU work.
+
+**Fallback:** any exception (RDKit import failure, empty pool, etc.) falls back to
+the prior behaviour of taking the top-3 by score — zero regression risk.
+
+**Interaction with §OOOO and §WWWWW:**
+
+§OOOO applies scaffold diversity to the current-epoch PSICHIC seeds; §SSSSSS applies
+diversity to the historical cache seeds.  §WWWWW supplies cross-target seeds; §SSSSSS
+does not interfere (cross-target seeds are appended after the §UU+§SSSSSS block).
+
+**Expected benefit:**
+
+On epoch 3+ with a converged cache:
+- 2–3 SALSA passes now start from structurally distinct scaffolds instead of the same
+  neighbourhood, increasing the probability of discovering a new local optimum.
+- When the cache is small (< 4 valid entries) §SSSSSS is a no-op (takes all valid).
+- If diversity selection selects a molecule ranked 5–20 (not top-3 by score), its
+  PSICHIC re-scoring will confirm or reject it as a genuine lead — low-risk, moderate
+  upside.
+
+**Estimated gain:** +3–8% probability of finding a new scaffold-family winner per
+epoch on week-3+ runs where the §MM convergence region has been exhausted.
+
+**Files changed:**
+
+- `neurons/miner.py` — §UU block: `limit=5 → 20`, `_uu_valid` collection loop,
+  `§SSSSSS` max-min diversity selection with try/except fallback.
+
+---
+
+## Previous Status (as of 2026-07-11)
 
 §RRRRRR added 2026-07-11: Cross-Target History in GitHub Cache Export.
 

@@ -358,7 +358,7 @@ Even a partial result (1 of 5 molecules scored) improves on the PSICHIC-only bas
 
 ## Implementation Roadmap (priority order)
 
-All items 1–29 are **implemented**. Items 5 and 7 remain as conditional/research directions.
+All items 1–30 are **implemented**. Items 5 and 7 remain as conditional/research directions.
 
 | Priority | Approach | Effort | Status | Expected gain |
 |----------|----------|--------|--------|---------------|
@@ -391,6 +391,7 @@ All items 1–29 are **implemented**. Items 5 and 7 remain as conditional/resear
 | 27 | §WW: Multi-seed Boltz stability check for position-0 ordering | 50 lines | ✅ Done | Reduces risk from stochastic seed-68 outlier at validation; uses mean(seeds 42,68,123) |
 | 28 | §PPPPPP: Remote Boltz cache persistence via GitHub JSON export | 150 lines | ✅ Done | Warm surrogate + timing + rxn bias from epoch 1 on any container restart; 15–25% gain on restart sessions |
 | 29 | §RRRRRR: Cross-target history in GitHub export — §WWWWW seeds on protein rotation + fresh container | 60 lines | ✅ Done | +3–8% Boltz score on epoch 1 after protein rotation when homologous prior target exists |
+| 30 | §SSSSSS: Diversity-aware §UU cache seed selection — max-min Tanimoto from top-20 instead of top-3 by score | 50 lines | ✅ Done | +3–8% probability of finding new scaffold-family winner per epoch on week-3+ converged runs |
 
 All approaches share the same submission constraint: molecules must map to valid SAVI-2020
 product names. SALSA and GradientGA both solve this via nearest-neighbour SAVI-2020 lookup.

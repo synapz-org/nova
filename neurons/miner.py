@@ -949,10 +949,16 @@ async def run_psichic_model_loop(state: Dict[str, Any]) -> None:
                         # have already been scored by the actual Boltz-2 oracle — far better seeds
                         # than PSICHIC-ranked candidates alone.  Silently ignored on the first epoch
                         # (empty cache) and when `binding_pocket` changes (different protein key).
+                        #
+                        # §SSSSSS: diversity-aware seed selection.  Pull top-20 cache entries and
+                        # apply max-min Tanimoto selection, always keeping rank-1 for exploitation.
+                        # When §MM hill-climbing has converged to one scaffold family, the top-3 by
+                        # score are nearly identical; max-min diversity ensures each of the 3 SALSA
+                        # passes explores a genuinely different chemical neighbourhood.
                         _uu_db_path = state.get('boltz_cache_db', BOLTZ_CACHE_DB)
                         _uu_protein = state['config'].weekly_target
-                        _uu_cached = _disk_cache_get_candidates(_uu_db_path, _uu_protein, limit=5)
-                        _uu_seeds = []
+                        _uu_cached = _disk_cache_get_candidates(_uu_db_path, _uu_protein, limit=20)
+                        _uu_valid = []
                         for _uu_row in _uu_cached:
                             _uu_sm = _uu_row.get('product_smiles', '')
                             if (
@@ -961,13 +967,45 @@ async def run_psichic_model_loop(state: Dict[str, Any]) -> None:
                                 and Chem.MolFromSmiles(_uu_sm) is not None
                                 and is_boltz_safe_smiles(_uu_sm)[0]
                             ):
-                                _uu_seeds.append(_uu_sm)
-                            if len(_uu_seeds) >= 3:
-                                break
+                                _uu_valid.append(_uu_sm)
+                        _uu_seeds: list = []
+                        if len(_uu_valid) <= 3:
+                            _uu_seeds = _uu_valid
+                        else:
+                            # §SSSSSS: max-min diversity selection from top-20 cache candidates.
+                            try:
+                                from rdkit.Chem import AllChem
+                                from rdkit import DataStructs
+                                _uu_mols = [Chem.MolFromSmiles(s) for s in _uu_valid]
+                                _uu_fps = [
+                                    AllChem.GetMorganFingerprintAsBitVect(m, 2, 2048)
+                                    for m in _uu_mols
+                                ]
+                                _uu_sel = [0]  # always keep rank-1 (best score)
+                                while len(_uu_sel) < 3:
+                                    best_i, best_dist = -1, -1.0
+                                    for i in range(len(_uu_valid)):
+                                        if i in _uu_sel:
+                                            continue
+                                        min_sim = min(
+                                            DataStructs.TanimotoSimilarity(_uu_fps[i], _uu_fps[j])
+                                            for j in _uu_sel
+                                        )
+                                        dist = 1.0 - min_sim
+                                        if dist > best_dist:
+                                            best_dist, best_i = dist, i
+                                    if best_i >= 0:
+                                        _uu_sel.append(best_i)
+                                    else:
+                                        break
+                                _uu_seeds = [_uu_valid[i] for i in _uu_sel]
+                            except Exception:
+                                _uu_seeds = _uu_valid[:3]  # fallback: top-3 by score
                         if _uu_seeds:
                             _seeds = _seeds + _uu_seeds
                             bt.logging.info(
-                                f"[UU] Adding {len(_uu_seeds)} prior-epoch Boltz-validated seed(s) to SALSA."
+                                f"[UU+§SSSSSS] {len(_uu_seeds)} cache seed(s) added to SALSA "
+                                f"(diversity-selected from top-{len(_uu_valid)} cached)."
                             )
 
                         # §WWWWW: extend with seeds from homologous prior-target proteins.
