@@ -2638,6 +2638,271 @@ async def run_boltz_prescoring(state: Dict[str, Any], max_candidates: int = 5) -
         except Exception as _xx_err:
             bt.logging.warning(f"§XX tautomer search failed (non-fatal): {_xx_err}")
 
+    # §TTTTTT — Extended Tautomer Search for 2nd/3rd Epoch Best Molecules.
+    # §XX above enumerates tautomers of the single epoch-best molecule.  §TTTTTT
+    # extends this to the 2nd and 3rd best molecules in all_scores (sorted by Boltz
+    # LE), subject to a per-seed time guard.  On hardware with ample GPU budget
+    # (H100: ~25 s/mol, up to 20 §MM rounds), distinct scaffolds often survive from
+    # §QQ/§VV basin-hops; their tautomers represent genuinely unexplored chemical
+    # space.  Each seed uses the §NNNNNN two-phase screen (batch fast-screen → one
+    # full Boltz call for the winner), reusing the §MMMMMM FP cache.  Cross-seed
+    # SAVI neighbour deduplication via a shared `_tt_seen` set prevents re-scoring
+    # the same product name across both seeds.
+    _tt_pool = state.get('savi_stream_pool')
+    if (
+        _tt_pool is not None
+        and not _tt_pool.empty
+        and len([v for v in all_scores.values() if math.isfinite(v)]) >= 2
+    ):
+        _tt_sorted_all = sorted(
+            [(s, v) for s, v in all_scores.items() if math.isfinite(v)],
+            key=lambda kv: kv[1], reverse=True,
+        )
+        # Indices 1 and 2 — index 0 is the §XX seed already processed above.
+        _tt_extra_seeds = [s for s, _v in _tt_sorted_all[1:3]]
+        if _tt_extra_seeds:
+            try:
+                from rdkit.Chem.MolStandardize import rdMolStandardize as _rdMSt_tt
+                from utils.salsa import (
+                    nearest_pool_molecules as _tt_nnm,
+                    get_cached_pool_fps as _tt_gfps,
+                )
+                _tt_valid_pool, _tt_pool_fps = _tt_gfps(_tt_pool)
+                _tt_seen: set = set()
+
+                for _tt_seed_smi in _tt_extra_seeds:
+                    # Per-seed time guard: abort before starting if < t_mol + 30 s remain.
+                    try:
+                        _tt_blk = await state['subtensor'].get_current_block()
+                        _tt_ep  = (
+                            (_tt_blk // state['epoch_length']) + 1
+                        ) * state['epoch_length']
+                        _tt_t_mol = state.get('boltz_time_per_mol', 150.0)
+                        if (_tt_ep - _tt_blk) * 12 <= _tt_t_mol + 30:
+                            bt.logging.info("§TTTTTT: time guard fired — stopping.")
+                            break
+                    except Exception:
+                        break
+
+                    _tt_mol = Chem.MolFromSmiles(_tt_seed_smi)
+                    if _tt_mol is None:
+                        continue
+                    _tt_enumerator = _rdMSt_tt.TautomerEnumerator()
+                    _tt_tautomers  = _tt_enumerator.Enumerate(_tt_mol)
+                    _tt_seed_canon = Chem.MolToSmiles(_tt_mol)
+
+                    _tt_novel: list = []
+                    for _tt in _tt_tautomers:
+                        if _tt is None:
+                            continue
+                        _tt_smi = Chem.MolToSmiles(_tt)
+                        if _tt_smi == _tt_seed_canon:
+                            continue
+                        _tt_ok, _ = is_boltz_safe_smiles(_tt_smi)
+                        if not _tt_ok:
+                            continue
+                        _tt_ha = get_heavy_atom_count(_tt_smi)
+                        if _tt_ha is None or _tt_ha < 10 or _tt_ha > 35:
+                            continue
+                        _tt_novel.append(_tt_smi)
+
+                    if not _tt_novel:
+                        bt.logging.debug(
+                            f"§TTTTTT: no novel tautomers for seed {_tt_seed_smi[:30]!r}"
+                        )
+                        continue
+
+                    # Map tautomers to nearest SAVI-2020 neighbours (up to 6 probes).
+                    _tt_cands: list = []
+                    for _tt_tsmi in _tt_novel[:6]:
+                        _tt_near = _tt_nnm(
+                            _tt_tsmi, _tt_valid_pool, top_k=1, pool_fps=_tt_pool_fps
+                        )
+                        if _tt_near.empty:
+                            continue
+                        _tt_nr     = _tt_near.iloc[0]
+                        _tt_nsmi   = _tt_nr['product_smiles']
+                        _tt_npname = _tt_nr.get('product_name', '')
+                        if _tt_npname in _tt_seen:
+                            continue
+                        _tt_seen.add(_tt_npname)
+                        _tt_cands.append((_tt_nsmi, _tt_npname, _tt_nr))
+
+                    if not _tt_cands:
+                        continue
+
+                    bt.logging.info(
+                        f"§TTTTTT: {len(_tt_cands)} SAVI candidate(s) from "
+                        f"tautomers of rank-2/3 seed — phase-1 fast-screen"
+                    )
+
+                    # Phase 1: cache hit check + batch fast-screen for misses.
+                    _tt_screen: Dict[str, float] = {}
+                    _tt_misses: list = []
+                    for _tt_sm, _tt_pn, _tt_rw in _tt_cands:
+                        _tt_can = get_canonical_smiles(_tt_sm)
+                        _tt_key = (_tt_can, protein)
+                        if _tt_key in boltz_cache:
+                            _tt_screen[_tt_sm] = boltz_cache[_tt_key]
+                            bt.logging.debug(
+                                f"§TTTTTT cache hit: {boltz_cache[_tt_key]:.4f}"
+                            )
+                        elif _tt_can in _epoch_fast_cache:
+                            _tt_screen[_tt_sm] = _epoch_fast_cache[_tt_can]
+                            bt.logging.debug(
+                                f"§TTTTTT fast-cache hit: {_epoch_fast_cache[_tt_can]:.4f}"
+                            )
+                        else:
+                            _tt_misses.append((_tt_sm, _tt_pn, _tt_rw))
+
+                    if _tt_misses:
+                        try:
+                            _tt_blk2 = await state['subtensor'].get_current_block()
+                            _tt_ep2  = (
+                                (_tt_blk2 // state['epoch_length']) + 1
+                            ) * state['epoch_length']
+                            if (_tt_ep2 - _tt_blk2) * 12 >= _tt_t_mol + 30:
+                                _tt_bvmbu = {
+                                    _uid: {"smiles": [_sm], "names": [_pn]}
+                                    for _uid, (_sm, _pn, _rw) in enumerate(_tt_misses)
+                                }
+                                _tt_bsd: Dict[str, Any] = {
+                                    _uid: {} for _uid in _tt_bvmbu
+                                }
+                                await asyncio.to_thread(
+                                    wrapper.score_molecules_target,
+                                    _tt_bvmbu, _tt_bsd, subnet_config,
+                                    '0x' + '0' * 64, True,  # fast=True
+                                )
+                                for _uid, (_sm, _pn, _rw) in enumerate(_tt_misses):
+                                    _sc = wrapper.per_molecule_metric.get(
+                                        _uid, {}
+                                    ).get(_sm, -math.inf)
+                                    _tt_screen[_sm] = _sc
+                                    _epoch_fast_cache[get_canonical_smiles(_sm)] = _sc
+                                bt.logging.info(
+                                    f"§TTTTTT §FFFFFF: batch fast-screened "
+                                    f"{len(_tt_misses)} tautomer neighbour(s)"
+                                )
+                        except Exception as _tt_fe:
+                            bt.logging.error(f"§TTTTTT fast-screen error: {_tt_fe}")
+                            for _sm, _, _ in _tt_misses:
+                                _tt_screen.setdefault(_sm, -math.inf)
+
+                    # Phase 2: full Boltz call for the best fast-screened candidate.
+                    _tt_winner_sm = max(
+                        (_s for _s, _v in _tt_screen.items() if math.isfinite(_v)),
+                        key=lambda _s: _tt_screen[_s],
+                        default=None,
+                    )
+                    if _tt_winner_sm is None:
+                        continue
+                    _tt_w_can   = get_canonical_smiles(_tt_winner_sm)
+                    _tt_w_key   = (_tt_w_can, protein)
+                    _tt_w_pname = next(
+                        (pn for sm, pn, _ in _tt_cands if sm == _tt_winner_sm), ''
+                    )
+
+                    if _tt_w_key in boltz_cache:
+                        _tt_w_score = boltz_cache[_tt_w_key]
+                    else:
+                        _tt_disk = _disk_cache_get(db_path, _tt_w_can, protein)
+                        if _tt_disk is not None:
+                            boltz_cache[_tt_w_key] = _tt_disk
+                            _tt_w_score = _tt_disk
+                        else:
+                            try:
+                                _tt_blk3 = await state['subtensor'].get_current_block()
+                                _tt_ep3  = (
+                                    (_tt_blk3 // state['epoch_length']) + 1
+                                ) * state['epoch_length']
+                                if (_tt_ep3 - _tt_blk3) * 12 < _tt_t_mol + 30:
+                                    bt.logging.info(
+                                        "§TTTTTT: time guard before full-score — stopping."
+                                    )
+                                    break
+                            except Exception:
+                                break
+
+                            _tt_uid  = 0
+                            _tt_vmbu = {
+                                _tt_uid: {
+                                    "smiles": [_tt_winner_sm],
+                                    "names":  [_tt_w_pname],
+                                }
+                            }
+                            _tt_vsd: Dict[str, Any] = {_tt_uid: {}}
+                            try:
+                                await asyncio.to_thread(
+                                    wrapper.score_molecules_target,
+                                    _tt_vmbu, _tt_vsd, subnet_config,
+                                    '0x' + '0' * 64,
+                                )
+                                _tt_w_score = wrapper.per_molecule_metric.get(
+                                    _tt_uid, {}
+                                ).get(_tt_winner_sm, -math.inf)
+                                boltz_cache[_tt_w_key] = _tt_w_score
+                                _tt_comps = wrapper.per_molecule_components.get(
+                                    _tt_uid, {}
+                                ).get(_tt_winner_sm, {})
+                                _tt_apb = _tt_comps.get('affinity_probability_binary')
+                                _tt_apv = _tt_comps.get('affinity_pred_value')
+                                _tt_li  = _tt_comps.get('ligand_iptm')
+                                _disk_cache_put(
+                                    db_path, _tt_w_can, protein, _tt_w_score,
+                                    product_name=_tt_w_pname or None,
+                                    apb=_tt_apb if isinstance(
+                                        _tt_apb, (int, float)
+                                    ) else None,
+                                    apv=_tt_apv if isinstance(
+                                        _tt_apv, (int, float)
+                                    ) else None,
+                                    ligand_iptm=_tt_li if isinstance(
+                                        _tt_li, (int, float)
+                                    ) else None,
+                                )
+                                if wrapper.last_inference_duration > 0:
+                                    state['boltz_time_per_mol'] = (
+                                        wrapper.last_inference_duration
+                                    )
+                                    _save_miner_state(
+                                        db_path,
+                                        'boltz_time_per_mol',
+                                        wrapper.last_inference_duration,
+                                    )
+                                bt.logging.info(
+                                    f"§TTTTTT: full Boltz — "
+                                    f"{_tt_w_pname!r} score={_tt_w_score:.4f}"
+                                )
+                            except Exception as _tt_be:
+                                bt.logging.error(f"§TTTTTT Boltz error: {_tt_be}")
+                                _tt_w_score = -math.inf
+
+                    # Update all_scores and promote to pos-0 if new epoch best.
+                    if math.isfinite(_tt_w_score):
+                        _tt_epoch_best = max(
+                            (v for v in all_scores.values() if math.isfinite(v)),
+                            default=-math.inf,
+                        )
+                        all_scores[_tt_w_can] = _tt_w_score
+                        if _tt_w_score > _tt_epoch_best and _tt_w_pname:
+                            _tt_orig = state['candidate_product'].split(',')
+                            state['candidate_product'] = ','.join(
+                                [_tt_w_pname]
+                                + [n for n in _tt_orig if n != _tt_w_pname]
+                            )
+                            bt.logging.info(
+                                f"§TTTTTT: new epoch best from rank-2/3 "
+                                f"tautomer search — {_tt_w_pname} "
+                                f"(boltz={_tt_w_score:.4f} > "
+                                f"prev={_tt_epoch_best:.4f})"
+                            )
+
+            except Exception as _tttttt_err:
+                bt.logging.warning(
+                    f"§TTTTTT tautomer search failed (non-fatal): {_tttttt_err}"
+                )
+
     # §WW — Multi-seed stability estimation for top-2 candidates.
     # Boltz-2 is a stochastic diffusion model; the same molecule can score
     # differently across random seeds.  The validator always uses seed=68, so

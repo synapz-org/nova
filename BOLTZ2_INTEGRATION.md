@@ -1,6 +1,82 @@
 # Boltz-2 Miner Integration
 
-## Current Status (as of 2026-07-12)
+## Current Status (as of 2026-07-13)
+
+§TTTTTT added 2026-07-13: Extended Tautomer Search for 2nd/3rd Epoch Best Molecules.
+
+---
+
+**§TTTTTT — Extended Tautomer Search for 2nd/3rd Epoch Best Molecules (`neurons/miner.py`)**
+
+**Problem:** §XX enumerates RDKit canonical tautomers of the single epoch-best molecule
+(highest Boltz LE score in `all_scores`) and maps them to nearest SAVI-2020 neighbours.
+After §MM hill-climbing with §QQ/§VV basin-hops, `all_scores` typically contains 2–5
+well-scored molecules from distinct scaffolds (initial prescoring, §FF winner, and
+basin-hop seeds).  The tautomer neighbourhoods of the 2nd and 3rd best molecules are
+completely unexplored — if either has a protonation/tautomer variant that maps to a
+better SAVI-2020 match, the miner misses it.
+
+**Fix:** After §XX completes, §TTTTTT runs the same §NNNNNN two-phase screen (batch
+fast-screen → one full Boltz call for the winner) on the 2nd and 3rd best molecules
+in `all_scores`:
+
+1. Sort `all_scores` descending by Boltz LE; skip index 0 (§XX seed); take indices 1–2.
+2. For each seed, check a per-seed time guard: abort before starting if fewer than
+   `boltz_time_per_mol + 30` seconds remain in the epoch.
+3. Enumerate up to 6 novel tautomers (via `rdMolStandardize.TautomerEnumerator`);
+   filter by Boltz-safety, HA bounds [10, 35].
+4. Map each tautomer to its nearest SAVI-2020 neighbour via the §MMMMMM FP cache
+   (`get_cached_pool_fps` — free if §MM/§XX already populated it).
+5. Deduplicate across both seeds with a shared `_tt_seen` set keyed by product name.
+6. Batch fast-screen all cache-misses in one `score_molecules_target(fast=True)` call
+   (§FFFFFF); store results in `_epoch_fast_cache` (§GGGGGG) for §WW/§UUUU reuse.
+7. Full-score the fast-screen winner; persist to SQLite cache + miner_state.
+8. If the winner beats the current epoch best, promote it to position 0 in
+   `state['candidate_product']`.
+
+All three Boltz checkpoints (§XX, §TTTTTT seed-1, §TTTTTT seed-2) share the same
+`_epoch_fast_cache`, so a molecule fast-screened by §XX's batch is a cache hit for
+§TTTTTT and costs zero GPU time.
+
+**Time budget analysis:**
+
+| Hardware | t_mol | Time for §TTTTTT (2 seeds) | Active on epoch |
+|----------|-------|---------------------------|-----------------|
+| H100 (~25 s/mol) | ~25 s | ~110–220 s (fast-batch + full × 2) | Common (large §MM budget) |
+| A100 (~45 s/mol) | ~45 s | ~150–300 s | Possible when §MM converges early |
+| RTX 3090 (~150 s/mol) | ~150 s | Time guard fires immediately | Never active |
+
+On H100 where §MM runs 15–20 rounds and uses ~800–1000 s, the remaining ~200–400 s
+fits 2 §TTTTTT seeds.  On A100 with ~875 s §MM budget and 10 rounds (~450 s), §TTTTTT
+fires on roughly 30–50% of epochs when §MM converges with time to spare.
+
+**Interaction with other blocks:**
+
+- §XX runs first (seed = rank-1).  §TTTTTT uses rank-2/3, never re-processes rank-1.
+- §MMMMMM FP cache is shared — no per-call fingerprint recomputation.
+- §WW and §UUUU run after §TTTTTT and see any new epoch-best molecule that §TTTTTT
+  discovered.  §WW's multi-seed stability check thus benefits from the extended tautomer
+  search without code changes.
+- §SSSSSS diversity seeds for next epoch include §TTTTTT winners (they enter all_scores
+  and boltz_cache on the current epoch, feeding §UU on the next).
+
+**Expected benefit:**
+
+On epochs where §MM basin-hops have produced ≥2 distinct scaffolds in `all_scores`
+(frequent on H100 after week 2+ with a populated cache):
+- Each §TTTTTT seed explores 1–6 SAVI molecules that no earlier block has examined.
+- Estimated +2–5% probability per epoch of finding a new score winner via a tautomeric
+  variant of a scaffold that was locally optimal but not globally optimal.
+- When both seeds produce only cache hits (all tautomer SAVI neighbours already scored),
+  §TTTTTT costs < 1 ms of CPU time and zero GPU time.
+
+**Files changed:**
+
+- `neurons/miner.py` — new §TTTTTT block inserted between §XX and §WW.
+
+---
+
+## Previous Status (as of 2026-07-12)
 
 §SSSSSS added 2026-07-12: Diversity-Aware Historical Cache Seeds for §UU SALSA.
 
