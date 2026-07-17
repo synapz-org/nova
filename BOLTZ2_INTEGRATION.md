@@ -1,6 +1,66 @@
 # Boltz-2 Miner Integration
 
-## Current Status (as of 2026-07-13)
+## Current Status (as of 2026-07-17)
+
+§UUUUUU added 2026-07-17: Surrogate-Guided GradientGA Fitness Function.
+
+---
+
+**§UUUUUU — Surrogate-Guided GradientGA Fitness Function (`neurons/miner.py`)**
+
+**Problem:** GradientGA uses PSICHIC `combined_score` as the fitness proxy for tournament
+selection, population sorting, and return ranking.  PSICHIC and Boltz-2 have imperfect
+correlation — a molecule that PSICHIC ranks highly may score poorly under Boltz-2 and
+vice versa.  On epoch 3+ when the dual RF surrogate (§YYYYY/§AAAAAA) has ≥100 cache
+points, this misalignment causes GA generations to evolve toward a PSICHIC-optimal region
+that diverges from the actual Boltz-2 scoring surface.
+
+§HHHHHH already fixes this for SALSA inside `run_boltz_prescoring` by augmenting the
+SAVI pool with a `surrogate_salsa_score` column before §FF/§MM hill-climbing.  GradientGA,
+which fires earlier in the epoch, never received the same treatment.
+
+**Fix:** Immediately before the GradientGA call, fit the dual surrogate from the disk
+cache.  If it returns both RF models (≥100 cache points), call
+`augment_pool_with_surrogate_blend` on both the SAVI stream pool (`ga_pool`) and the
+seed DataFrame (`global_candidate_pool`) to add a `surrogate_salsa_score` column:
+
+```
+surrogate_salsa_score = 0.4 × norm(PSICHIC) + 0.6 × norm((apb_pred − apv_pred) / HA)
+```
+
+Pass `score_col='surrogate_salsa_score'` to `run_gradient_ga` so tournament selection,
+offspring ranking, and the final `top_k` return all use the Boltz-calibrated fitness.
+When either model is Ridge (< 100 cache points) or any exception occurs, the call falls
+back to `score_col='combined_score'` (pure PSICHIC) — zero regression risk.
+
+**Interaction with §HHHHHH:**
+
+§UUUUUU uses the same `fit_dual_surrogate` / `augment_pool_with_surrogate_blend` pipeline
+as §HHHHHH.  The only difference is timing: §UUUUUU fires at the GA trigger (boltz_trigger
++ 20 blocks before epoch), while §HHHHHH fires inside `run_boltz_prescoring` (boltz_trigger
+blocks).  §HHHHHH still fits its own surrogate instance inside `run_boltz_prescoring`
+independently; §UUUUUU's `_uu_dual` is a local variable and does not interfere.
+
+**Expected benefit:**
+
+On epoch 3+ with the RF surrogate active:
+- GA tournament selection now prefers parents whose predicted Boltz LE score is high,
+  not just their PSICHIC rank.
+- Offspring mapped to nearest-SAVI neighbours land in regions of chemical space that
+  the surrogate associates with high Boltz APB and low APV — i.e. genuine binders.
+- §BBB post-GA SALSA seeds from the GA winner (via `state['best_ga_smiles']`) now
+  start from a molecule the surrogate rates highly, giving SALSA a better launch point.
+- Estimated gain: +3–6% in final Boltz score on epochs where GA fires with ≥100 cache
+  points and the prior-epoch surrogate accurately captures the protein's binding SAR.
+
+**Files changed:**
+
+- `neurons/miner.py` — GradientGA trigger block: fit `_uu_dual`, augment `_uu_ga_pool`
+  and `_uu_ga_seed`, select `_uu_ga_score_col`, pass them to `run_gradient_ga`.
+
+---
+
+## Previous Status (as of 2026-07-13)
 
 §TTTTTT added 2026-07-13: Extended Tautomer Search for 2nd/3rd Epoch Best Molecules.
 

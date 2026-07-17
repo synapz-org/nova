@@ -1109,14 +1109,40 @@ async def run_psichic_model_loop(state: Dict[str, Any]) -> None:
                             f"GradientGA: triggering with {ga_pool_size}-molecule pool, "
                             f"{blocks_until_epoch} blocks remaining..."
                         )
+                        # §UUUUUU: Surrogate-guided GA fitness — when the dual RF surrogate
+                        # has ≥100 cache points, augment the GA pool and seed_df with a
+                        # surrogate-blended score column so GA's tournament selection and
+                        # population sorting optimise toward the Boltz objective rather than
+                        # the PSICHIC signal.  Falls back silently to 'combined_score' when
+                        # the surrogate is unavailable (< 100 pts / Ridge tier / first epoch).
+                        _uu_ga_score_col = 'combined_score'
+                        _uu_ga_pool = ga_pool
+                        _uu_ga_seed = state['global_candidate_pool']
+                        try:
+                            _uu_dual = fit_dual_surrogate(
+                                state.get('boltz_cache_db', BOLTZ_CACHE_DB),
+                                state['config'].weekly_target
+                            )
+                            if _uu_dual is not None:
+                                _uu_ga_pool = augment_pool_with_surrogate_blend(_uu_ga_pool, _uu_dual)
+                                _uu_ga_seed = augment_pool_with_surrogate_blend(_uu_ga_seed, _uu_dual)
+                                if 'surrogate_salsa_score' in _uu_ga_pool.columns:
+                                    _uu_ga_score_col = 'surrogate_salsa_score'
+                                    bt.logging.info(
+                                        "[§UUUUUU] GA pool augmented with dual surrogate blend "
+                                        "— evolving toward Boltz-calibrated fitness."
+                                    )
+                        except Exception as _uu_ga_err:
+                            bt.logging.debug(f"[§UUUUUU] GA surrogate blend skipped: {_uu_ga_err}")
                         try:
                             ga_hits = await asyncio.to_thread(
                                 run_gradient_ga,
-                                state['global_candidate_pool'],
-                                ga_pool,
+                                _uu_ga_seed,
+                                _uu_ga_pool,
                                 5,   # n_generations
                                 50,  # pop_size
                                 5,   # top_k
+                                _uu_ga_score_col,  # §UUUUUU: surrogate-blended when RF available
                             )
                             if not ga_hits.empty:
                                 bt.logging.info(
