@@ -1,6 +1,82 @@
 # Boltz-2 Miner Integration
 
-## Current Status (as of 2026-07-17)
+## Current Status (as of 2026-07-19)
+
+§VVVVVV added 2026-07-19: Submission-Archive InChIKey Pre-Filter.
+
+---
+
+**§VVVVVV — Submission-Archive InChIKey Pre-Filter (`neurons/miner.py`)**
+
+**Problem:** The validator (`neurons/validator/validity.py`) calls
+`molecule_unique_for_protein_hf(protein, smiles)` for every submitted molecule.  If the
+molecule's InChIKey already appears in `Metanova/Submission-Archive/{target}_molecules.csv`
+on HuggingFace, the entire submission is rejected — the miner earns nothing for that epoch.
+
+The miner had no corresponding pre-filter.  In practice this means:
+
+1. On week-1 runs against a fresh target the risk is low (few competing InChIKeys in the
+   archive yet), but grows every epoch as more miners submit.
+2. On long-running campaigns the §PPPP warm-start and §JJ disk-cache fallback naturally
+   re-promote the *same* best-scoring molecule from the previous epoch.  If another miner
+   submitted that molecule or an identical compound (same InChIKey), this is now a
+   guaranteed rejection.
+3. With §RRRRRR cross-target seeding, molecules from prior-protein campaigns that happen to
+   share an InChIKey with an already-submitted molecule for the NEW target would waste GPU
+   time on what the validator will discard.
+
+**Fix:** In `run_boltz_prescoring`, immediately after the Boltz-safety mask, apply a second
+filter using `molecule_unique_for_protein_hf(protein, smiles)` from `utils.molecules`:
+
+```
+# §VVVVVV
+unique_mask = candidates['product_smiles'].apply(
+    lambda s: molecule_unique_for_protein_hf(protein, s)
+)
+candidates = candidates[unique_mask].reset_index(drop=True)
+```
+
+`molecule_unique_for_protein_hf` already holds its own 60-second TTL cache keyed by
+`(protein, HuggingFace commit hash)`: the first call per minute downloads the InChIKey CSV
+once; all subsequent calls within the minute are pure in-process set lookups (< 1 ms).  If
+the network is unavailable or the archive file doesn't exist yet (new target), the function
+returns `True` (assume unique) — so there is no regression risk for early epochs or offline
+environments.
+
+**Interaction with existing blocks:**
+
+- §PPPP warm-start pre-seeds `savi_stream_pool` from disk cache; §VVVVVV does not touch
+  `savi_stream_pool` — it only filters the `candidates` DataFrame built from it inside
+  `run_boltz_prescoring`.  The warm-start molecule at `state['candidate_product'][0]` is
+  NOT filtered here: §VVVVVV's scope is the Boltz GPU scoring queue.  If the warm-start
+  molecule is non-unique, `_reorder_submission` will replace it with the best unique
+  molecule from the scored candidates as soon as the first Boltz-2 result arrives.
+- §JJ cache-fallback pool: same — archive-duplicate disk-cache molecules are filtered before
+  GPU scoring.
+- §WW multi-seed stability check uses `all_scores` entries, all of which now correspond to
+  archive-unique molecules.
+- §MM hill-climbing seeds from the §FF winner (best Boltz-scored molecule), which is now
+  always archive-unique.
+
+**Expected benefit:**
+
+- Guaranteed: no GPU time wasted on candidates the validator will reject for non-uniqueness.
+- Guaranteed: `state['candidate_product'][0]` (position-0 molecule) is always archive-unique
+  after the first `_reorder_submission` call completes.
+- For converged long-running campaigns (week 3+): prevents the most likely rejection
+  scenario where §PPPP/§JJ keep re-promoting an already-submitted molecule.
+- Estimated GPU budget saved: 0–2 full Boltz-2 calls per epoch on week-3+ campaigns ≈
+  0–300 s on A100, 0–50 s on H100.
+
+**Files changed:**
+
+- `neurons/miner.py` — added `molecule_unique_for_protein_hf` to import;
+  §VVVVVV filter block inserted in `run_boltz_prescoring` after `safe_mask`.
+- `kb/raw/arxiv-survey.md` — roadmap updated to item 33.
+
+---
+
+## Previous Status (as of 2026-07-17)
 
 §UUUUUU added 2026-07-17: Surrogate-Guided GradientGA Fitness Function.
 

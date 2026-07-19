@@ -43,7 +43,7 @@ from utils import (
     get_heavy_atom_count,
     compute_maccs_entropy,
 )
-from utils.molecules import is_boltz_safe_smiles, get_canonical_smiles
+from utils.molecules import is_boltz_safe_smiles, get_canonical_smiles, molecule_unique_for_protein_hf
 from utils.msa import ensure_msa
 from utils.salsa import run_salsa_search
 from utils.genetic import run_gradient_ga
@@ -1588,6 +1588,28 @@ async def run_boltz_prescoring(state: Dict[str, Any], max_candidates: int = 5) -
     candidates = candidates.head(max_candidates * 3).copy()
     safe_mask = candidates['product_smiles'].apply(lambda s: is_boltz_safe_smiles(s)[0])
     candidates = candidates[safe_mask].reset_index(drop=True)
+
+    # §VVVVVV: Filter candidates already present in the Submission-Archive before
+    # spending GPU time scoring them.  The validator's InChIKey uniqueness check
+    # rejects the entire submission if the top molecule's InChIKey is in the archive
+    # for this target protein.  Pre-filtering here ensures every Boltz-2 call is
+    # spent on a candidate that can actually be accepted.
+    # molecule_unique_for_protein_hf() uses a 60 s TTL HuggingFace cache, so the
+    # first call per minute hits the network and subsequent calls are free.
+    # Fails open (skips filtering) on any network or parse error.
+    try:
+        _vv_mask = candidates['product_smiles'].apply(
+            lambda s: molecule_unique_for_protein_hf(protein, s)
+        )
+        _vv_n_filtered = int((~_vv_mask).sum())
+        candidates = candidates[_vv_mask].reset_index(drop=True)
+        if _vv_n_filtered > 0:
+            bt.logging.info(
+                f"[§VVVVVV] Removed {_vv_n_filtered} already-submitted candidate(s) "
+                f"(InChIKey in Submission-Archive for {protein}) before Boltz scoring."
+            )
+    except Exception as _vv_err:
+        bt.logging.debug(f"[§VVVVVV] Archive pre-filter skipped (non-fatal): {_vv_err}")
 
     # §ZZ / §YYYYY: Re-rank Boltz candidates by surrogate when ≥ 40 scores cached.
     # §YYYYY dual surrogate: when ≥ 40 rows with complete APB/APV component data
