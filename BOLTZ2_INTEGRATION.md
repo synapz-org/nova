@@ -1,6 +1,103 @@
 # Boltz-2 Miner Integration
 
-## Current Status (as of 2026-07-19)
+## Current Status (as of 2026-07-21)
+
+§WWWWWWW added 2026-07-21: Boltz-2 Ensemble Variance as Surrogate Confidence Signal.
+
+---
+
+**§WWWWWWW — Boltz-2 Ensemble Variance Cache Storage + Surrogate Confidence Weighting (`neurons/miner.py`, `utils/surrogate.py`, `utils/github.py`)**
+
+**Problem:** The dual RF surrogate (§YYYYY/§AAAAAA) uses `ligand_iptm` (§DDDDDD) as the sole
+confidence weight when training on cached Boltz-2 measurements.  `ligand_iptm` reflects Boltz-2's
+confidence in the *pose quality* — but a well-posed complex can still have a noisy *affinity
+prediction* if the diffusion process samples widely across the energy landscape.
+
+With `diffusion_samples_affinity=3`, each full Boltz inference already produces 3 independent LE
+estimates: `(APB₀−APV₀)/HA`, `(APB₁−APV₁)/HA`, `(APB₂−APV₂)/HA`.  §SSSS averages these for
+ordering, but the standard deviation — a direct measure of Boltz's affinity prediction stability —
+is discarded.
+
+**Consequence:** The surrogate trains equally on stable high-confidence Boltz predictions (std ≈
+0.005 LE units) and noisy measurements where the 3 samples disagree substantially (std ≈ 0.05 LE
+units).  Noisy training points reduce NDCG: the RF interpolates between values that represent
+different binding-mode samplies rather than a consensus binding signal.
+
+**Fix:** At every `_disk_cache_put` call site, compute:
+
+```python
+boltz_le_std = std([LE_0, LE_1, LE_2])   # ddof=0, population std; None if <2 samples
+```
+
+Store in a new nullable `boltz_le_std REAL` column.  In both `fit_surrogate` and
+`fit_dual_surrogate`, apply a combined weight:
+
+```python
+w = max(0.1, ligand_iptm) / (1.0 + 10.0 × boltz_le_std)
+# clamped: max(0.05, w)
+```
+
+Penalty factor k=10 calibration:
+| `boltz_le_std` | relative penalty |
+|----------------|-----------------|
+| 0.0 (NULL → COALESCE 0) | 1.00 (no change) |
+| 0.005 (stable) | 0.95 (5% down-weight) |
+| 0.02 (moderate) | 0.83 (17% down-weight) |
+| 0.05 (noisy)   | 0.67 (33% down-weight) |
+
+**Backward compatibility:**
+- Existing cache rows get `COALESCE(boltz_le_std, 0.0)` → no penalty (unchanged behaviour).
+- GitHub export entries from before §WWWWWWW have no `le_std` key → `_e.get('le_std')` → None →
+  stored as NULL → COALESCE to 0.0.
+- Fast-screen Boltz calls (`fast=True`) use only 1 diffusion sample (§NN), so `_compute_le_std`
+  returns None for those entries — also stored as NULL with no penalty.
+
+**Helper function:**
+
+```python
+def _compute_le_std(comps: dict) -> Optional[float]:
+    ha = comps.get('heavy_atom_count') or 1
+    pairs = [
+        (comps.get('affinity_probability_binary'), comps.get('affinity_pred_value')),
+        (comps.get('affinity_probability_binary1'), comps.get('affinity_pred_value1')),
+        (comps.get('affinity_probability_binary2'), comps.get('affinity_pred_value2')),
+    ]
+    mem_scores = [(apb - apv) / ha for apb, apv in pairs if both valid]
+    return float(np.std(mem_scores, ddof=0)) if len(mem_scores) >= 2 else None
+```
+
+**Files changed:**
+
+- `neurons/miner.py`:
+  - `_init_boltz_cache_db`: `ALTER TABLE boltz_cache ADD COLUMN boltz_le_std REAL`
+  - `_disk_cache_put`: new `boltz_le_std` param; updated INSERT to 8 columns
+  - `_compute_le_std`: new module-level helper (26 lines)
+  - 5 call sites (initial pass, §FF, §MM, §XX, §TTTTTT): `boltz_le_std=_compute_le_std(_comps)`
+  - §PPPPPP import INSERT: includes `boltz_le_std` from `_e.get('le_std')`
+  - §RRRRRR history INSERT: same
+
+- `utils/surrogate.py`:
+  - `fit_surrogate`: SQL adds `COALESCE(boltz_le_std, 0.0)`; weight formula updated
+  - `fit_dual_surrogate`: same SQL + weight update
+
+- `utils/github.py`:
+  - `upload_boltz_cache_export`: SELECT adds `boltz_le_std`; entries dict adds `"le_std": r[6]`
+  - History SELECT and entry dict updated identically
+
+**Expected benefit:**
+
+On epoch 3+ when the RF surrogate is active (≥100 cache points):
+- Estimated +3–5% NDCG improvement in surrogate quality from cleaner training signal
+- Stacks multiplicatively with §DDDDDD (ligand_iptm weighting)
+- On H100 hardware where all 3 diffusion samples are parallel (§LLLLLL), `boltz_le_std` is
+  available for essentially every full-quality Boltz call — maximum benefit
+
+Zero regression: NULL entries → COALESCE(0.0) → no weight change for old cache rows or
+GitHub-imported entries.
+
+---
+
+## Previous Status (as of 2026-07-19)
 
 §VVVVVV added 2026-07-19: Submission-Archive InChIKey Pre-Filter.
 

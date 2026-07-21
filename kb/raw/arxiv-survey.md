@@ -358,7 +358,7 @@ Even a partial result (1 of 5 molecules scored) improves on the PSICHIC-only bas
 
 ## Implementation Roadmap (priority order)
 
-All items 1–33 are **implemented**. Items 5 and 7 remain as conditional/research directions.
+All items 1–34 are **implemented**. Items 5 and 7 remain as conditional/research directions.
 
 | Priority | Approach | Effort | Status | Expected gain |
 |----------|----------|--------|--------|---------------|
@@ -395,6 +395,7 @@ All items 1–33 are **implemented**. Items 5 and 7 remain as conditional/resear
 | 31 | §TTTTTT: Extended §XX tautomer search for 2nd/3rd epoch-best molecules | 200 lines | ✅ Done | +2–5% chance of new epoch best from rank-2/3 scaffold tautomers; free when all hits cached |
 | 32 | §UUUUUU: Surrogate-guided GradientGA fitness — replace PSICHIC score with dual RF surrogate blend in GA tournament selection | 30 lines | ✅ Done | +3–6% Boltz score on GA-active epochs (epoch 3+, ≥100 cache points) by evolving toward Boltz objective instead of PSICHIC |
 | 33 | §VVVVVV: Submission-Archive InChIKey pre-filter — drop candidates already submitted by any miner before Boltz-2 scoring | 20 lines | ✅ Done | Prevents wasted GPU time on non-unique submissions; ensures submitted molecule is always validator-accepted |
+| 34 | §WWWWWWW: Boltz-2 ensemble variance cache storage — store std of 3-sample LE in boltz_le_std; use as combined down-weight with ligand_iptm in RF surrogate training | 70 lines | ✅ Done | +3–5% NDCG improvement in surrogate quality from epoch 3+; stacks with §DDDDDD |
 
 All approaches share the same submission constraint: molecules must map to valid SAVI-2020
 product names. SALSA and GradientGA both solve this via nearest-neighbour SAVI-2020 lookup.

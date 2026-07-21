@@ -80,6 +80,10 @@ def _init_boltz_cache_db(db_path: str) -> None:
             # §DDDDDD: store ligand_iptm (inter-chain pTM for the ligand chain) so
             # the surrogate can down-weight low-confidence training examples.
             "ALTER TABLE boltz_cache ADD COLUMN ligand_iptm REAL",
+            # §WWWWWWW: store std of per-sample LE across the 3 affinity diffusion
+            # samples (primary + _1 + _2).  High std → noisy Boltz prediction →
+            # down-weight in surrogate training alongside ligand_iptm.
+            "ALTER TABLE boltz_cache ADD COLUMN boltz_le_std REAL",
         ):
             try:
                 conn.execute(_col_ddl)
@@ -122,6 +126,7 @@ def _disk_cache_put(
     apb: Optional[float] = None,
     apv: Optional[float] = None,
     ligand_iptm: Optional[float] = None,
+    boltz_le_std: Optional[float] = None,
 ) -> None:
     """Upsert a Boltz score into the persistent cache (silently ignores errors).
 
@@ -131,17 +136,48 @@ def _disk_cache_put(
     §DDDDDD: ligand_iptm is also stored so the surrogate can apply confidence-based
     sample weighting — low ligand_iptm (<0.25) indicates an uncertain binding pose
     whose APB/APV values are noisy and should contribute less to surrogate training.
+    §WWWWWWW: boltz_le_std is the std of LE across the 3 affinity diffusion samples;
+    high variance → additional down-weight on top of ligand_iptm in the surrogate.
     """
     try:
         with sqlite3.connect(db_path) as conn:
             conn.execute(
                 "INSERT OR REPLACE INTO boltz_cache "
-                "(smiles, protein, score, product_name, affinity_prob_binary, affinity_pred_val, ligand_iptm) "
-                "VALUES (?,?,?,?,?,?,?)",
-                (smiles, protein, score, product_name, apb, apv, ligand_iptm),
+                "(smiles, protein, score, product_name, affinity_prob_binary, "
+                "affinity_pred_val, ligand_iptm, boltz_le_std) "
+                "VALUES (?,?,?,?,?,?,?,?)",
+                (smiles, protein, score, product_name, apb, apv, ligand_iptm, boltz_le_std),
             )
     except Exception:
         pass
+
+
+def _compute_le_std(comps: dict) -> Optional[float]:
+    """§WWWWWWW: Compute std of per-sample LE from boltz per_molecule_components dict.
+
+    Returns the sample std of (apb - apv) / ha across the 3 affinity diffusion
+    samples (primary + _1 + _2), or None when fewer than 2 samples are available.
+    Called at each _disk_cache_put site so high-variance Boltz runs get an extra
+    down-weight in surrogate training on top of the §DDDDDD ligand_iptm penalty.
+    """
+    try:
+        ha = comps.get('heavy_atom_count') or 1
+        if not ha or ha <= 0:
+            return None
+        pairs = [
+            (comps.get('affinity_probability_binary'), comps.get('affinity_pred_value')),
+            (comps.get('affinity_probability_binary1'), comps.get('affinity_pred_value1')),
+            (comps.get('affinity_probability_binary2'), comps.get('affinity_pred_value2')),
+        ]
+        mem_scores = [
+            (apb - apv) / ha
+            for apb, apv in pairs
+            if isinstance(apb, (int, float)) and isinstance(apv, (int, float))
+            and math.isfinite(apb) and math.isfinite(apv)
+        ]
+        return float(np.std(mem_scores, ddof=0)) if len(mem_scores) >= 2 else None
+    except Exception:
+        return None
 
 
 def _cleanup_boltz_cache(db_path: str, keep_protein: str, max_age_days: int = 14) -> None:
@@ -1840,14 +1876,17 @@ async def run_boltz_prescoring(state: Dict[str, Any], max_candidates: int = 5) -
                         _pname = None
                     # §YYYYY: extract primary APB/APV for component caching.
                     # §DDDDDD: also extract ligand_iptm for confidence-weighted surrogate.
+                    # §WWWWWWW: compute per-sample LE std for additional variance weighting.
                     _yyyyy_apb = _comps.get('affinity_probability_binary')
                     _yyyyy_apv = _comps.get('affinity_pred_value')
                     _dddddd_li = _comps.get('ligand_iptm')
+                    _wwwwwww_le_std = _compute_le_std(_comps)
                     _disk_cache_put(
                         db_path, canon, protein, score, product_name=_pname,
                         apb=_yyyyy_apb if isinstance(_yyyyy_apb, (int, float)) else None,
                         apv=_yyyyy_apv if isinstance(_yyyyy_apv, (int, float)) else None,
                         ligand_iptm=_dddddd_li if isinstance(_dddddd_li, (int, float)) else None,
+                        boltz_le_std=_wwwwwww_le_std,
                     )
 
                     # Adaptive trigger: one molecule gives the most accurate per-mol timing
@@ -2056,6 +2095,7 @@ async def run_boltz_prescoring(state: Dict[str, Any], max_candidates: int = 5) -
                                         apb=_ff_apb if isinstance(_ff_apb, (int, float)) else None,
                                         apv=_ff_apv if isinstance(_ff_apv, (int, float)) else None,
                                         ligand_iptm=_ff_li if isinstance(_ff_li, (int, float)) else None,
+                                        boltz_le_std=_compute_le_std(_ff_comps),
                                     )
                                     bt.logging.info(
                                         f"§FF §NN full-scored winner: {_ff_w_row.get('product_name', '?')} "
@@ -2310,6 +2350,7 @@ async def run_boltz_prescoring(state: Dict[str, Any], max_candidates: int = 5) -
                                 apb=_mm_apb if isinstance(_mm_apb, (int, float)) else None,
                                 apv=_mm_apv if isinstance(_mm_apv, (int, float)) else None,
                                 ligand_iptm=_mm_li if isinstance(_mm_li, (int, float)) else None,
+                                boltz_le_std=_compute_le_std(_mm_comps),
                             )
                             if wrapper.last_inference_duration > 0:
                                 state['boltz_time_per_mol'] = wrapper.last_inference_duration
@@ -2648,6 +2689,7 @@ async def run_boltz_prescoring(state: Dict[str, Any], max_candidates: int = 5) -
                                                 ligand_iptm=_xx_li if isinstance(
                                                     _xx_li, (int, float)
                                                 ) else None,
+                                                boltz_le_std=_compute_le_std(_xx_comps),
                                             )
                                             if wrapper.last_inference_duration > 0:
                                                 state['boltz_time_per_mol'] = (
@@ -2908,6 +2950,7 @@ async def run_boltz_prescoring(state: Dict[str, Any], max_candidates: int = 5) -
                                     ligand_iptm=_tt_li if isinstance(
                                         _tt_li, (int, float)
                                     ) else None,
+                                    boltz_le_std=_compute_le_std(_tt_comps),
                                 )
                                 if wrapper.last_inference_duration > 0:
                                     state['boltz_time_per_mol'] = (
@@ -3498,13 +3541,15 @@ async def run_miner(config: argparse.Namespace) -> None:
                                 cur = _pp_conn.execute(
                                     "INSERT OR IGNORE INTO boltz_cache "
                                     "(smiles, protein, score, ts, product_name, "
-                                    "affinity_prob_binary, affinity_pred_val, ligand_iptm) "
-                                    "VALUES (?,?,?,?,?,?,?,?)",
+                                    "affinity_prob_binary, affinity_pred_val, ligand_iptm, "
+                                    "boltz_le_std) "
+                                    "VALUES (?,?,?,?,?,?,?,?,?)",
                                     (
                                         _e['smiles'], config.weekly_target,
                                         _e['score'], 0,
                                         _e.get('product_name') or '',
                                         _e.get('apb'), _e.get('apv'), _e.get('ligand_iptm'),
+                                        _e.get('le_std'),
                                     ),
                                 )
                                 if cur.rowcount:
@@ -3538,13 +3583,15 @@ async def run_miner(config: argparse.Namespace) -> None:
                                 _rr_conn.execute(
                                     "INSERT OR IGNORE INTO boltz_cache "
                                     "(smiles, protein, score, ts, product_name, "
-                                    "affinity_prob_binary, affinity_pred_val, ligand_iptm) "
-                                    "VALUES (?,?,?,?,?,?,?,?)",
+                                    "affinity_prob_binary, affinity_pred_val, ligand_iptm, "
+                                    "boltz_le_std) "
+                                    "VALUES (?,?,?,?,?,?,?,?,?)",
                                     (
                                         _e['smiles'], _rr_protein,
                                         _e['score'], _rr_ts,
                                         _e.get('product_name') or '',
                                         _e.get('apb'), _e.get('apv'), _e.get('ligand_iptm'),
+                                        _e.get('le_std'),
                                     ),
                                 )
                             except Exception:
