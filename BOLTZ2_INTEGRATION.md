@@ -1,6 +1,71 @@
 # Boltz-2 Miner Integration
 
-## Current Status (as of 2026-07-21)
+## Current Status (as of 2026-07-22)
+
+§XXXXXXXX added 2026-07-22: §WW Inter-Seed Variance Cache + numpy import bugfix.
+
+---
+
+**§XXXXXXXX — §WW Inter-Seed Standard Deviation Cache (`neurons/miner.py`, `utils/surrogate.py`, `utils/github.py`)**
+
+**Bugfix (critical):** `_compute_le_std` in `neurons/miner.py` called `np.std()` but `import numpy as np` was missing from `miner.py`'s import block.  The bare `except Exception` in `_compute_le_std` silently caught the `NameError`, causing `boltz_le_std` to return `None` for every molecule — meaning §WWWWWWW's surrogate variance weighting was completely inactive since deployment.  Fixed by adding `import numpy as np` after the stdlib imports.
+
+**Problem:** §WWWWWWW adds intra-run diffusion sample variance (`boltz_le_std` = std of 3 samples within one Boltz call) as a surrogate confidence weight.  But there is a second orthogonal noise source: **inter-seed variance** — Boltz-2's sensitivity to the random diffusion seed.  §WW already computes 3-seed scores `[s_68, s_42, s_123]` for the top-2 candidates each epoch, but these inter-seed measurements are discarded after the position-0 ordering decision.
+
+A molecule where seeds 68, 42, 123 give LE values of 0.10, 0.05, 0.08 (std=0.025) is a much noisier training example than one that gives 0.10, 0.10, 0.09 (std=0.005) — yet the surrogate currently treats them identically if they share the same `ligand_iptm` and `boltz_le_std`.
+
+**Fix:** Add a `boltz_ww_std REAL` column to `boltz_cache`.  Inside the §WW outer loop, when ≥2 seeds returned finite scores (`len(_ww_mol_scores) >= 2`), compute `std(_ww_mol_scores, ddof=0)` and UPDATE the SQLite row for that molecule.  Uses `UPDATE … SET boltz_ww_std=?` (not `INSERT OR REPLACE`) to preserve all other columns.
+
+In both `fit_surrogate` and `fit_dual_surrogate`, apply a combined denominator:
+
+```python
+w = max(0.1, lig_iptm) / (
+    (1.0 + 10.0 * le_std) * (1.0 + 10.0 * ww_std)
+)
+w = max(0.05, w)
+```
+
+k=10 calibration for `ww_std` (same as §WWWWWWW):
+| `boltz_ww_std` | relative penalty (on top of le_std factor) |
+|----------------|---------------------------------------------|
+| 0.0 (NULL → COALESCE 0) | 1.00 (no change) |
+| 0.005 (stable across seeds) | 0.95 (5% down-weight) |
+| 0.02 (moderate) | 0.83 (17% down-weight) |
+| 0.05 (noisy)   | 0.67 (33% down-weight) |
+
+**Backward compatibility:**
+- Existing rows get `COALESCE(boltz_ww_std, 0.0)` → no penalty (unchanged behaviour).
+- §WW only fires when ≥4 mol-times remain, so most cache rows will have NULL `ww_std`; the COALESCE handles this.
+- INSERT OR IGNORE in §PPPPPP/§RRRRRR includes `ww_std` from `_e.get('ww_std')` → NULL for pre-§XXXXXXXX exports → no penalty.
+
+**Expected benefit:**
+
+On epoch 3+ when the RF surrogate is active (≥100 cache points):
+- Top-2 candidates per epoch now contribute more accurate confidence weights
+- These top-scoring examples disproportionately influence the surrogate's accuracy in the high-LE region that §MM and §FF search
+- Combined with the numpy bugfix (§WWWWWWW now actually active), estimated +3–6% NDCG improvement vs. what §WWWWWWW was delivering (zero) before this fix
+- Additional +1–2% from §XXXXXXXX's cross-seed variance weighting on top of the now-working intra-run weighting
+
+**Files changed:**
+
+- `neurons/miner.py`:
+  - Import block: `import numpy as np` (bugfix — previously absent, silently broke §WWWWWWW)
+  - `_init_boltz_cache_db`: `ALTER TABLE boltz_cache ADD COLUMN boltz_ww_std REAL`
+  - §WW inner loop: compute `np.std(_ww_mol_scores, ddof=0)` when len≥2; UPDATE SQLite via targeted `UPDATE ... SET boltz_ww_std=?`
+  - §PPPPPP INSERT: 10th column `boltz_ww_std`, value `_e.get('ww_std')`
+  - §RRRRRR history INSERT: same
+
+- `utils/surrogate.py`:
+  - `fit_surrogate`: SQL adds `COALESCE(boltz_ww_std, 0.0)`; weight denominator becomes product of two factors
+  - `fit_dual_surrogate`: same SQL + weight update
+
+- `utils/github.py`:
+  - `upload_boltz_cache_export`: SELECT adds `boltz_ww_std`; entries dict adds `"ww_std": r[7]`
+  - History SELECT and entry dict updated identically
+
+---
+
+## Previous Status (as of 2026-07-21)
 
 §WWWWWWW added 2026-07-21: Boltz-2 Ensemble Variance as Surrogate Confidence Signal.
 

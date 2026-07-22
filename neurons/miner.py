@@ -13,6 +13,8 @@ import hashlib
 import json
 import sqlite3
 
+import numpy as np
+
 from rdkit import Chem
 from rdkit.Chem import Descriptors
 
@@ -84,6 +86,11 @@ def _init_boltz_cache_db(db_path: str) -> None:
             # samples (primary + _1 + _2).  High std → noisy Boltz prediction →
             # down-weight in surrogate training alongside ligand_iptm.
             "ALTER TABLE boltz_cache ADD COLUMN boltz_le_std REAL",
+            # §XXXXXXXX: store std of LE scores across the 3 §WW random seeds (68/42/123).
+            # Captures inter-seed diffusion variance — orthogonal to boltz_le_std (which
+            # measures intra-run sample variance).  High ww_std → noisy cross-seed
+            # prediction → additional down-weight in surrogate training.
+            "ALTER TABLE boltz_cache ADD COLUMN boltz_ww_std REAL",
         ):
             try:
                 conn.execute(_col_ddl)
@@ -3081,6 +3088,28 @@ async def run_boltz_prescoring(state: Dict[str, Any], max_candidates: int = 5) -
                         f"§WW: {_ww_pname} mean={_ww_mean[_ww_sm]:.4f} "
                         f"({len(_ww_mol_scores)} seed(s): {[f'{s:.4f}' for s in _ww_mol_scores]})"
                     )
+                    # §XXXXXXXX: Persist inter-seed std to SQLite for surrogate
+                    # confidence weighting.  Only stored when ≥2 seeds returned
+                    # finite scores so the std is meaningful.  Uses UPDATE (not
+                    # INSERT OR REPLACE) to preserve all other columns unchanged.
+                    if len(_ww_mol_scores) >= 2:
+                        _xx_ww_std = float(np.std(_ww_mol_scores, ddof=0))
+                        _xx_can = get_canonical_smiles(_ww_sm) or _ww_sm
+                        try:
+                            with sqlite3.connect(db_path) as _xx_conn:
+                                _xx_conn.execute(
+                                    "UPDATE boltz_cache SET boltz_ww_std=? "
+                                    "WHERE smiles=? AND protein=?",
+                                    (_xx_ww_std, _xx_can, protein),
+                                )
+                            bt.logging.debug(
+                                f"[§XXXXXXXX] {_ww_pname}: ww_std={_xx_ww_std:.4f} "
+                                f"({len(_ww_mol_scores)} seeds)"
+                            )
+                        except Exception as _xx_e:
+                            bt.logging.debug(
+                                f"[§XXXXXXXX] ww_std persist failed (non-fatal): {_xx_e}"
+                            )
 
                 # Reorder pos-0 based on mean scores if top-2 both have estimates
                 if len(_ww_mean) >= 2:
@@ -3542,14 +3571,14 @@ async def run_miner(config: argparse.Namespace) -> None:
                                     "INSERT OR IGNORE INTO boltz_cache "
                                     "(smiles, protein, score, ts, product_name, "
                                     "affinity_prob_binary, affinity_pred_val, ligand_iptm, "
-                                    "boltz_le_std) "
-                                    "VALUES (?,?,?,?,?,?,?,?,?)",
+                                    "boltz_le_std, boltz_ww_std) "
+                                    "VALUES (?,?,?,?,?,?,?,?,?,?)",
                                     (
                                         _e['smiles'], config.weekly_target,
                                         _e['score'], 0,
                                         _e.get('product_name') or '',
                                         _e.get('apb'), _e.get('apv'), _e.get('ligand_iptm'),
-                                        _e.get('le_std'),
+                                        _e.get('le_std'), _e.get('ww_std'),
                                     ),
                                 )
                                 if cur.rowcount:
@@ -3584,14 +3613,14 @@ async def run_miner(config: argparse.Namespace) -> None:
                                     "INSERT OR IGNORE INTO boltz_cache "
                                     "(smiles, protein, score, ts, product_name, "
                                     "affinity_prob_binary, affinity_pred_val, ligand_iptm, "
-                                    "boltz_le_std) "
-                                    "VALUES (?,?,?,?,?,?,?,?,?)",
+                                    "boltz_le_std, boltz_ww_std) "
+                                    "VALUES (?,?,?,?,?,?,?,?,?,?)",
                                     (
                                         _e['smiles'], _rr_protein,
                                         _e['score'], _rr_ts,
                                         _e.get('product_name') or '',
                                         _e.get('apb'), _e.get('apv'), _e.get('ligand_iptm'),
-                                        _e.get('le_std'),
+                                        _e.get('le_std'), _e.get('ww_std'),
                                     ),
                                 )
                             except Exception:

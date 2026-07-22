@@ -118,7 +118,10 @@ def fit_surrogate(db_path: str, protein: str, min_points: int = 40):
             rows = conn.execute(
                 # §DDDDDD: COALESCE ligand_iptm to 1.0 for pre-§DDDDDD cache rows.
                 # §WWWWWWW: COALESCE boltz_le_std to 0.0 (no variance penalty for old rows).
-                "SELECT smiles, score, COALESCE(ligand_iptm, 1.0), COALESCE(boltz_le_std, 0.0) "
+                # §XXXXXXXX: COALESCE boltz_ww_std to 0.0 (no inter-seed penalty for rows
+                # that §WW never re-scored or that pre-date §XXXXXXXX).
+                "SELECT smiles, score, COALESCE(ligand_iptm, 1.0), "
+                "COALESCE(boltz_le_std, 0.0), COALESCE(boltz_ww_std, 0.0) "
                 "FROM boltz_cache WHERE protein=?",
                 (protein,),
             ).fetchall()
@@ -131,14 +134,19 @@ def fit_surrogate(db_path: str, protein: str, min_points: int = 40):
     # §DDDDDD: weight each training example by ligand_iptm.
     # §WWWWWWW: additionally divide by (1 + 10 × boltz_le_std) so molecules where
     # the 3 affinity diffusion samples disagreed strongly contribute less signal.
-    # NULL le_std → 0.0 (no variance penalty) for pre-§WWWWWWW or fast-screened rows.
+    # §XXXXXXXX: additionally divide by (1 + 10 × boltz_ww_std) so molecules where
+    # the §WW cross-seed re-scoring showed high inter-seed variance (computed from
+    # the std of [s_68, s_42, s_123]) contribute even less to surrogate training.
+    # NULL ww_std → 0.0 → no additional penalty (pre-§XXXXXXXX or §WW never fired).
     X, y, weights = [], [], []
-    for smiles, score, lig_iptm, le_std in rows:
+    for smiles, score, lig_iptm, le_std, ww_std in rows:
         vec = _descriptor_vector(smiles)
         if vec is not None:
             X.append(vec)
             y.append(float(score))
-            w = max(0.1, float(lig_iptm)) / (1.0 + 10.0 * float(le_std))
+            w = max(0.1, float(lig_iptm)) / (
+                (1.0 + 10.0 * float(le_std)) * (1.0 + 10.0 * float(ww_std))
+            )
             weights.append(max(0.05, w))
 
     if len(X) < min_points:
@@ -304,8 +312,11 @@ def fit_dual_surrogate(db_path: str, protein: str, min_points: int = 40):
             rows = conn.execute(
                 # §DDDDDD: COALESCE ligand_iptm to 1.0 for pre-§DDDDDD cache rows.
                 # §WWWWWWW: COALESCE boltz_le_std to 0.0 (no variance penalty for old rows).
+                # §XXXXXXXX: COALESCE boltz_ww_std to 0.0 (no inter-seed penalty for rows
+                # that §WW never re-scored or that pre-date §XXXXXXXX).
                 "SELECT smiles, affinity_prob_binary, affinity_pred_val, "
-                "COALESCE(ligand_iptm, 1.0), COALESCE(boltz_le_std, 0.0) "
+                "COALESCE(ligand_iptm, 1.0), COALESCE(boltz_le_std, 0.0), "
+                "COALESCE(boltz_ww_std, 0.0) "
                 "FROM boltz_cache "
                 "WHERE protein=? "
                 "  AND affinity_prob_binary IS NOT NULL "
@@ -318,17 +329,21 @@ def fit_dual_surrogate(db_path: str, protein: str, min_points: int = 40):
     if len(rows) < min_points:
         return None
 
-    # §DDDDDD + §WWWWWWW: combined confidence-weighted training.
-    # Weight = ligand_iptm / (1 + 10 × boltz_le_std): low-confidence poses AND
-    # high-variance Boltz predictions both reduce the training point's influence.
+    # §DDDDDD + §WWWWWWW + §XXXXXXXX: combined confidence-weighted training.
+    # Weight = ligand_iptm / ((1 + 10×le_std) × (1 + 10×ww_std)):
+    # - low-confidence poses (ligand_iptm): reduce training influence
+    # - high intra-run sample variance (boltz_le_std): further reduce
+    # - high inter-seed variance (boltz_ww_std): further reduce
     X, y_apb, y_apv, weights = [], [], [], []
-    for smiles, apb, apv, lig_iptm, le_std in rows:
+    for smiles, apb, apv, lig_iptm, le_std, ww_std in rows:
         vec = _descriptor_vector(smiles)
         if vec is not None:
             X.append(vec)
             y_apb.append(float(apb))
             y_apv.append(float(apv))
-            w = max(0.1, float(lig_iptm)) / (1.0 + 10.0 * float(le_std))
+            w = max(0.1, float(lig_iptm)) / (
+                (1.0 + 10.0 * float(le_std)) * (1.0 + 10.0 * float(ww_std))
+            )
             weights.append(max(0.05, w))
 
     if len(X) < min_points:
