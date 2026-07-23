@@ -1,6 +1,34 @@
 # Boltz-2 Miner Integration
 
-## Current Status (as of 2026-07-22)
+## Current Status (as of 2026-07-23)
+
+**All 35 roadmap items implemented.** Boltz-2 is fully integrated as the primary scoring
+engine (50% of subnet incentive).  SALSA and GradientGA are also complete.  Two new
+optimisation opportunities identified for the next development cycle:
+
+- **§YYYYYY — Startup Surrogate for Inline PSICHIC Chunk Augmentation (proposed)**
+  Fit the dual RF surrogate at miner startup from the GitHub cache export (if ≥ 40 cache
+  points exist for the current protein).  Use it to augment `combined_score` inline in the
+  PSICHIC streaming loop — replacing pure PSICHIC ranking with a 0.4 × PSICHIC + 0.6 ×
+  surrogate(APB−APV)/HA blend from the very first SAVI chunk.  Currently the surrogate is
+  only applied at SALSA trigger time (§ZZ) and GA trigger time (§UUUUUU); the initial
+  global_candidate_pool accumulates on pure PSICHIC rank.  Warm-cache sessions (container
+  restart with ≥ 100 GitHub-imported entries) would immediately have a Boltz-calibrated pool,
+  giving SALSA better seeds when streaming time is short.  ~50 lines in neurons/miner.py.
+  Estimated gain: +3–8% on warm-cache restart sessions; no change on cold-cache first epoch.
+
+- **§ZZZZZZZZ — Cache-Aware Adaptive §WW Seed Budget (proposed)**
+  §WW always runs 2 extra seeds (42 and 123) for the top-2 molecules, spending 4 Boltz calls.
+  When a molecule's `boltz_ww_std` (stored since §XXXXXXXX) is already in the cache and is
+  very low (< 0.003 — less than half the typical stable-molecule threshold), skip the extra
+  seeds and use only seed=68.  Save 1–2 Boltz call budgets that could be spent on additional
+  §MM hill-climbing rounds or §TTTTTT tautomer search.  High-ww_std molecules still get all 3
+  seeds.  ~25 lines in neurons/miner.py.  Estimated gain: +2–4% on epoch 3+ runs where the
+  top-2 candidates are already in the Boltz cache from prior epochs.
+
+---
+
+## Previous Status (as of 2026-07-22)
 
 §XXXXXXXX added 2026-07-22: §WW Inter-Seed Variance Cache + numpy import bugfix.
 
