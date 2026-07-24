@@ -820,6 +820,18 @@ async def run_psichic_model_loop(state: Dict[str, Any]) -> None:
                 df.sort_values(by=['combined_score'], ascending=[False], inplace=True)
                 df.reset_index(drop=True, inplace=True)
 
+                # §YYYYYY: Re-rank with startup dual surrogate when available.
+                # augment_pool_with_surrogate_blend only fires for RF models (≥100 pts);
+                # on cold starts or Ridge-only quality it returns df unchanged.
+                _yyyyyy_sds = state.get('startup_dual_surrogate')
+                if _yyyyyy_sds is not None:
+                    _yyyyyy_aug = augment_pool_with_surrogate_blend(df, _yyyyyy_sds)
+                    if 'surrogate_salsa_score' in _yyyyyy_aug.columns:
+                        df = _yyyyyy_aug.sort_values(
+                            'surrogate_salsa_score', ascending=False
+                        ).drop(columns=['surrogate_salsa_score'])
+                        df.reset_index(drop=True, inplace=True)
+
                 # Select top 10 molecules
                 top_molecules = df.iloc[:10]
 
@@ -3056,7 +3068,28 @@ async def run_boltz_prescoring(state: Dict[str, Any], max_candidates: int = 5) -
                         continue
 
                     _ww_mol_scores = [_ww_seed68_score]
-                    for _ww_seed in _ww_extra_seeds:
+                    # §ZZZZZZZZ: Skip extra seeds when the cached inter-seed std is
+                    # already very low (< 0.003) — the molecule is diffusion-stable
+                    # and re-running seeds 42/123 would just confirm what we know.
+                    # Saves 1–2 Boltz call budgets for §MM/§TTTTTT on epoch 3+.
+                    _zz_extra_seeds = list(_ww_extra_seeds)
+                    try:
+                        _zz_can = get_canonical_smiles(_ww_sm) or _ww_sm
+                        with sqlite3.connect(db_path) as _zz_conn:
+                            _zz_row = _zz_conn.execute(
+                                "SELECT boltz_ww_std FROM boltz_cache "
+                                "WHERE smiles=? AND protein=?",
+                                (_zz_can, protein),
+                            ).fetchone()
+                        if _zz_row and _zz_row[0] is not None and float(_zz_row[0]) < 0.003:
+                            _zz_extra_seeds = []
+                            bt.logging.info(
+                                f"[§ZZZZZZZZ] {_ww_pname}: cached ww_std={_zz_row[0]:.4f}"
+                                " < 0.003 — skipping extra seeds (diffusion-stable)."
+                            )
+                    except Exception:
+                        pass
+                    for _ww_seed in _zz_extra_seeds:
                         try:
                             _ww_blk2 = await state['subtensor'].get_current_block()
                             _ww_ep2 = ((_ww_blk2 // state['epoch_length']) + 1) * state['epoch_length']
@@ -3499,6 +3532,7 @@ async def run_miner(config: argparse.Namespace) -> None:
         'bbb_run_this_epoch': False,     # §BBB: prevent duplicate post-GA SALSA runs per epoch
         'best_ga_smiles': None,          # §BBB: best SMILES found by GradientGA this epoch
         'chembl_seeds': [],              # §SS: ChEMBL known actives, fetched at startup
+        'startup_dual_surrogate': None,  # §YYYYYY: dual RF surrogate fitted at startup from GitHub cache
         'best_boltz_rxn_class': None,    # §YY: winning rxn class for SAVI streaming bias (persists across epochs)
         'rxn_class_weights': {},          # §EEEEEE: {rxn_class: weight} for top-K multi-class sampling bias
         'best_score': float('-inf'),
@@ -3719,6 +3753,22 @@ async def run_miner(config: argparse.Namespace) -> None:
             )
     else:
         state['tttt_fragment_quota'] = 1000  # insufficient cache data — keep default
+
+    # §YYYYYY: Fit dual RF surrogate at startup from GitHub-imported cache so
+    # the PSICHIC streaming loop can blend its Boltz-calibrated signal from the
+    # very first SAVI chunk.  Only activates for RF models (≥100 cache points);
+    # falls back to None on cold starts or when only Ridge quality is available
+    # (augment_pool_with_surrogate_blend handles this guard internally).
+    try:
+        _yyyyyy_dual = fit_dual_surrogate(state['boltz_cache_db'], config.weekly_target)
+        if _yyyyyy_dual is not None:
+            state['startup_dual_surrogate'] = _yyyyyy_dual
+            bt.logging.info(
+                "[§YYYYYY] Startup dual surrogate fitted — PSICHIC streaming will "
+                "blend 0.4×PSICHIC + 0.6×surrogate from chunk 1 (RF tier only)."
+            )
+    except Exception as _yyyyyy_err:
+        bt.logging.debug(f"[§YYYYYY] Startup surrogate fit skipped: {_yyyyyy_err}")
 
     # Warm epoch start (§AA): pre-populate candidate_product from best cached result.
     # On first run the cache is empty; on subsequent runs this gives an immediate

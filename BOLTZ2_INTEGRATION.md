@@ -1,30 +1,80 @@
 # Boltz-2 Miner Integration
 
-## Current Status (as of 2026-07-23)
+## Current Status (as of 2026-07-24)
 
-**All 35 roadmap items implemented.** Boltz-2 is fully integrated as the primary scoring
-engine (50% of subnet incentive).  SALSA and GradientGA are also complete.  Two new
-optimisation opportunities identified for the next development cycle:
+**All 37 roadmap items implemented.** §YYYYYY and §ZZZZZZZZ added 2026-07-24.
 
-- **§YYYYYY — Startup Surrogate for Inline PSICHIC Chunk Augmentation (proposed)**
-  Fit the dual RF surrogate at miner startup from the GitHub cache export (if ≥ 40 cache
-  points exist for the current protein).  Use it to augment `combined_score` inline in the
-  PSICHIC streaming loop — replacing pure PSICHIC ranking with a 0.4 × PSICHIC + 0.6 ×
-  surrogate(APB−APV)/HA blend from the very first SAVI chunk.  Currently the surrogate is
-  only applied at SALSA trigger time (§ZZ) and GA trigger time (§UUUUUU); the initial
-  global_candidate_pool accumulates on pure PSICHIC rank.  Warm-cache sessions (container
-  restart with ≥ 100 GitHub-imported entries) would immediately have a Boltz-calibrated pool,
-  giving SALSA better seeds when streaming time is short.  ~50 lines in neurons/miner.py.
-  Estimated gain: +3–8% on warm-cache restart sessions; no change on cold-cache first epoch.
+---
 
-- **§ZZZZZZZZ — Cache-Aware Adaptive §WW Seed Budget (proposed)**
-  §WW always runs 2 extra seeds (42 and 123) for the top-2 molecules, spending 4 Boltz calls.
-  When a molecule's `boltz_ww_std` (stored since §XXXXXXXX) is already in the cache and is
-  very low (< 0.003 — less than half the typical stable-molecule threshold), skip the extra
-  seeds and use only seed=68.  Save 1–2 Boltz call budgets that could be spent on additional
-  §MM hill-climbing rounds or §TTTTTT tautomer search.  High-ww_std molecules still get all 3
-  seeds.  ~25 lines in neurons/miner.py.  Estimated gain: +2–4% on epoch 3+ runs where the
-  top-2 candidates are already in the Boltz cache from prior epochs.
+**§YYYYYY — Startup Surrogate for Inline PSICHIC Chunk Augmentation (`neurons/miner.py`)**
+
+**Problem:** The dual RF surrogate is fitted at SALSA trigger time (§ZZ, §HHHHHH) and GA
+trigger time (§UUUUUU), but the initial `global_candidate_pool` that accumulates during PSICHIC
+streaming uses pure PSICHIC rank.  On warm-cache restarts (≥100 GitHub-imported entries),
+the miner has enough data to fit an RF surrogate immediately at startup — yet it discards
+that signal for the entire streaming phase, passing uncalibrated PSICHIC-ranked seeds to SALSA.
+
+**Fix:** After §OOOOOO (adaptive fragment quota), attempt `fit_dual_surrogate` once at startup
+and store the result in `state['startup_dual_surrogate']`.  In the PSICHIC streaming chunk loop,
+after sorting `df` by `combined_score`, call `augment_pool_with_surrogate_blend(df, startup_dual_surrogate)`.
+If a `surrogate_salsa_score` column was added (only for RF models at ≥100 cache points), re-sort
+`df` by that blended score and drop the temporary column.  The `combined_score` values in
+`global_candidate_pool` remain PSICHIC LE scores (unchanged), so `best_score` tracking,
+entropy bonuses, and all downstream code are unaffected — only the top-10 selection changes.
+
+**Activation guard:** `augment_pool_with_surrogate_blend` already guards against Ridge models
+(returns pool unchanged when fewer than 100 cache points).  The startup surrogate attempt is
+a no-op on cold starts (SQLite empty → `fit_dual_surrogate` returns None).
+
+**Files changed:**
+
+- `neurons/miner.py`:
+  - State init: `'startup_dual_surrogate': None`
+  - After §OOOOOO: `fit_dual_surrogate` → store in `state['startup_dual_surrogate']`
+  - PSICHIC chunk loop: `augment_pool_with_surrogate_blend` + re-sort when RF active
+
+**Expected benefit:** +3–8% on warm-cache restart sessions where ≥100 GitHub-imported
+cache entries exist.  No change on cold-cache first epoch.
+
+---
+
+**§ZZZZZZZZ — Cache-Aware Adaptive §WW Seed Budget (`neurons/miner.py`)**
+
+**Problem:** §WW always runs 2 extra seeds (42 and 123) for the top-2 molecules, spending
+4 Boltz call budgets regardless of whether those molecules are already known to be
+diffusion-stable.  §XXXXXXXX stores `boltz_ww_std` (inter-seed std of [s_68, s_42, s_123])
+in SQLite for every molecule that §WW has scored.  On epoch 3+ the top-2 candidates are
+often the same stable molecules encountered in prior epochs — their `boltz_ww_std` is already
+in the cache and may be very low (< 0.003), meaning running seeds 42/123 again yields the same
+result.
+
+**Fix:** Before iterating over `_ww_extra_seeds = [42, 123]` for each molecule, look up its
+`boltz_ww_std` in SQLite.  If it's not None and < 0.003, set `_zz_extra_seeds = []` (skip both
+extra seeds for that molecule) and log the skip.  High-`ww_std` molecules still get all 3 seeds.
+
+**Threshold calibration:**
+| boltz_ww_std | interpretation | action |
+|---|---|---|
+| NULL (never scored by §WW) | unknown stability | run all 3 seeds |
+| ≥ 0.003 | possibly noisy | run all 3 seeds |
+| < 0.003 | diffusion-stable (< half typical threshold) | skip extra seeds |
+
+**Files changed:**
+
+- `neurons/miner.py`:
+  - §WW outer loop: after `_ww_mol_scores = [_ww_seed68_score]`, query `boltz_ww_std` and
+    set `_zz_extra_seeds = []` when below 0.003; iterate over `_zz_extra_seeds` instead of
+    `_ww_extra_seeds`
+
+**Expected benefit:** +2–4% on epoch 3+ when top-2 candidates are cached with low inter-seed
+variance.  Saves 1–2 Boltz call budgets per §WW run for §MM/§TTTTTT or additional SALSA rounds.
+Zero regression: NULL or high-std molecules always run all 3 seeds as before.
+
+---
+
+## Previous Status (as of 2026-07-23)
+
+**All 35 roadmap items implemented.** Two new optimisation opportunities proposed (§YYYYYY, §ZZZZZZZZ).
 
 ---
 
