@@ -470,6 +470,8 @@ def run_salsa_search(
     best_smiles = seed_smiles
     all_hits: List[pd.DataFrame] = []
     seen_names: set[str] = set()
+    # §AAAAAAAAA: track previous round's best so we can detect convergence.
+    _prev_best_smiles: Optional[str] = None
 
     for round_idx in range(rounds):
         perturbations = generate_perturbations(best_smiles, n_max=n_perturb, operator_weights=operator_weights)
@@ -508,6 +510,20 @@ def run_salsa_search(
             f"{hits_df.iloc[0].get(name_col, '?')} "
             f"(score={hits_df.iloc[0].get(score_col, float('nan')):.4f})"
         )
+
+        # §AAAAAAAAA: convergence guard — if the best seed didn't change from
+        # the previous round, every subsequent round would generate identical
+        # perturbations and re-visit the same pool neighbors.  Stop early and
+        # free the CPU budget for §MM's next hill-climbing molecule or another
+        # SALSA instance.  Only fires when ≥1 full round has already run
+        # (_prev_best_smiles is set) so we always complete at least one round.
+        if _prev_best_smiles is not None and best_smiles == _prev_best_smiles:
+            logger.debug(
+                f"[§AAAAAAAAA] SALSA converged at round {round_idx + 1} "
+                f"(seed unchanged: {best_smiles!r}) — stopping early."
+            )
+            break
+        _prev_best_smiles = best_smiles
 
     if not all_hits:
         return pd.DataFrame()

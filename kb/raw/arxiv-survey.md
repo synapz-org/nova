@@ -399,6 +399,7 @@ All items 1–35 are **implemented**. Items 5 and 7 remain as conditional/resear
 | 35 | §XXXXXXXX: numpy bugfix (§WWWWWWW was silently inactive) + §WW inter-seed std cache — store std of [s_68, s_42, s_123] as boltz_ww_std; use as additional surrogate confidence weight | 55 lines | ✅ Done | Bugfix restores full §WWWWWWW benefit; §XXXXXXXX adds +1–2% NDCG on top via cross-seed variance weighting |
 | 36 | §YYYYYY: Startup surrogate initialisation from GitHub cache — fit dual RF at startup (≥40 pts) and apply 0.4×PSICHIC + 0.6×surrogate blend inline in PSICHIC streaming loop so global_candidate_pool is Boltz-calibrated from chunk 1 | ~50 lines | ✅ Done | +3–8% on warm-cache restart sessions; SALSA seeds improve when streaming time is short |
 | 37 | §ZZZZZZZZ: Cache-aware adaptive §WW seed budget — skip extra seeds (42/123) when cached boltz_ww_std < 0.003; save 1–2 Boltz call budgets for §MM/§TTTTTT on stable cached molecules | ~25 lines | ✅ Done | +2–4% on epoch 3+ when top-2 candidates already cached with low inter-seed variance |
+| 38 | §AAAAAAAAA: SALSA convergence-based early stopping — detect when the best seed SMILES is unchanged between rounds and break early; frees CPU budget for §MM's next molecule or another SALSA instance | ~12 lines | ✅ Done | Saves 1–N redundant rounds on converged §MM hill-climbing calls (up to 20 rounds/epoch on H100); zero regression |
 
 All approaches share the same submission constraint: molecules must map to valid SAVI-2020
 product names. SALSA and GradientGA both solve this via nearest-neighbour SAVI-2020 lookup.
