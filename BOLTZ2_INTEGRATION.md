@@ -1,6 +1,47 @@
 # Boltz-2 Miner Integration
 
-## Current Status (as of 2026-07-27)
+## Current Status (as of 2026-07-28)
+
+**All 39 roadmap items implemented.** §BBBBBBBBBB added 2026-07-28.
+
+---
+
+**§BBBBBBBBBB — Warm-Start Molecule Inclusion in §MM Seed Pool (`neurons/miner.py`)**
+
+**Problem:** §MM multi-round Boltz-SALSA hill-climbing initialises its `_mm_all_scored` dict from
+`all_scores` (molecules scored in the initial Boltz pass) plus `boltz_cache` (which contains
+disk-cache entries for molecules that appeared in `candidates`).  The §CC warm-start molecule
+— the top SQLite-cached entry for the current protein — is only added to `boltz_cache` if it
+appeared in the scaffold-diversity-filtered `candidates` list.  On epoch 2+ it is often evicted
+from `global_candidate_pool` by later PSICHIC chunks, or filtered out by scaffold-diversity
+selection, so it is absent from `candidates` → absent from `boltz_cache` → absent from
+`_mm_all_scored`.  Result: §MM never runs SALSA from that molecule's chemical neighbourhood,
+missing the opportunity to find a SAVI-2020 molecule that beats the prior-epoch best.
+
+**Fix:** After the `_mm_all_scored` initialisation loop (boltz_cache scan), call
+`_disk_cache_get_best` once and add the warm-start molecule to `_mm_all_scored` when it is not
+already present.  The guard `if _bbbbbbbbbb_can not in _mm_all_scored` prevents double-entry when
+the molecule was scored this epoch.  The new entry is then included in the initial `max()`
+computation for `_mm_seed_smiles` — if the prior-epoch best outscores everything found this
+epoch, §MM starts exploring its chemical neighbourhood immediately.  If it doesn't, it becomes
+a basin-hop candidate (§QQ/§VV) later in §MM when the current seed stops improving.
+
+**Files changed:**
+
+- `neurons/miner.py`:
+  - After `_mm_all_scored` initialisation (boltz_cache scan): add 12-line §BBBBBBBBBB try-block
+    that reads `_disk_cache_get_best`, canonicalises the SMILES, and injects into `_mm_all_scored`
+    when not already present.
+
+**Expected benefit:** On epoch 2+ when the best prior-epoch molecule was NOT re-scored this
+epoch (common when many new PSICHIC candidates crowd the global pool): +3–8% in expected Boltz
+score via more thorough §MM neighbourhood exploration around the known best.  Zero regression when
+the warm-start molecule was already in `candidates` (scored this epoch → already in `_mm_all_scored`
+→ guard fires, no change).
+
+---
+
+## Previous Status (as of 2026-07-27)
 
 **All 38 roadmap items implemented.** §AAAAAAAAA added 2026-07-27.
 

@@ -2166,6 +2166,26 @@ async def run_boltz_prescoring(state: Dict[str, Any], max_candidates: int = 5) -
             if _mm_sm not in _mm_all_scored and math.isfinite(_mm_cv):
                 _mm_all_scored[_mm_sm] = _mm_cv
 
+    # §BBBBBBBBBB: Include §CC warm-start molecule in §MM seed pool when it was NOT
+    # re-scored this epoch.  The warm-start molecule (top SQLite-cached entry) may
+    # have been evicted from global_candidate_pool by later PSICHIC chunks or
+    # filtered out by scaffold-diversity selection — meaning it never appears in
+    # all_scores or boltz_cache.  Adding it here lets §MM explore its chemical
+    # neighbourhood via SALSA, potentially finding a better SAVI-2020 neighbor.
+    try:
+        _bbbbbbbbbb_ws = _disk_cache_get_best(db_path, protein)
+        if _bbbbbbbbbb_ws is not None:
+            _bbbbbbbbbb_sc, _bbbbbbbbbb_sm, _bbbbbbbbbb_pn = _bbbbbbbbbb_ws
+            _bbbbbbbbbb_can = get_canonical_smiles(_bbbbbbbbbb_sm) or _bbbbbbbbbb_sm
+            if _bbbbbbbbbb_can not in _mm_all_scored and math.isfinite(_bbbbbbbbbb_sc):
+                _mm_all_scored[_bbbbbbbbbb_can] = _bbbbbbbbbb_sc
+                bt.logging.info(
+                    f"[§BBBBBBBBBB] Added §CC warm-start to §MM seed pool: "
+                    f"{_bbbbbbbbbb_pn} (cached_score={_bbbbbbbbbb_sc:.4f})"
+                )
+    except Exception as _bbbbbbbbbb_err:
+        bt.logging.debug(f"[§BBBBBBBBBB] Warm-start §MM seed injection (non-fatal): {_bbbbbbbbbb_err}")
+
     _mm_best_score: float = max(
         (_v for _v in _mm_all_scored.values() if math.isfinite(_v)), default=-math.inf
     )
