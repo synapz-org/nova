@@ -2504,6 +2504,41 @@ async def run_boltz_prescoring(state: Dict[str, Any], max_candidates: int = 5) -
                     )
 
                 if _mm_next_seed is None:
+                    # §CCCCCCCCCC: Before stopping, try the top surrogate-scored SAVI
+                    # molecule not yet used as an §MM seed.  When all Boltz-scored
+                    # candidates are exhausted, the surrogate-blended pool can nominate a
+                    # fresh chemical basin to explore without an extra Boltz call upfront.
+                    _cccccccccc_seed = None
+                    try:
+                        if _mm_savi_pool is not None and not _mm_savi_pool.empty:
+                            _cc_col = (
+                                _hhhhhh_score_col
+                                if _hhhhhh_score_col in _mm_savi_pool.columns
+                                else 'combined_score'
+                            )
+                            if _cc_col in _mm_savi_pool.columns:
+                                for _, _cc_row in _mm_savi_pool.nlargest(50, _cc_col).iterrows():
+                                    _cc_smi = _cc_row.get('product_smiles', '')
+                                    _cc_can = get_canonical_smiles(_cc_smi) or _cc_smi
+                                    if _cc_can and _cc_can not in _mm_tried_seeds:
+                                        _ok2, _ = is_boltz_safe_smiles(_cc_can)
+                                        if _ok2:
+                                            _cccccccccc_seed = _cc_can
+                                            bt.logging.info(
+                                                f"[§CCCCCCCCCC] Surrogate-pool basin-hop: "
+                                                f"{_cc_row.get('product_name', '?')} "
+                                                f"({_cc_col}="
+                                                f"{_cc_row.get(_cc_col, float('nan')):.4f}) "
+                                                f"— Boltz-seed pool exhausted, extending §MM."
+                                            )
+                                            break
+                    except Exception as _cc_err:
+                        bt.logging.debug(
+                            f"[§CCCCCCCCCC] Surrogate-pool fallback (non-fatal): {_cc_err}"
+                        )
+                    if _cccccccccc_seed is not None:
+                        _mm_seed_smiles = _cccccccccc_seed
+                        continue  # start next §MM round from surrogate-nominated basin
                     bt.logging.info(
                         f"§MM round {_mm_round_idx + 1}: no improvement; "
                         f"all {len(_mm_tried_seeds)} seed(s) exhausted — stopping."

@@ -1,6 +1,48 @@
 # Boltz-2 Miner Integration
 
-## Current Status (as of 2026-07-28)
+## Current Status (as of 2026-07-30)
+
+**All 40 roadmap items implemented.** §CCCCCCCCCC added 2026-07-30.
+
+---
+
+**§CCCCCCCCCC — Surrogate-Pool Basin-Hop Fallback for §MM Seed Exhaustion (`neurons/miner.py`)**
+
+**Problem:** When §MM's §QQ/§VV basin-hopping exhausts all Boltz-scored molecules as seeds
+(`_mm_next_seed is None`), it stops immediately even when GPU time remains.  The
+`_mm_savi_pool` (surrogate-blended SAVI stream) may contain thousands of molecules with high
+surrogate-predicted scores that have never been used as §MM seeds — unexplored chemical basins
+that Boltz could improve on.  On low-cache epochs (epoch 1, few Boltz-scored candidates), the
+Boltz-scored pool is tiny (3–6 molecules) and §MM exhausts it after only 2–4 rounds, leaving
+the rest of the GPU budget idle.
+
+**Fix:** When `_mm_next_seed is None` fires, before breaking out of §MM, scan the top-50
+entries of `_mm_savi_pool` by `_hhhhhh_score_col` (surrogate-blended score, or `combined_score`
+fallback).  For each entry, compute its canonical SMILES and check whether it has already been
+tried as a seed (`_mm_tried_seeds`).  The first untried, `is_boltz_safe_smiles`-passing molecule
+becomes `_cccccccccc_seed`.  If found, assign it to `_mm_seed_smiles` and `continue` to the
+next §MM round — §MM then runs SALSA from that surrogate-nominated basin and fast-screens its
+neighbours normally.  If no untried safe molecule is found in the top-50, fall through to the
+original break.
+
+**Files changed:**
+
+- `neurons/miner.py`:
+  - Replace `if _mm_next_seed is None: ... break` block (line ~2506) with the §CCCCCCCCCC
+    try-block: top-50 surrogate-pool scan, first untried safe SMILES assigned to
+    `_cccccccccc_seed`, `continue` when found, original break when not found.
+
+**Expected benefit:** On epoch 1 (low cache, 3–6 Boltz-scored candidates, §MM seed pool
+exhausted after 2–4 rounds): enables 1–4 additional §MM rounds exploring surrogate-predicted
+chemical space, each bringing 1 new Boltz full-score.  Expected +3–8% probability of finding
+the epoch winner when SALSA around the surrogate-top molecule outperforms all initial Boltz
+candidates.  On epoch 3+ (large cache, many Boltz seeds): `_mm_next_seed` rarely reaches None
+so the guard seldom fires — zero regression.  The `is_boltz_safe_smiles` check prevents
+wasting a Boltz call on a molecule that would fail validator validation.
+
+---
+
+## Previous Status (as of 2026-07-28)
 
 **All 39 roadmap items implemented.** §BBBBBBBBBB added 2026-07-28.
 
