@@ -153,6 +153,14 @@ def fetch_msa(protein_code: str, sequence: str) -> bool:
         bt.logging.info(
             f"[MSA] Saved {out_path} ({len(a3m_bytes):,} bytes)"
         )
+        # §DDDDDDDDDD: persist to GitHub so future containers skip ColabFold
+        try:
+            from utils.github import upload_msa_to_github
+            upload_msa_to_github(protein_code, out_path)
+        except Exception as _gh_up_exc:
+            bt.logging.debug(
+                f"[§DDDDDDDDDD] GitHub MSA upload failed (non-fatal): {_gh_up_exc}"
+            )
         return True
     except Exception as exc:
         bt.logging.error(f"[MSA] Failed to write {out_path}: {exc}")
@@ -164,10 +172,26 @@ def ensure_msa(protein_code: str, sequence: str) -> bool:
     Ensure an MSA file exists for protein_code.
 
     If it is already on disk, return True immediately (no network call).
-    Otherwise attempt to fetch it via fetch_msa().
+    Otherwise attempt GitHub cache first (§DDDDDDDDDD), then ColabFold API.
     Returns True if the MSA is available after this call, False otherwise.
     """
     if msa_exists(protein_code):
         bt.logging.debug(f"[MSA] {protein_code}.a3m already on disk — skipping fetch.")
         return True
+
+    # §DDDDDDDDDD: Try GitHub cache before ColabFold (saves 5–15 min on restart)
+    local_path = _msa_path(protein_code)
+    try:
+        from utils.github import download_msa_from_github
+        if download_msa_from_github(protein_code, local_path):
+            bt.logging.info(
+                f"[§DDDDDDDDDD] MSA for {protein_code} restored from GitHub "
+                "— ColabFold skipped"
+            )
+            return True
+    except Exception as _gh_dn_exc:
+        bt.logging.debug(
+            f"[§DDDDDDDDDD] GitHub MSA download failed (non-fatal): {_gh_dn_exc}"
+        )
+
     return fetch_msa(protein_code, sequence)

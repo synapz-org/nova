@@ -218,3 +218,110 @@ def download_boltz_cache_export(protein: str) -> Optional[dict]:
     except Exception as e:
         bt.logging.warning(f"[§PPPPPP] Cache download error: {e}")
         return None
+
+
+# ----------------------------------------------------------------------------
+# §DDDDDDDDDD — MSA GitHub Cache
+# Upload / download compressed MSA (.a3m.gz) files to the miner's GitHub repo
+# so that on container restart the ColabFold API round-trip (5–15 min) is
+# skipped for already-seen proteins.  Files are gzip-compressed before upload
+# to stay within the GitHub Contents API 1 MB payload limit.
+# ----------------------------------------------------------------------------
+
+def upload_msa_to_github(protein_code: str, a3m_path: str) -> bool:
+    """§DDDDDDDDDD: Upload a gzip-compressed MSA file to GitHub.
+    No-ops silently when the file is already present or too large (>700 KB compressed)."""
+    import gzip as _gzip
+
+    owner, name, branch, token, path = _github_env()
+    if not all([owner, name, branch, token]):
+        return False
+
+    try:
+        with open(a3m_path, "rb") as fh:
+            a3m_bytes = fh.read()
+
+        compressed = _gzip.compress(a3m_bytes, compresslevel=6)
+        if len(compressed) > 700_000:
+            bt.logging.warning(
+                f"[§DDDDDDDDDD] MSA for {protein_code} too large after compression "
+                f"({len(compressed):,} bytes) — skipping GitHub upload"
+            )
+            return False
+
+        file_path = f"msa_cache/{protein_code}.a3m.gz"
+        if path:
+            file_path = f"{path}/{file_path}"
+
+        url = f"https://api.github.com/repos/{owner}/{name}/contents/{file_path}"
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/vnd.github+json",
+        }
+
+        existing = requests.get(url, headers=headers, params={"ref": branch})
+        if existing.status_code == 200:
+            bt.logging.debug(
+                f"[§DDDDDDDDDD] MSA for {protein_code} already on GitHub — skipping upload"
+            )
+            return True
+
+        payload = {
+            "message": f"cache: MSA for {protein_code}",
+            "content": base64.b64encode(compressed).decode(),
+            "branch": branch,
+        }
+        resp = requests.put(url, headers=headers, json=payload)
+        if resp.status_code in (200, 201):
+            bt.logging.info(
+                f"[§DDDDDDDDDD] Uploaded MSA for {protein_code} "
+                f"({len(compressed):,} bytes compressed)"
+            )
+            return True
+        bt.logging.warning(
+            f"[§DDDDDDDDDD] MSA upload failed: {resp.status_code} {resp.text[:200]}"
+        )
+        return False
+    except Exception as exc:
+        bt.logging.warning(f"[§DDDDDDDDDD] MSA upload error: {exc}")
+        return False
+
+
+def download_msa_from_github(protein_code: str, local_path: str) -> bool:
+    """§DDDDDDDDDD: Download and decompress a cached MSA from GitHub.
+    Writes the .a3m file to local_path and returns True on success."""
+    import gzip as _gzip
+
+    owner, name, branch, token, path = _github_env()
+    if not all([owner, name, branch, token]):
+        return False
+
+    try:
+        file_path = f"msa_cache/{protein_code}.a3m.gz"
+        if path:
+            file_path = f"{path}/{file_path}"
+
+        url = f"https://api.github.com/repos/{owner}/{name}/contents/{file_path}"
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/vnd.github+json",
+        }
+        resp = requests.get(url, headers=headers, params={"ref": branch})
+        if resp.status_code != 200:
+            return False
+
+        content_b64 = resp.json().get("content", "").replace("\n", "")
+        a3m_bytes = _gzip.decompress(base64.b64decode(content_b64))
+
+        os.makedirs(os.path.dirname(local_path), exist_ok=True)
+        with open(local_path, "wb") as fh:
+            fh.write(a3m_bytes)
+
+        bt.logging.info(
+            f"[§DDDDDDDDDD] Downloaded MSA for {protein_code} from GitHub "
+            f"({len(a3m_bytes):,} bytes)"
+        )
+        return True
+    except Exception as exc:
+        bt.logging.warning(f"[§DDDDDDDDDD] MSA download error: {exc}")
+        return False
