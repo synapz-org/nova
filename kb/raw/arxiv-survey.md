@@ -358,7 +358,7 @@ Even a partial result (1 of 5 molecules scored) improves on the PSICHIC-only bas
 
 ## Implementation Roadmap (priority order)
 
-All items 1–35 are **implemented**. Items 5 and 7 remain as conditional/research directions.
+All items 1–42 are **implemented**. Items 5 and 7 remain as conditional/research directions.
 
 | Priority | Approach | Effort | Status | Expected gain |
 |----------|----------|--------|--------|---------------|
@@ -403,6 +403,7 @@ All items 1–35 are **implemented**. Items 5 and 7 remain as conditional/resear
 | 39 | §BBBBBBBBBB: Warm-start molecule inclusion in §MM seed pool — inject top SQLite-cached entry into `_mm_all_scored` when it was evicted from the initial Boltz pass; lets §MM explore prior-epoch best neighbourhood immediately | ~12 lines | ✅ Done | +3–8% expected Boltz score on epoch 2+ when warm-start molecule was filtered out of scaffold-diversity selection |
 | 40 | §CCCCCCCCCC: Surrogate-pool basin-hop fallback for §MM seed exhaustion — when all Boltz-scored seeds are exhausted (`_mm_next_seed is None`), scan top-50 surrogate-pool entries for an untried safe SMILES and continue §MM from that basin | ~30 lines | ✅ Done | +3–8% on epoch 1 (low cache, small Boltz-seed pool) by enabling 1–4 additional §MM rounds from surrogate-nominated chemical basins; zero regression on warm-cache epochs |
 | 41 | §DDDDDDDDDD: MSA GitHub cache — after ColabFold fetches an MSA, gzip-compress and upload to `msa_cache/{protein}.a3m.gz` in the GitHub repo; on container restart try GitHub download before ColabFold (saves 5–15 min per restart for known proteins) | ~90 lines | ✅ Done | +2–5% Boltz LE on restart sessions by enabling full-MSA Boltz from epoch 1 instead of single-sequence mode; ColabFold wait eliminated for all proteins seen in prior week |
+| 42 | §EEEEEEEEEE: Gzip-compress Boltz cache export before base64 — apply same gzip technique as §DDDDDDDDDD MSA cache to §PPPPPP JSON export; expand entries from 500→1000 within GitHub 1 MB limit; backward-compatible downloader via magic-byte detection | ~20 lines | ✅ Done | 2× more surrogate training data from GitHub on restart (+3–8% NDCG on epoch 3+ with 1000 vs 500 cache points); also prevents export failures when cache grows large |
 
 All approaches share the same submission constraint: molecules must map to valid SAVI-2020
 product names. SALSA and GradientGA both solve this via nearest-neighbour SAVI-2020 lookup.

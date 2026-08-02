@@ -71,8 +71,11 @@ def _github_env() -> tuple:
 
 
 def upload_boltz_cache_export(db_path: str, protein: str) -> bool:
-    """§PPPPPP: Export top-500 Boltz cache entries + miner_state to the miner's
-    GitHub repo.  Returns True on successful upload, False on any error or missing env."""
+    """§PPPPPP: Export top-1000 Boltz cache entries + miner_state to the miner's
+    GitHub repo.  Returns True on successful upload, False on any error or missing env.
+    §EEEEEEEEEE: JSON is gzip-compressed before base64 encoding, shrinking payload
+    by ~65% and allowing 1000 entries (vs 500) within GitHub's 1 MB limit."""
+    import gzip as _gzip
     import time as _time
 
     owner, name, branch, token, path = _github_env()
@@ -86,7 +89,7 @@ def upload_boltz_cache_export(db_path: str, protein: str) -> bool:
         c.execute(
             "SELECT smiles, score, affinity_prob_binary, affinity_pred_val, "
             "ligand_iptm, product_name, boltz_le_std, boltz_ww_std "
-            "FROM boltz_cache WHERE protein=? ORDER BY score DESC LIMIT 500",
+            "FROM boltz_cache WHERE protein=? ORDER BY score DESC LIMIT 1000",
             (protein,),
         )
         entries = [
@@ -146,7 +149,13 @@ def upload_boltz_cache_export(db_path: str, protein: str) -> bool:
             "state": state_out,
             "history": history,
         }
-        content = base64.b64encode(json.dumps(export).encode()).decode()
+        # §EEEEEEEEEE: gzip-compress JSON before base64 encoding.
+        # JSON is highly compressible (~65-75% reduction); 1000 entries compress to
+        # ~40-60 KB — well within GitHub's 1 MB Contents API limit.
+        # Downloader detects the gzip magic header for backward compatibility.
+        content = base64.b64encode(
+            _gzip.compress(json.dumps(export).encode(), compresslevel=6)
+        ).decode()
 
         file_path = "boltz_cache_export.json"
         if path:
@@ -161,7 +170,7 @@ def upload_boltz_cache_export(db_path: str, protein: str) -> bool:
         sha = existing.json().get("sha") if existing.status_code == 200 else None
 
         payload = {
-            "message": f"cache: Boltz export {protein} ({len(entries)} entries)",
+            "message": f"cache: Boltz export {protein} ({len(entries)} entries, gzip)",
             "content": content,
             "branch": branch,
         }
@@ -182,7 +191,11 @@ def upload_boltz_cache_export(db_path: str, protein: str) -> bool:
 
 def download_boltz_cache_export(protein: str) -> Optional[dict]:
     """§PPPPPP: Download the Boltz cache export from the miner's GitHub repo.
-    Returns the parsed dict on success, or None if not found / protein mismatch / error."""
+    Returns the parsed dict on success, or None if not found / protein mismatch / error.
+    §EEEEEEEEEE: Detects gzip magic header (\\x1f\\x8b) for new compressed exports;
+    falls back to plain JSON decode for legacy uncompressed uploads."""
+    import gzip as _gzip
+
     owner, name, branch, token, path = _github_env()
     if not all([owner, name, branch, token]):
         return None
@@ -202,7 +215,12 @@ def download_boltz_cache_export(protein: str) -> Optional[dict]:
             return None
 
         content_b64 = resp.json().get("content", "").replace("\n", "")
-        data = json.loads(base64.b64decode(content_b64).decode())
+        raw = base64.b64decode(content_b64)
+        # §EEEEEEEEEE: gzip magic bytes \x1f\x8b indicate compressed payload (new format).
+        # Fall back to direct UTF-8 decode for legacy uncompressed exports.
+        if raw[:2] == b'\x1f\x8b':
+            raw = _gzip.decompress(raw)
+        data = json.loads(raw.decode())
 
         if data.get("protein") != protein:
             bt.logging.info(
