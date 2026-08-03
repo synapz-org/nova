@@ -2562,6 +2562,33 @@ async def run_boltz_prescoring(state: Dict[str, Any], max_candidates: int = 5) -
             f"final_best={_mm_best_score:.4f}"
         )
 
+    # §FFFFFFFFFFFFFF: Pre-§XX boltz_cache merge — ensure §XX/§TTTTTT/§WW/§UUUU
+    # see the complete epoch picture when §MM ran zero rounds.
+    #
+    # Problem: §MM merges boltz_cache → all_scores at the end of each completed round
+    # (line ~2458).  When §MM ran ≥1 round, §FF scores are in all_scores by the time
+    # §XX/§TTTTTT/§WW/§UUUU run.  But when §MM runs ZERO rounds (time guard fires
+    # immediately — possible in the 105–210 s window on A100 where §MM needs 210 s but
+    # §XX only needs 105 s), §FF scores exist only in boltz_cache and are invisible to:
+    #   • §XX: picks the wrong epoch-best for tautomer enumeration
+    #   • §TTTTTT: picks the wrong 2nd/3rd-best molecules for extended tautomer search
+    #   • §WW: runs multi-seed stability check on wrong top-2 candidates
+    #   • §UUUU: runs antitarget scoring on wrong top-2 candidates
+    #
+    # Fix: merge boltz_cache → all_scores HERE (before §XX) rather than only before
+    # §CC.  The merge is idempotent — the same guard (`not in all_scores`) means
+    # the second merge at line ~3400 becomes a no-op, kept as a safety net for future
+    # code paths that might add boltz_cache entries between here and §CC.
+    for _fff_k, _fff_v in boltz_cache.items():
+        if (
+            isinstance(_fff_k, tuple)
+            and len(_fff_k) == 2
+            and _fff_k[1] == protein
+            and _fff_k[0] not in all_scores
+            and math.isfinite(_fff_v)
+        ):
+            all_scores[_fff_k[0]] = _fff_v
+
     # §XX — Tautomer Enumeration for Borderline Candidates.
     # After §MM converges, enumerate RDKit canonical tautomers of the epoch's
     # best-scoring molecule.  Tautomers share the same molecular formula but differ
@@ -3397,13 +3424,11 @@ async def run_boltz_prescoring(state: Dict[str, Any], max_candidates: int = 5) -
                 f"§UUUU antitarget selectivity check failed (non-fatal): {_uuuu_err}"
             )
 
-    # Merge §FF / §MM scores into all_scores before the §CC guard.
-    # The §MM loop exposes boltz_cache → all_scores at the end of each complete
-    # round, but if §MM exits before round 0 (time check fails immediately) or
-    # the §MM block is never entered, §FF scores stay in boltz_cache but never
-    # reach all_scores.  Without this merge, best_new below would exclude the
-    # §FF winner, making the §CC guard incorrectly promote a disk-cached
-    # molecule over a better §FF molecule found this epoch.
+    # Safety-net merge: §FFFFFFFFFFFFFF moved the primary boltz_cache → all_scores
+    # merge to before §XX (above).  This copy picks up any boltz_cache entries added
+    # between that merge and §CC by §XX/§TTTTTT/§WW/§UUUU (all of which write their
+    # new scores to both boltz_cache and all_scores directly, so this is a no-op in
+    # practice but guards against future code paths that might add to boltz_cache only).
     for _pre_cc_k, _pre_cc_v in boltz_cache.items():
         if (
             isinstance(_pre_cc_k, tuple)

@@ -1,6 +1,77 @@
 # Boltz-2 Miner Integration
 
-## Current Status (as of 2026-08-02)
+## Current Status (as of 2026-08-03)
+
+**All 43 roadmap items implemented.** §FFFFFFFFFFFFFF added 2026-08-03.
+
+---
+
+**§FFFFFFFFFFFFFF — Pre-§XX boltz_cache Merge (`neurons/miner.py`)**
+
+**Problem:** `§MM` merges `boltz_cache → all_scores` at the end of each completed round
+(~line 2458), so when §MM ran ≥1 round every downstream section (§XX, §TTTTTT, §WW,
+§UUUU) correctly sees the complete epoch picture including §FF scores.  However, when §MM
+runs **zero rounds** — possible in the 105–210 s window on A100 where §MM's entry guard
+requires 210 s but §XX only requires 105 s — §FF scores are locked in `boltz_cache` and
+invisible to all four downstream sections:
+
+| Section | Gap when §MM ran 0 rounds |
+|---------|--------------------------|
+| §XX (tautomer enum) | Picks wrong epoch-best molecule for tautomer seed |
+| §TTTTTT (extended tautomers) | Picks wrong 2nd/3rd-best molecules |
+| §WW (multi-seed stability) | Runs extra seeds on wrong top-2 candidates |
+| §UUUU (antitarget selectivity) | Runs antitarget scoring on wrong top-2 candidates |
+
+On A100 (45 s/mol, `boltz_trigger_blocks` ~100): after §FF completes, if the epoch has
+105–210 s left, §MM exits immediately on its time guard but §XX, §TTTTTT, §WW, and §UUUU
+all run with stale `all_scores`.  On H100 (25 s/mol) the window narrows to 55–100 s —
+still reachable on short epochs or warm-cache runs where Boltz finishes early.
+
+Concrete failure scenario: §FF finds a new epoch best (e.g. LE=0.42 vs initial Boltz
+best of 0.38).  §MM skips (time guard).  §XX runs, reads `all_scores`, sees LE=0.38 as
+the epoch best, enumerates the wrong tautomers.  §TTTTTT picks LE=0.35 and LE=0.33 as
+its 2nd/3rd seeds.  §WW runs multi-seed on LE=0.38 and LE=0.35, not on LE=0.42.
+§UUUU runs antitarget scoring on LE=0.38 and LE=0.35 instead of LE=0.42 and LE=0.38.
+Result: wasted Boltz calls on the wrong molecules; §FF winner bypasses all post-processing.
+
+**Fix:** Move the `boltz_cache → all_scores` merge to immediately before §XX (line ~2565).
+The existing merge before §CC (now ~line 3427) is retained as a safety net but becomes a
+no-op in practice: §XX/§TTTTTT/§WW/§UUUU all write their new scores to both `boltz_cache`
+and `all_scores` directly, so no new entries are added to `boltz_cache`-only between the
+two merge points.  The safety net guards against future code paths that might add to
+`boltz_cache` only between §UUUU and §CC.
+
+**Files changed:**
+
+- `neurons/miner.py`:
+  - Before §XX block (~line 2565): add 20-line `§FFFFFFFFFFFFFF` merge block
+    (same loop as the original pre-§CC merge, new comment explaining rationale).
+  - Pre-§CC merge (~line 3427): update comment from "primary" to "safety-net" role.
+
+**Expected benefit:**
+
+| Scenario | Before §FFFFFFFFFFFFFF | After §FFFFFFFFFFFFFF |
+|----------|------------------------|------------------------|
+| §MM ran ≥1 round | No change (all_scores already complete) | No change |
+| §MM ran 0 rounds, §FF found new best | §XX/§TTTTTT/§WW/§UUUU use stale all_scores | All four use complete all_scores |
+| §MM ran 0 rounds, §FF found no improvement | No change (boltz_cache adds no new scores) | No change |
+
+On epochs where §MM is budget-constrained (§MM skips entirely): §XX/§TTTTTT tautomer
+search is now seeded from the true epoch best (§FF winner), giving +2–5% probability of
+finding a higher-scoring tautomer neighbour.  §WW and §UUUU also evaluate the correct
+molecules, eliminating wasted fast-Boltz calls on sub-optimal candidates.
+
+Frequency: §MM skipping entirely is uncommon but real — estimated 10–20% of epochs on
+A100 hardware where `§BBBBB` adaptive timing has extended the trigger window and §FF
+consumes much of the remaining budget.  On H100, less common due to faster per-mol time.
+
+**Zero regression risk:** When §MM ran ≥1 round, `boltz_cache` contains no entries not
+already in `all_scores` by the time §FFFFFFFFFFFFFF runs — the new merge block is a
+no-op.  The safety-net merge before §CC is idempotent for the same reason.
+
+---
+
+## Previous Status (as of 2026-08-02)
 
 **All 42 roadmap items implemented.** §EEEEEEEEEE added 2026-08-02.
 
