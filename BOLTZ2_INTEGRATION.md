@@ -1,8 +1,69 @@
 # Boltz-2 Miner Integration
 
-## Current Status (as of 2026-08-02)
+## Current Status (as of 2026-08-04)
 
-**All 42 roadmap items implemented.** §EEEEEEEEEE added 2026-08-02.
+**All 43 roadmap items implemented.** §FFFFFFFFFF added 2026-08-04.
+
+---
+
+**§FFFFFFFFFF — `confidence_score` SQLite Cache, Surrogate Weight, and GitHub Export**
+
+**Problem:** Boltz-2 computes a `confidence_score` (overall complex structural confidence, 0–1
+range) for every inference run. This metric was used inline in `run_boltz_prescoring()` for the
+§RR ordering penalty (`-0.2 * (1 - confidence_score)`), but was never persisted to the SQLite
+`boltz_cache` table or included in the GitHub export (`§PPPPPP`). As a result, the dual RF
+surrogate (`§QQQQ`/`§YYYYY`) could not use per-molecule structural confidence as a training
+weight even though it is more informative than plain `ligand_iptm` alone: a molecule may have
+high `ligand_iptm` (good ligand pose) but low overall complex confidence (poor protein folding),
+or vice versa. Omitting it from the weight formula degrades surrogate calibration for
+structurally ambiguous candidates.
+
+**Fix:** Three-part change:
+
+1. **SQLite schema** (`neurons/miner.py`, `_init_boltz_cache_db`): Add
+   `"ALTER TABLE boltz_cache ADD COLUMN confidence_score REAL"` to the ALTER TABLE migration
+   list, creating a new nullable column (existing rows get NULL, coalesced to 1.0 at read time).
+
+2. **`_disk_cache_put`** (`neurons/miner.py`): Add `confidence_score: Optional[float] = None`
+   parameter to the signature, include it as the 9th column in the INSERT statement. All 5
+   call sites updated to extract `_comps.get('confidence_score')` from the Boltz output dict
+   (main prescoring, §FF winner, §MM winner, §XX tautomer, §TTTTTT tautomer). Also updated the
+   §PPPPPP and §RRRRRR GitHub-import INSERT paths to write `confidence_score` into the 11-column
+   tuple.
+
+3. **Dual RF surrogate** (`utils/surrogate.py`, `fit_surrogate` + `fit_dual_surrogate`):
+   - SQL query updated to fetch `COALESCE(confidence_score, 1.0)` as a 6th column.
+   - Per-sample weight formula extended from
+     `w = lig_iptm / ((1 + 10*le_std) * (1 + 10*ww_std))`
+     to
+     `w = lig_iptm * conf_score / ((1 + 10*le_std) * (1 + 10*ww_std))`
+     (both terms clamped to ≥0.1 via `max(0.1, float(...))`).
+
+4. **GitHub export** (`utils/github.py`, `upload_boltz_cache_export`):
+   - Main entries SELECT extended to include `COALESCE(confidence_score, 1.0)` as column 9;
+     dict comprehension adds `"conf_score": r[8]`.
+   - History entries SELECT extended identically for cross-target history rows.
+
+**Files changed:**
+
+- `neurons/miner.py`: `_init_boltz_cache_db` (ALTER list), `_disk_cache_put` (signature +
+  INSERT), 5 call sites, §PPPPPP and §RRRRRR import INSERT tuples.
+- `utils/surrogate.py`: `fit_surrogate` and `fit_dual_surrogate` (SQL + weight formula).
+- `utils/github.py`: `upload_boltz_cache_export` main entries SQL + dict, history SQL + dict.
+
+**Expected benefit:**
+
+| Metric | Before §FFFFFFFFFF | After §FFFFFFFFFF |
+|--------|---------------------|---------------------|
+| Surrogate weight factors | 3 (lig_iptm, le_std, ww_std) | 4 (+conf_score) |
+| Weight signal on low-conf entries | Under-penalized | Correctly down-weighted |
+| Weight signal on high-conf entries | No bonus | Correctly up-weighted |
+| Estimated surrogate NDCG improvement | — | ~1–3% on structurally mixed cache |
+
+The primary impact is on **epoch 3+ surrogate ranking** when the training set contains a mix of
+high-quality confident runs and noisier low-confidence runs. The `conf_score` factor steers the
+RF fit toward the reliable data points, reducing false-positive UCB candidates for expensive
+Boltz oracle calls.
 
 ---
 

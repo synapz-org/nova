@@ -120,8 +120,11 @@ def fit_surrogate(db_path: str, protein: str, min_points: int = 40):
                 # §WWWWWWW: COALESCE boltz_le_std to 0.0 (no variance penalty for old rows).
                 # §XXXXXXXX: COALESCE boltz_ww_std to 0.0 (no inter-seed penalty for rows
                 # that §WW never re-scored or that pre-date §XXXXXXXX).
+                # §FFFFFFFFFF: COALESCE confidence_score to 1.0 for pre-§FFFFFFFFFF rows
+                # (no additional penalty when the column doesn't exist yet).
                 "SELECT smiles, score, COALESCE(ligand_iptm, 1.0), "
-                "COALESCE(boltz_le_std, 0.0), COALESCE(boltz_ww_std, 0.0) "
+                "COALESCE(boltz_le_std, 0.0), COALESCE(boltz_ww_std, 0.0), "
+                "COALESCE(confidence_score, 1.0) "
                 "FROM boltz_cache WHERE protein=?",
                 (protein,),
             ).fetchall()
@@ -138,13 +141,16 @@ def fit_surrogate(db_path: str, protein: str, min_points: int = 40):
     # the §WW cross-seed re-scoring showed high inter-seed variance (computed from
     # the std of [s_68, s_42, s_123]) contribute even less to surrogate training.
     # NULL ww_std → 0.0 → no additional penalty (pre-§XXXXXXXX or §WW never fired).
+    # §FFFFFFFFFF: additionally multiply by COALESCE(confidence_score, 1.0) — low overall
+    # complex confidence flags predictions where the Boltz structure is unreliable,
+    # complementing ligand_iptm (global inter-chain alignment) with a holistic signal.
     X, y, weights = [], [], []
-    for smiles, score, lig_iptm, le_std, ww_std in rows:
+    for smiles, score, lig_iptm, le_std, ww_std, conf_score in rows:
         vec = _descriptor_vector(smiles)
         if vec is not None:
             X.append(vec)
             y.append(float(score))
-            w = max(0.1, float(lig_iptm)) / (
+            w = max(0.1, float(lig_iptm)) * max(0.1, float(conf_score)) / (
                 (1.0 + 10.0 * float(le_std)) * (1.0 + 10.0 * float(ww_std))
             )
             weights.append(max(0.05, w))
@@ -314,9 +320,10 @@ def fit_dual_surrogate(db_path: str, protein: str, min_points: int = 40):
                 # §WWWWWWW: COALESCE boltz_le_std to 0.0 (no variance penalty for old rows).
                 # §XXXXXXXX: COALESCE boltz_ww_std to 0.0 (no inter-seed penalty for rows
                 # that §WW never re-scored or that pre-date §XXXXXXXX).
+                # §FFFFFFFFFF: COALESCE confidence_score to 1.0 for pre-§FFFFFFFFFF rows.
                 "SELECT smiles, affinity_prob_binary, affinity_pred_val, "
                 "COALESCE(ligand_iptm, 1.0), COALESCE(boltz_le_std, 0.0), "
-                "COALESCE(boltz_ww_std, 0.0) "
+                "COALESCE(boltz_ww_std, 0.0), COALESCE(confidence_score, 1.0) "
                 "FROM boltz_cache "
                 "WHERE protein=? "
                 "  AND affinity_prob_binary IS NOT NULL "
@@ -329,19 +336,20 @@ def fit_dual_surrogate(db_path: str, protein: str, min_points: int = 40):
     if len(rows) < min_points:
         return None
 
-    # §DDDDDD + §WWWWWWW + §XXXXXXXX: combined confidence-weighted training.
-    # Weight = ligand_iptm / ((1 + 10×le_std) × (1 + 10×ww_std)):
+    # §DDDDDD + §WWWWWWW + §XXXXXXXX + §FFFFFFFFFF: combined confidence-weighted training.
+    # Weight = ligand_iptm × confidence_score / ((1 + 10×le_std) × (1 + 10×ww_std)):
     # - low-confidence poses (ligand_iptm): reduce training influence
     # - high intra-run sample variance (boltz_le_std): further reduce
     # - high inter-seed variance (boltz_ww_std): further reduce
+    # - low overall complex confidence (confidence_score): additional reduction
     X, y_apb, y_apv, weights = [], [], [], []
-    for smiles, apb, apv, lig_iptm, le_std, ww_std in rows:
+    for smiles, apb, apv, lig_iptm, le_std, ww_std, conf_score in rows:
         vec = _descriptor_vector(smiles)
         if vec is not None:
             X.append(vec)
             y_apb.append(float(apb))
             y_apv.append(float(apv))
-            w = max(0.1, float(lig_iptm)) / (
+            w = max(0.1, float(lig_iptm)) * max(0.1, float(conf_score)) / (
                 (1.0 + 10.0 * float(le_std)) * (1.0 + 10.0 * float(ww_std))
             )
             weights.append(max(0.05, w))

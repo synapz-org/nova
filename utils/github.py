@@ -88,14 +88,15 @@ def upload_boltz_cache_export(db_path: str, protein: str) -> bool:
 
         c.execute(
             "SELECT smiles, score, affinity_prob_binary, affinity_pred_val, "
-            "ligand_iptm, product_name, boltz_le_std, boltz_ww_std "
+            "ligand_iptm, product_name, boltz_le_std, boltz_ww_std, "
+            "COALESCE(confidence_score, 1.0) "
             "FROM boltz_cache WHERE protein=? ORDER BY score DESC LIMIT 1000",
             (protein,),
         )
         entries = [
             {"smiles": r[0], "score": r[1], "apb": r[2], "apv": r[3],
              "ligand_iptm": r[4], "product_name": r[5], "le_std": r[6],
-             "ww_std": r[7]}
+             "ww_std": r[7], "conf_score": r[8]}
             for r in c.fetchall()
         ]
 
@@ -127,14 +128,15 @@ def upload_boltz_cache_export(db_path: str, protein: str) -> bool:
             for (pp,) in prior_rows:
                 c.execute(
                     "SELECT smiles, score, affinity_prob_binary, affinity_pred_val, "
-                    "ligand_iptm, product_name, boltz_le_std, boltz_ww_std "
+                    "ligand_iptm, product_name, boltz_le_std, boltz_ww_std, "
+                    "COALESCE(confidence_score, 1.0) "
                     "FROM boltz_cache WHERE protein=? ORDER BY score DESC LIMIT 20",
                     (pp,),
                 )
                 history[pp] = [
                     {"smiles": r[0], "score": r[1], "apb": r[2], "apv": r[3],
                      "ligand_iptm": r[4], "product_name": r[5], "le_std": r[6],
-                     "ww_std": r[7]}
+                     "ww_std": r[7], "conf_score": r[8]}
                     for r in c.fetchall()
                 ]
         except Exception:
