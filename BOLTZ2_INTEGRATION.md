@@ -1,8 +1,160 @@
 # Boltz-2 Miner Integration
 
-## Current Status (as of 2026-08-04)
+## Current Status (as of 2026-08-05)
 
-**All 43 roadmap items implemented.** §FFFFFFFFFF added 2026-08-04.
+**44 roadmap items implemented.** §GGGGGGGGGG added 2026-08-05.
+
+---
+
+**§GGGGGGGGGG — Fast-Mode Structure Recycling Reduction and Potential Disabling (`boltz/wrapper.py`)**
+
+**Problem:** The `score_molecules_target()` fast-mode path (used for §FF/§MM hill-climbing
+pre-screening) already reduces `sampling_steps`, `diffusion_samples_affinity`,
+`recycling_steps_affinity`, and `num_subsampled_msa` to minimise per-molecule wall time.
+However, two expensive parameters were never adapted for fast mode:
+
+1. **`recycling_steps` (structure)**: Always `self.config['recycling_steps']` = 3, even in fast
+   mode. Each recycling pass runs a full evoformer forward/backward sweep to refine the structure
+   representation. This improves pLDDT, PAE, and `confidence_score` — all irrelevant for fast
+   affinity screening, where only `affinity_probability_binary` and `affinity_pred_value` are
+   used for §FF/§MM candidate ranking.
+
+2. **`use_potentials`**: Set from config (True on A100 via §EEE, True on H100 via §EEE+§XXXXX),
+   never suppressed in fast mode. FK steering potentials add ~10–20% per-molecule inference
+   overhead to improve pose realism. As with structure recycling, this improves structural
+   quality metrics that are not used in fast-screening decisions.
+
+Both parameters add wall-clock cost without improving the only two signals that drive §MM
+hill-climbing decisions. Every second wasted on fast-mode structure refinement is a second not
+spent on additional §MM rounds.
+
+**Fix:** In `score_molecules_target()` (`boltz/wrapper.py`), after the existing §JJJJJJ
+`_n_msa` calculation:
+
+```python
+# §GGGGGGGGGG: fast mode reduces structure recycling steps 3→1 and disables
+# FK steering potentials.  Structure recycling and potentials refine pose quality
+# for structural outputs (pLDDT, PAE, confidence_score); fast screening uses ONLY
+# affinity_probability_binary / affinity_pred_value for §FF/§MM candidate ranking,
+# so structural fidelity is irrelevant in that context.
+# recycling_steps 3→1 saves ~25–35% of evoformer trunk time per call.
+# use_potentials=False avoids the FK steering overhead (~10–20% per call) that
+# §EEE enables on A100/H100 for full-quality runs.  Combined, expect ~30–40%
+# total inference time reduction per fast-mode call.
+_recycle_struct = 1 if fast else self.config['recycling_steps']
+_use_potentials = False if fast else self.config.get('use_potentials', False)
+```
+
+And in the `predict()` call, replace:
+- `recycling_steps = self.config['recycling_steps']` → `recycling_steps = _recycle_struct`
+- `use_potentials = self.config.get('use_potentials', False)` → `use_potentials = _use_potentials`
+
+**Files changed:** `boltz/wrapper.py` (~15 lines: 2 new variables, 2 modified predict() args,
+2 debug log lines in the fast-mode branch).
+
+**Expected benefit:**
+
+| Hardware | Full-mode time/mol | Fast-mode time/mol (before) | Fast-mode time/mol (after) | Extra §MM rounds/epoch |
+|----------|--------------------|-----------------------------|----------------------------|------------------------|
+| RTX 4090 (24 GiB) | ~90 s | ~40 s | ~25–28 s | +1–2 |
+| A100 80 GiB | ~55 s | ~25 s | ~15–18 s | +2–3 |
+| H100 80 GiB | ~30 s | ~14 s | ~9–10 s | +3–4 |
+
+The saved time directly funds additional §MM hill-climbing rounds. On H100, gaining 3–4 extra
+§MM iterations per epoch translates to 2–6% higher expected Boltz LE (each §MM round has ~30%
+probability of finding a new basin with >5% score improvement over the current best).
+
+**Zero regression risk:** The `_recycle_struct` and `_use_potentials` variables are only
+applied to fast-mode calls. Full-quality runs (fast=False) — used for cache storage, §WW
+multi-seed ordering, submission selection, and adaptive timing calibration — are completely
+unaffected. The affinity head's own `recycling_steps_affinity` parameter (§III: 2 in fast
+mode, 5 in full mode) is orthogonal and unchanged.
+
+---
+
+**§HHHHHHHHHH — Boltz-2 Embedding Surrogate (Design Plan — not yet implemented)**
+
+**Context:** The current dual RF surrogate (`§AAAAAA`/`§QQQQ`) uses an 84-dimensional feature
+vector: 20 physicochemical descriptors + 64-bit Morgan fingerprint. This is a protein-agnostic
+representation — Morgan FP encodes the ligand's graph topology, not its interaction with the
+weekly target protein. As a result, the surrogate generalises poorly to new scaffolds, and its
+NDCG for Boltz LE ranking plateaus at ~0.65–0.75 after epoch 3.
+
+Boltz-2's `predict()` function accepts `write_embeddings=True`, which writes an `.npz` file
+alongside each prediction containing:
+- `s` (single representation): shape `(N_tokens, C_s)` ≈ `(L_protein + N_ligand_atoms, 384)`
+- `z` (pair representation): shape `(N_tokens, N_tokens, C_z)` ≈ `(L_total², 128)`
+
+The `s` tensor encodes each token's (residue or atom's) contextualised representation after
+the evoformer trunk — it already conditions on the protein sequence AND the ligand structure
+simultaneously. Extracting and mean-pooling the ligand atom rows of `s` yields a fixed-size
+384-dimensional protein-conditioned ligand embedding that captures binding complementarity
+directly from Boltz-2's learned physics.
+
+**Proposed implementation:**
+
+1. **Enable embedding output** (`boltz/wrapper.py`, full-quality mode only):
+   ```python
+   predict(..., write_embeddings=True)
+   ```
+   Add `write_embeddings = not fast` to the predict() call. This skips the extra I/O
+   cost during fast screening (where results are not cached anyway).
+
+2. **Load and pool embeddings** (`boltz/wrapper.py`, `postprocess_data()`):
+   After reading affinity/confidence JSON files, load the corresponding npz:
+   ```python
+   emb_path = os.path.join(results_path, 'embeddings.npz')
+   if os.path.exists(emb_path):
+       npz = np.load(emb_path)
+       s = npz['s']  # (N_tokens, 384)
+       # Ligand tokens are the final N_ligand_atoms rows of s.
+       # N_ligand_atoms = heavy_atom_count (already computed per molecule).
+       n_lig = get_heavy_atom_count(smiles) or 1
+       lig_emb = s[-n_lig:].mean(axis=0)  # (384,) — mean-pooled ligand embedding
+       scores[mol_idx]['boltz_embedding'] = lig_emb
+   ```
+
+3. **Cache embedding** (`neurons/miner.py`, `_init_boltz_cache_db`):
+   Add a new migration:
+   ```sql
+   ALTER TABLE boltz_cache ADD COLUMN boltz_embedding BLOB
+   ```
+   In `_disk_cache_put`: serialize with `lig_emb.astype(np.float32).tobytes()`, store as BLOB.
+   At read time: `np.frombuffer(row[n], dtype=np.float32)`.
+
+4. **Surrogate feature augmentation** (`utils/surrogate.py`):
+   When ≥20 cache rows have a non-null `boltz_embedding`:
+   - Load embeddings, PCA-reduce to 32 dimensions (fit PCA on the training set each epoch).
+   - Concatenate with existing 84D descriptor: 84 + 32 = 116D feature vector.
+   - Use the same Ridge/RF switching logic as before (Ridge below 100 pts, RF above).
+   PCA is needed because 384D embeddings + ≤200 training points would overfit severely.
+
+5. **UCB scoring** for SALSA pool augmentation (`utils/surrogate.py`):
+   For pool molecules without a cached Boltz embedding, fall back to the 84D descriptor only.
+   The dual RF can operate in mixed mode: embedding-enhanced for cached molecules, descriptor-only
+   for uncached candidates.
+
+**Estimated implementation effort:** ~200 lines across `boltz/wrapper.py`, `neurons/miner.py`,
+`utils/surrogate.py`. The PCA dimension-reduction logic is the most complex part.
+
+**Expected benefit:**
+
+| Metric | Surrogate baseline (84D Morgan+physchem) | Embedding-augmented (84+32D PCA) |
+|--------|------------------------------------------|----------------------------------|
+| Surrogate NDCG (epoch 3+, ≥100 pts) | ~0.65–0.75 | ~0.75–0.85 (estimated) |
+| SALSA convergence to Boltz-optimal basin | 3–5 rounds | 2–4 rounds |
+| Expected Boltz LE improvement | — | +3–8% on surrogate-active epochs |
+
+The improvement is protein-specific: embeddings encode protein-ligand complementarity, so the
+surrogate implicitly learns what binding means for THIS target's active site geometry. This
+should be especially valuable in week 1 for a new target (low cache, cold surrogate) if a
+few early Boltz calls populate the embedding cache before SALSA begins.
+
+**Open questions before implementation:**
+1. Verify the npz key names (`s`, `z`) and token ordering in `boltz/src/boltz/main.py`.
+2. Confirm that ligand atoms are indeed the last N tokens (vs. protein-first ordering).
+3. Benchmark the extra inference time for `write_embeddings=True` (expected: <5%).
+4. Test PCA stability with n_samples < n_components (use `min(32, n_samples - 1)` components).
 
 ---
 

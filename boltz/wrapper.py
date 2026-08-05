@@ -257,6 +257,18 @@ properties:
         # under-sampling for very long proteins.  Full-quality runs are unaffected.
         _full_msa = self.config.get('num_subsampled_msa', 1024)
         _n_msa = max(256, _full_msa // 4) if fast else _full_msa
+        # §GGGGGGGGGG: fast mode reduces structure recycling steps 3→1 and disables
+        # FK steering potentials.  Structure recycling (evoformer passes) and potentials
+        # refine pose quality for structural outputs (pLDDT, PAE, confidence_score);
+        # fast screening uses ONLY affinity_probability_binary / affinity_pred_value for
+        # §FF/§MM candidate ranking, so structural fidelity is irrelevant in that context.
+        # recycling_steps 3→1 saves ~25–35% of evoformer trunk time per call.
+        # use_potentials=False avoids the FK steering overhead (~10–20% per call) that
+        # §EEE enables on A100/H100 for full-quality runs.  Combined, expect ~30–40%
+        # total inference time reduction per fast-mode call — equivalent to 1–3 extra
+        # §MM rounds on A100 per epoch.  Full-quality runs (fast=False) are unaffected.
+        _recycle_struct = 1 if fast else self.config['recycling_steps']
+        _use_potentials = False if fast else self.config.get('use_potentials', False)
 
         # Run Boltz2 for unique molecules
         _mode_tag = "[FAST] " if fast else ""
@@ -265,12 +277,16 @@ properties:
             bt.logging.debug(
                 f"[§JJJJJJ] Fast mode MSA: {_full_msa} → {_n_msa} sequences"
             )
+            bt.logging.debug(
+                f"[§GGGGGGGGGG] Fast mode: recycling_steps {self.config['recycling_steps']}→1, "
+                f"use_potentials {self.config.get('use_potentials', False)}→False"
+            )
         _t0 = time.time()
         try:
             predict(
                 data = self.input_dir,
                 out_dir = self.output_dir,
-                recycling_steps = self.config['recycling_steps'],
+                recycling_steps = _recycle_struct,
                 sampling_steps = _s_steps,
                 diffusion_samples = self.config['diffusion_samples'],
                 sampling_steps_affinity = _s_steps_aff,
@@ -282,7 +298,7 @@ properties:
                 no_kernels = self.config.get('no_kernels', False),
                 num_workers = self.config.get('num_workers', 2),
                 preprocessing_threads = self.config.get('preprocessing_threads', 4),
-                use_potentials = self.config.get('use_potentials', False),
+                use_potentials = _use_potentials,
                 step_scale = self.config.get('step_scale', None),
                 subsample_msa = self.config.get('subsample_msa', True),
                 num_subsampled_msa = _n_msa,

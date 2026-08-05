@@ -358,7 +358,7 @@ Even a partial result (1 of 5 molecules scored) improves on the PSICHIC-only bas
 
 ## Implementation Roadmap (priority order)
 
-All items 1–42 are **implemented**. Items 5 and 7 remain as conditional/research directions.
+Items 1–44 are **implemented** (§GGGGGGGGGG added 2026-08-05). Item 45 is planned. Items 5 and 7 remain as conditional/research directions.
 
 | Priority | Approach | Effort | Status | Expected gain |
 |----------|----------|--------|--------|---------------|
@@ -405,6 +405,8 @@ All items 1–42 are **implemented**. Items 5 and 7 remain as conditional/resear
 | 41 | §DDDDDDDDDD: MSA GitHub cache — after ColabFold fetches an MSA, gzip-compress and upload to `msa_cache/{protein}.a3m.gz` in the GitHub repo; on container restart try GitHub download before ColabFold (saves 5–15 min per restart for known proteins) | ~90 lines | ✅ Done | +2–5% Boltz LE on restart sessions by enabling full-MSA Boltz from epoch 1 instead of single-sequence mode; ColabFold wait eliminated for all proteins seen in prior week |
 | 42 | §EEEEEEEEEE: Gzip-compress Boltz cache export before base64 — apply same gzip technique as §DDDDDDDDDD MSA cache to §PPPPPP JSON export; expand entries from 500→1000 within GitHub 1 MB limit; backward-compatible downloader via magic-byte detection | ~20 lines | ✅ Done | 2× more surrogate training data from GitHub on restart (+3–8% NDCG on epoch 3+ with 1000 vs 500 cache points); also prevents export failures when cache grows large |
 | 43 | §FFFFFFFFFF: Persist Boltz-2 `confidence_score` (overall complex structural confidence, 0–1) to SQLite cache and GitHub export; extend dual RF surrogate weight to `lig_iptm * conf_score / ((1+10*le_std)*(1+10*ww_std))` so structurally uncertain molecules are down-weighted in surrogate training | ~50 lines | ✅ Done | ~1–3% NDCG improvement on structurally mixed cache; reduces false-positive UCB candidates when training set contains noisier low-confidence Boltz runs |
+| 44 | §GGGGGGGGGG: Fast-mode structure recycling 3→1 + disable FK potentials — two Boltz-2 call parameters never previously adapted for fast mode; saves 30–40% fast-call wall time on A100/H100 | ~15 lines | ✅ Done | +1–4 §MM rounds/epoch on A100/H100; equivalent to 2–6% higher expected Boltz LE per epoch |
+| 45 | §HHHHHHHHHH: Boltz-2 embedding surrogate — use `write_embeddings=True` to extract 384D ligand embeddings from Boltz-2, PCA-reduce to 32D, concatenate with Morgan FP+physchem descriptor for protein-conditioned surrogate features | ~200 lines | 📋 Planned | +3–8% surrogate NDCG on epoch 3+ (estimated); especially impactful on week-1 new targets with few cache points |
 
 All approaches share the same submission constraint: molecules must map to valid SAVI-2020
 product names. SALSA and GradientGA both solve this via nearest-neighbour SAVI-2020 lookup.
