@@ -269,6 +269,11 @@ properties:
         # §MM rounds on A100 per epoch.  Full-quality runs (fast=False) are unaffected.
         _recycle_struct = 1 if fast else self.config['recycling_steps']
         _use_potentials = False if fast else self.config.get('use_potentials', False)
+        # §HHHHHHHHHH: write trunk embeddings only for full-quality runs (not fast screening).
+        # Fast-mode calls are not cached, so embeddings would never be used for surrogate
+        # training.  Full-quality runs write embeddings_{mol_idx}.npz alongside the
+        # affinity/confidence JSONs; postprocess_data() reads and mean-pools them.
+        _write_embeddings = not fast
 
         # Run Boltz2 for unique molecules
         _mode_tag = "[FAST] " if fast else ""
@@ -304,6 +309,7 @@ properties:
                 num_subsampled_msa = _n_msa,
                 recycling_steps_affinity = _recycle_aff,
                 max_parallel_samples = self.config.get('max_parallel_samples', 1),
+                write_embeddings = _write_embeddings,
             )
             _elapsed = time.time() - _t0
             if not fast:
@@ -339,6 +345,14 @@ properties:
                         with open(os.path.join(results_path, filepath), 'r') as f:
                             confidence_data = json.load(f)
                         scores[mol_idx].update(confidence_data)
+                    elif filepath.startswith('embeddings') and filepath.endswith('.npz'):
+                        # §HHHHHHHHHH: load trunk single-representation for ligand embedding.
+                        # The file is only written for full-quality runs (write_embeddings=True).
+                        try:
+                            _emb_npz = np.load(os.path.join(results_path, filepath))
+                            scores[mol_idx]['_s_arr'] = _emb_npz['s']
+                        except Exception:
+                            pass
             except (FileNotFoundError, OSError) as e:
                 bt.logging.warning(
                     f"Boltz results missing for mol_idx={mol_idx} "
@@ -422,6 +436,20 @@ properties:
                 except Exception:
                     heavy_atom_count = None
 
+                # §HHHHHHHHHH: mean-pool ligand trunk embedding from Boltz-2 evoformer output.
+                # Protein tokens come first (chain A), ligand tokens are the last N rows of s
+                # (chain B, 1 token per heavy atom).  Only available for full-quality runs.
+                boltz_embedding = None
+                _s_arr = mol_scores.get('_s_arr')
+                if _s_arr is not None and heavy_atom_count:
+                    try:
+                        n_lig = max(1, heavy_atom_count)
+                        lig_emb = _s_arr[-n_lig:].mean(axis=0).astype(np.float32)
+                        if lig_emb.shape == (384,):
+                            boltz_embedding = lig_emb
+                    except Exception:
+                        pass
+
                 if uid not in self.per_molecule_components:
                     self.per_molecule_components[uid] = {}
                 self.per_molecule_components[uid][smiles] = {
@@ -443,6 +471,7 @@ properties:
                     "chains_ptm": chains_ptm,
                     "pair_chains_iptm": pair_chains_iptm,
                     "heavy_atom_count": heavy_atom_count,
+                    "boltz_embedding": boltz_embedding,
                 }
         bt.logging.debug(f"final_boltz_scores: {final_boltz_scores}")
 

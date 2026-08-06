@@ -50,7 +50,7 @@ from utils.msa import ensure_msa
 from utils.salsa import run_salsa_search
 from utils.genetic import run_gradient_ga
 from utils.chembl import get_chembl_seeds
-from utils.surrogate import fit_surrogate, rank_pool_by_surrogate, ucb_rank_pool, fit_dual_surrogate, dual_surrogate_rank_pool, dual_surrogate_ucb_rank_pool, augment_pool_with_surrogate_blend
+from utils.surrogate import fit_surrogate, rank_pool_by_surrogate, ucb_rank_pool, fit_dual_surrogate, dual_surrogate_rank_pool, dual_surrogate_ucb_rank_pool, augment_pool_with_surrogate_blend, fit_dual_surrogate_with_embeddings, dual_surrogate_ucb_rank_pool_emb
 from PSICHIC.wrapper import PsichicWrapper
 from boltz.wrapper import BoltzWrapper
 from btdr import QuicknetBittensorDrandTimelock
@@ -96,6 +96,11 @@ def _init_boltz_cache_db(db_path: str) -> None:
             # with a holistic quality signal.  LOW confidence_score → additional
             # down-weight in surrogate training alongside ligand_iptm.
             "ALTER TABLE boltz_cache ADD COLUMN confidence_score REAL",
+            # §HHHHHHHHHH: store mean-pooled Boltz-2 evoformer trunk embedding for the
+            # ligand chain (384D float32 vector serialised as BLOB).  Used to train a
+            # protein-conditioned PCA-augmented RF surrogate that captures binding
+            # complementarity beyond Morgan fingerprint topology.
+            "ALTER TABLE boltz_cache ADD COLUMN boltz_embedding BLOB",
         ):
             try:
                 conn.execute(_col_ddl)
@@ -140,6 +145,7 @@ def _disk_cache_put(
     ligand_iptm: Optional[float] = None,
     boltz_le_std: Optional[float] = None,
     confidence_score: Optional[float] = None,
+    boltz_embedding: Optional[bytes] = None,
 ) -> None:
     """Upsert a Boltz score into the persistent cache (silently ignores errors).
 
@@ -160,13 +166,23 @@ def _disk_cache_put(
             conn.execute(
                 "INSERT OR REPLACE INTO boltz_cache "
                 "(smiles, protein, score, product_name, affinity_prob_binary, "
-                "affinity_pred_val, ligand_iptm, boltz_le_std, confidence_score) "
-                "VALUES (?,?,?,?,?,?,?,?,?)",
+                "affinity_pred_val, ligand_iptm, boltz_le_std, confidence_score, "
+                "boltz_embedding) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?)",
                 (smiles, protein, score, product_name, apb, apv, ligand_iptm,
-                 boltz_le_std, confidence_score),
+                 boltz_le_std, confidence_score, boltz_embedding),
             )
     except Exception:
         pass
+
+
+def _emb_to_bytes(comps: dict) -> Optional[bytes]:
+    """§HHHHHHHHHH: Extract embedding bytes from per_molecule_components dict for cache storage."""
+    emb = comps.get('boltz_embedding')
+    try:
+        return emb.tobytes() if emb is not None else None
+    except Exception:
+        return None
 
 
 def _compute_le_std(comps: dict) -> Optional[float]:
@@ -1676,35 +1692,40 @@ async def run_boltz_prescoring(state: Dict[str, Any], max_candidates: int = 5) -
     except Exception as _vv_err:
         bt.logging.debug(f"[§VVVVVV] Archive pre-filter skipped (non-fatal): {_vv_err}")
 
-    # §ZZ / §YYYYY: Re-rank Boltz candidates by surrogate when ≥ 40 scores cached.
-    # §YYYYY dual surrogate: when ≥ 40 rows with complete APB/APV component data
-    # exist, trains separate surrogates for affinity_probability_binary and
-    # affinity_pred_value, then predicts (apb_pred - apv_pred) / ha as the ranking
-    # signal.  Separate models capture the distinct functional forms of the two Boltz
-    # outputs (probability vs. free energy) better than a single combined-score model.
-    # Falls back to §RRRR UCB surrogate (combined score) when component data is sparse
-    # (pre-§YYYYY cache entries, or first epoch on a new target), and further falls back
-    # to PSICHIC ordering when the cache has < 40 entries.
+    # §ZZ / §YYYYY / §HHHHHHHHHH: Re-rank Boltz candidates by surrogate when ≥ 40 scores cached.
+    # §HHHHHHHHHH: try the embedding-augmented dual surrogate first (RF tier + ≥20 embedding rows).
+    # Embedding features encode protein-conditioned ligand binding complementarity from the
+    # Boltz-2 evoformer trunk, improving surrogate NDCG beyond Morgan FP + physchem alone.
+    # Falls back: §YYYYY dual UCB → §RRRR UCB (combined) → PSICHIC ordering.
     if not candidates.empty:
         try:
-            _dual = fit_dual_surrogate(db_path, protein)
-            if _dual is not None:
-                candidates = dual_surrogate_ucb_rank_pool(candidates, _dual)
+            _emb_dual = fit_dual_surrogate_with_embeddings(db_path, protein)
+            if _emb_dual is not None:
+                candidates = dual_surrogate_ucb_rank_pool_emb(candidates, _emb_dual)
+                _emb_tag = "[emb+RF]" if _emb_dual[2] is not None else "[RF]"
                 bt.logging.info(
-                    f"[§AAAAAA] Pre-Boltz candidates re-ranked by dual APB+APV UCB surrogate "
-                    f"({len(candidates)} entries, target={protein})."
+                    f"[§HHHHHHHHHH/§AAAAAA] Pre-Boltz candidates re-ranked by embedding-augmented "
+                    f"dual UCB surrogate {_emb_tag} ({len(candidates)} entries, target={protein})."
                 )
             else:
-                _zz_model = fit_surrogate(db_path, protein)
-                if _zz_model is not None:
-                    # §RRRR: UCB ranking when surrogate is RF (≥100 pts).
-                    candidates = ucb_rank_pool(candidates, _zz_model)
+                _dual = fit_dual_surrogate(db_path, protein)
+                if _dual is not None:
+                    candidates = dual_surrogate_ucb_rank_pool(candidates, _dual)
                     bt.logging.info(
-                        f"[§RRRR/ZZ] Pre-Boltz candidates re-ranked by UCB surrogate "
+                        f"[§AAAAAA] Pre-Boltz candidates re-ranked by dual APB+APV UCB surrogate "
                         f"({len(candidates)} entries, target={protein})."
                     )
+                else:
+                    _zz_model = fit_surrogate(db_path, protein)
+                    if _zz_model is not None:
+                        # §RRRR: UCB ranking when surrogate is RF (≥100 pts).
+                        candidates = ucb_rank_pool(candidates, _zz_model)
+                        bt.logging.info(
+                            f"[§RRRR/ZZ] Pre-Boltz candidates re-ranked by UCB surrogate "
+                            f"({len(candidates)} entries, target={protein})."
+                        )
         except Exception as _zz_err:
-            bt.logging.debug(f"[ZZ/YYYYY] Candidate surrogate re-rank skipped: {_zz_err}")
+            bt.logging.debug(f"[ZZ/YYYYY/HHHHHHHHHH] Candidate surrogate re-rank skipped: {_zz_err}")
 
     if candidates.empty:
         bt.logging.warning("Boltz-2 pre-scoring: no Boltz-safe candidates, keeping PSICHIC ranking.")
@@ -1919,6 +1940,7 @@ async def run_boltz_prescoring(state: Dict[str, Any], max_candidates: int = 5) -
                         ligand_iptm=_dddddd_li if isinstance(_dddddd_li, (int, float)) else None,
                         boltz_le_std=_wwwwwww_le_std,
                         confidence_score=_fffff_cs if isinstance(_fffff_cs, (int, float)) else None,
+                        boltz_embedding=_emb_to_bytes(_comps),
                     )
 
                     # Adaptive trigger: one molecule gives the most accurate per-mol timing
@@ -2130,6 +2152,7 @@ async def run_boltz_prescoring(state: Dict[str, Any], max_candidates: int = 5) -
                                         ligand_iptm=_ff_li if isinstance(_ff_li, (int, float)) else None,
                                         boltz_le_std=_compute_le_std(_ff_comps),
                                         confidence_score=_ff_cs if isinstance(_ff_cs, (int, float)) else None,
+                                        boltz_embedding=_emb_to_bytes(_ff_comps),
                                     )
                                     bt.logging.info(
                                         f"§FF §NN full-scored winner: {_ff_w_row.get('product_name', '?')} "
@@ -2407,6 +2430,7 @@ async def run_boltz_prescoring(state: Dict[str, Any], max_candidates: int = 5) -
                                 ligand_iptm=_mm_li if isinstance(_mm_li, (int, float)) else None,
                                 boltz_le_std=_compute_le_std(_mm_comps),
                                 confidence_score=_mm_cs if isinstance(_mm_cs, (int, float)) else None,
+                                boltz_embedding=_emb_to_bytes(_mm_comps),
                             )
                             if wrapper.last_inference_duration > 0:
                                 state['boltz_time_per_mol'] = wrapper.last_inference_duration
@@ -2785,6 +2809,7 @@ async def run_boltz_prescoring(state: Dict[str, Any], max_candidates: int = 5) -
                                                 confidence_score=_xx_cs if isinstance(
                                                     _xx_cs, (int, float)
                                                 ) else None,
+                                                boltz_embedding=_emb_to_bytes(_xx_comps),
                                             )
                                             if wrapper.last_inference_duration > 0:
                                                 state['boltz_time_per_mol'] = (
@@ -3050,6 +3075,7 @@ async def run_boltz_prescoring(state: Dict[str, Any], max_candidates: int = 5) -
                                     confidence_score=_tt_cs if isinstance(
                                         _tt_cs, (int, float)
                                     ) else None,
+                                    boltz_embedding=_emb_to_bytes(_tt_comps),
                                 )
                                 if wrapper.last_inference_duration > 0:
                                     state['boltz_time_per_mol'] = (

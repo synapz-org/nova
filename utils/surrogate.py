@@ -594,3 +594,225 @@ def augment_pool_with_surrogate_blend(
         return pool_copy
     except Exception:
         return pool_df
+
+
+# ---------------------------------------------------------------------------
+# §HHHHHHHHHH — Boltz-2 Embedding-Augmented Dual Surrogate
+# ---------------------------------------------------------------------------
+# Uses mean-pooled Boltz-2 evoformer trunk embeddings (384D ligand chain rows
+# of the single representation `s`) stored per-molecule in the SQLite cache.
+# PCA-reduces to 32D and concatenates with the existing 84D descriptor vector
+# (84 + 32 = 116D features).  For pool molecules not yet Boltz-scored,
+# the 32 PCA components are zero-padded (neutral prior = mean embedding).
+# Only activates for RandomForest tier (≥ 100 cache points, ≥ 20 with embeddings).
+
+_N_EMB_COMPONENTS = 32
+_MIN_EMB_ROWS = 20
+
+
+def _load_embeddings_from_cache(db_path: str, protein: str) -> tuple:
+    """Load (smiles → 32D PCA vector) dict from SQLite, or (None, {}) on failure.
+
+    Returns (fitted_pca, emb_dict) where emb_dict maps canonical SMILES to a
+    float32 array of shape (_N_EMB_COMPONENTS,).  Returns (None, {}) when fewer
+    than _MIN_EMB_ROWS embedding rows exist or sklearn/numpy are unavailable.
+    """
+    try:
+        from sklearn.decomposition import PCA
+    except ImportError:
+        return None, {}
+
+    try:
+        with sqlite3.connect(db_path) as conn:
+            rows = conn.execute(
+                "SELECT smiles, boltz_embedding FROM boltz_cache "
+                "WHERE protein=? AND boltz_embedding IS NOT NULL",
+                (protein,),
+            ).fetchall()
+    except Exception:
+        return None, {}
+
+    if len(rows) < _MIN_EMB_ROWS:
+        return None, {}
+
+    smiles_list, raw_embs = [], []
+    for smiles, blob in rows:
+        try:
+            emb = np.frombuffer(blob, dtype=np.float32)
+            if emb.shape == (384,):
+                smiles_list.append(smiles)
+                raw_embs.append(emb)
+        except Exception:
+            pass
+
+    if len(smiles_list) < _MIN_EMB_ROWS:
+        return None, {}
+
+    try:
+        X = np.stack(raw_embs)
+        n_comp = min(_N_EMB_COMPONENTS, X.shape[0] - 1, X.shape[1])
+        if n_comp < 1:
+            return None, {}
+        pca = PCA(n_components=n_comp, random_state=68)
+        X_red = pca.fit_transform(X)
+        if n_comp < _N_EMB_COMPONENTS:
+            pad = np.zeros((X_red.shape[0], _N_EMB_COMPONENTS - n_comp), dtype=np.float32)
+            X_red = np.hstack([X_red, pad])
+        emb_dict = {s: X_red[i].astype(np.float32) for i, s in enumerate(smiles_list)}
+        return pca, emb_dict
+    except Exception:
+        return None, {}
+
+
+def fit_dual_surrogate_with_embeddings(db_path: str, protein: str, min_points: int = 40):
+    """§HHHHHHHHHH: Dual APB/APV surrogate optionally augmented with PCA embeddings.
+
+    Returns (model_apb, model_apv, emb_pca, emb_dict) where emb_pca and emb_dict
+    are populated when ≥ _MIN_EMB_ROWS embedding rows exist; otherwise both are
+    None/{} and the models use only the 84D descriptor features (identical to
+    fit_dual_surrogate).  Returns None when fewer than min_points valid training
+    examples exist or sklearn is unavailable.
+
+    Callers pass the 4-tuple to dual_surrogate_ucb_rank_pool_emb() for ranking.
+    """
+    try:
+        from sklearn.linear_model import Ridge
+        from sklearn.ensemble import RandomForestRegressor
+        from sklearn.pipeline import Pipeline
+        from sklearn.preprocessing import StandardScaler
+    except ImportError:
+        return None
+
+    emb_pca, emb_dict = _load_embeddings_from_cache(db_path, protein)
+    has_emb = emb_pca is not None
+
+    try:
+        with sqlite3.connect(db_path) as conn:
+            rows = conn.execute(
+                "SELECT smiles, affinity_prob_binary, affinity_pred_val, "
+                "COALESCE(ligand_iptm, 1.0), COALESCE(boltz_le_std, 0.0), "
+                "COALESCE(boltz_ww_std, 0.0), COALESCE(confidence_score, 1.0) "
+                "FROM boltz_cache "
+                "WHERE protein=? "
+                "  AND affinity_prob_binary IS NOT NULL "
+                "  AND affinity_pred_val IS NOT NULL",
+                (protein,),
+            ).fetchall()
+    except Exception:
+        return None
+
+    if len(rows) < min_points:
+        return None
+
+    zeros_emb = [0.0] * _N_EMB_COMPONENTS
+    X, y_apb, y_apv, weights = [], [], [], []
+    for smiles, apb, apv, lig_iptm, le_std, ww_std, conf_score in rows:
+        vec = _descriptor_vector(smiles)
+        if vec is None:
+            continue
+        if has_emb:
+            emb_feat = emb_dict.get(smiles)
+            vec = vec + (list(emb_feat) if emb_feat is not None else zeros_emb)
+        X.append(vec)
+        y_apb.append(float(apb))
+        y_apv.append(float(apv))
+        w = max(0.1, float(lig_iptm)) * max(0.1, float(conf_score)) / (
+            (1.0 + 10.0 * float(le_std)) * (1.0 + 10.0 * float(ww_std))
+        )
+        weights.append(max(0.05, w))
+
+    if len(X) < min_points:
+        return None
+
+    def _make_pipeline(n: int):
+        if n >= _RF_THRESHOLD:
+            learner = RandomForestRegressor(
+                n_estimators=100, max_features='sqrt', random_state=68, n_jobs=1
+            )
+        else:
+            learner = Ridge(alpha=1.0)
+        return Pipeline([('scaler', StandardScaler()), ('model', learner)])
+
+    try:
+        _w = np.array(weights)
+        model_apb = _make_pipeline(len(X))
+        model_apb.fit(X, y_apb, model__sample_weight=_w)
+        model_apv = _make_pipeline(len(X))
+        model_apv.fit(X, y_apv, model__sample_weight=_w)
+        return (model_apb, model_apv, emb_pca, emb_dict)
+    except Exception:
+        return None
+
+
+def dual_surrogate_ucb_rank_pool_emb(
+    pool_df,
+    emb_result,
+    beta: float = 1.0,
+    smiles_col: str = 'product_smiles',
+    ha_col: str = 'heavy_atoms',
+):
+    """§HHHHHHHHHH: UCB ranking using the embedding-augmented dual surrogate.
+
+    emb_result is the (model_apb, model_apv, emb_pca, emb_dict) tuple from
+    fit_dual_surrogate_with_embeddings().  Pool molecules not in emb_dict get
+    zero-padded PCA components (neutral prior).  Falls back to plain mean ranking
+    when RF variance is unavailable (Ridge tier or error).
+    """
+    if emb_result is None:
+        return pool_df
+
+    model_apb, model_apv, emb_pca, emb_dict = emb_result
+    has_emb = emb_pca is not None
+
+    try:
+        from sklearn.ensemble import RandomForestRegressor
+        _apb_rf = isinstance(model_apb.named_steps.get('model'), RandomForestRegressor)
+        _apv_rf = isinstance(model_apv.named_steps.get('model'), RandomForestRegressor)
+    except Exception:
+        return pool_df
+
+    try:
+        smiles_list = pool_df[smiles_col].tolist()
+        desc_vecs = [_descriptor_vector(s) for s in smiles_list]
+        n_valid = sum(1 for v in desc_vecs if v is not None)
+        if n_valid < max(1, len(pool_df) * 0.5):
+            return pool_df
+
+        zeros_desc = [0.0] * _N_FEATURES
+        zeros_emb = [0.0] * _N_EMB_COMPONENTS
+        if has_emb:
+            X = [
+                (d if d is not None else zeros_desc) +
+                (list(emb_dict.get(s, np.zeros(_N_EMB_COMPONENTS, dtype=np.float32)))
+                 if has_emb else zeros_emb)
+                for d, s in zip(desc_vecs, smiles_list)
+            ]
+        else:
+            X = [d if d is not None else zeros_desc for d in desc_vecs]
+
+        if ha_col in pool_df.columns:
+            ha_vals = pool_df[ha_col].fillna(25).values.astype(float)
+        else:
+            from utils.molecules import get_heavy_atom_count
+            ha_vals = np.array([float(get_heavy_atom_count(s) or 25) for s in smiles_list])
+        ha_vals = np.where(ha_vals > 0, ha_vals, 25.0)
+
+        if _apb_rf and _apv_rf:
+            mean_apb, std_apb = predict_with_uncertainty(model_apb, X)
+            mean_apv, std_apv = predict_with_uncertainty(model_apv, X)
+            scores = (mean_apb - mean_apv + beta * (std_apb + std_apv)) / ha_vals
+        else:
+            apb_preds = model_apb.predict(X)
+            apv_preds = model_apv.predict(X)
+            scores = (apb_preds - apv_preds) / ha_vals
+
+        pool_copy = pool_df.copy()
+        pool_copy['surrogate_score'] = scores
+        return (
+            pool_copy
+            .sort_values('surrogate_score', ascending=False)
+            .drop(columns=['surrogate_score'])
+            .reset_index(drop=True)
+        )
+    except Exception:
+        return pool_df
