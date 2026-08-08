@@ -101,6 +101,13 @@ def _init_boltz_cache_db(db_path: str) -> None:
             # protein-conditioned PCA-augmented RF surrogate that captures binding
             # complementarity beyond Morgan fingerprint topology.
             "ALTER TABLE boltz_cache ADD COLUMN boltz_embedding BLOB",
+            # §IIIIIIIIII: store PSICHIC ligand-efficiency score (combined_score =
+            # (target_affinity - weight*antitarget_affinity) / heavy_atoms) recorded
+            # at Boltz call time.  Used as an extra surrogate training feature so the
+            # RF model learns the PSICHIC→Boltz correction rather than relying solely
+            # on Morgan FP / physicochemical descriptors.  NULL for legacy rows and
+            # §MM SALSA-discovered molecules not in the PSICHIC candidate pool.
+            "ALTER TABLE boltz_cache ADD COLUMN psichic_le REAL",
         ):
             try:
                 conn.execute(_col_ddl)

@@ -1,10 +1,176 @@
 # Boltz-2 Miner Integration
 
-## Current Status (as of 2026-08-06)
+## Current Status (as of 2026-08-08)
 
 **45 roadmap items implemented.** §HHHHHHHHHH added 2026-08-06.
+3 new optimisations planned (§IIIIIIIIII, §JJJJJJJJJJ, §KKKKKKKKKK) — see below.
 
 ---
+
+## Planned Optimisations
+
+### §IIIIIIIIII — PSICHIC Ligand Efficiency as Surrogate Training Feature
+
+**Problem:** The dual RF surrogate (§AAAAAA / §HHHHHHHHHH) trains on Boltz-2 scores using
+84D molecular descriptors + 32D PCA Boltz embeddings as features.  These encode the ligand's
+*topology* and *protein-interaction geometry* but not the PSICHIC binding signal.  PSICHIC
+captures protein-ligand complementarity from a different model family — its prediction is
+partially independent of Morgan FP and partially independent of Boltz-2 embeddings.  The
+residual prediction error of the surrogate (Boltz_LE − predicted) often correlates with the
+PSICHIC LE score for that molecule, meaning PSICHIC could reduce surrogate error if included
+as feature 118 in the embedding tier (or feature 85 in the descriptor-only tier).
+
+**Fix — three-part change:**
+
+1. **`neurons/miner.py` — Schema migration:** Add `psichic_le REAL` column to `boltz_cache`
+   via the existing ALTER TABLE migration list in `_init_boltz_cache_db`.  NULL for legacy rows.
+   *(This data-collection step is already committed — see schema migration below.)*
+
+2. **`neurons/miner.py` — Cache write:** At each `_disk_cache_put()` call site inside
+   `run_boltz_prescoring`, look up the molecule's `combined_score` (= PSICHIC LE) from the
+   `candidates` / `all_scores` context and pass it as `psichic_le=...`.  For §MM SALSA-
+   discovered molecules that are not in `candidates`, store NULL (neutral under StandardScaler).
+
+3. **`utils/surrogate.py` — Training and ranking:**
+   - `fit_dual_surrogate_with_embeddings`: query `COALESCE(psichic_le, 0.0)` from cache;
+     append as one extra feature after the 84D descriptor vector and before the 32D PCA
+     embedding block → total 117D feature vector.
+   - `dual_surrogate_ucb_rank_pool_emb`: add `psichic_le_col: str = 'combined_score'`
+     parameter; extract psichic_le from `pool_df[psichic_le_col].fillna(0.0)` and append
+     to each candidate's feature vector before prediction.
+   - Mirror the same change in `fit_dual_surrogate` and `dual_surrogate_ucb_rank_pool`
+     (85D instead of 84D for the non-embedding tier).
+
+**Backward compatibility:** Models are always retrained from scratch each Boltz prescoring
+call — there is no persistent model file.  The feature-dimension increase is invisible to
+callers; only training and ranking code need updating.  Old cache rows with NULL psichic_le
+get 0.0 (neutral) and contribute the same signal as before.  All surrogate failures fall
+back silently to PSICHIC ordering (existing pattern), so zero regression risk.
+
+**Expected benefit:** +3–8% NDCG improvement in surrogate quality from epoch 2+.  Especially
+impactful on week-1 new targets where embeddings are sparse but PSICHIC scores exist for
+every molecule in the training set.  Stacks with §HHHHHHHHHH (PCA embeddings) and §FFFFFFFFFF
+(confidence weighting).
+
+**Files to change:** `neurons/miner.py` (~40 lines), `utils/surrogate.py` (~35 lines).
+
+**Schema data-collection step: already applied (2026-08-08).**
+
+---
+
+### §JJJJJJJJJJ — Mid-Epoch Exploratory Boltz Probe (Cold-Start Surrogate Seed)
+
+**Problem:** On epoch 1 of a new weekly target, the disk cache is empty and no GitHub export
+exists.  The §YYYYYY startup surrogate cannot activate (<40 cache points), §HHHHHHHHHH
+embeddings are unavailable, and all surrogate-based SALSA improvements are dormant.  The miner
+runs PSICHIC-only ranking for the entire pre-trigger window (~50 min) before Boltz fires at
+epoch end.  This is the weakest epoch precisely when the target is newest.
+
+**Fix:** After `savi_stream_pool` reaches ≥ 1000 molecules AND no Boltz cache data exists for
+the current protein (cold-start detection), fire ONE fast Boltz call on the top PSICHIC
+candidate.  Use the `fast=True` path with an even more aggressive configuration:
+`sampling_steps_affinity=25, diffusion_samples_affinity=1, recycling_steps_affinity=1,
+recycling_steps=1` (≈ 15–20 s on A100, ≈ 8–12 s on H100).
+
+```python
+# §JJJJJJJJJJ: Mid-epoch cold-start probe — fires once per epoch when cache is empty.
+_jj_protein = state['config'].weekly_target
+_jj_probe_done = state.get('jj_probe_done', False)
+_jj_cache_empty = not bool(_disk_cache_get_candidates(db_path, _jj_protein, limit=1))
+if (
+    not _jj_probe_done
+    and _jj_cache_empty
+    and len(state.get('savi_stream_pool', [])) >= 1000
+    and blocks_until_epoch > boltz_trigger + 50   # stay well clear of normal trigger
+):
+    _jj_candidate = state['global_candidate_pool'].iloc[0]['product_smiles']
+    # Run a 1-molecule ultra-fast Boltz call in background thread (non-blocking)
+    asyncio.create_task(_run_jj_probe(state, _jj_candidate))
+    state['jj_probe_done'] = True   # fire only once per epoch
+```
+
+The probe result is written to the disk cache immediately.  On the next PSICHIC chunk, the
+cache reaches 1 entry and the startup surrogate activates (§YYYYYY with min_points=1 override
+for this fast path).  SALSA subsequently uses a surrogate-blended pool from that point.
+
+**Reset:** `jj_probe_done` is cleared in the epoch-boundary reset block alongside other
+per-epoch flags.
+
+**Guard:** If Boltz is already running (§FF/§MM active), skip probe.  If probe fails (any
+exception), log and continue — zero regression.
+
+**Expected benefit:** On cold-start epoch 1 (no GitHub cache, new protein), enables surrogate-
+guided SALSA seeding 20–40 min earlier than the normal trigger.  This is the scenario where
+the surrogate benefit is largest (unknown chemistry → high exploration value).  Estimated
++3–6% Boltz LE on epoch 1 of a new weekly target rotation.
+
+**Cost:** 15–20 s of GPU time, fired once mid-epoch when no other GPU work is running.
+Effectively free on A100/H100 which otherwise idles until the trigger window.
+
+**Files to change:** `neurons/miner.py` (~40 lines).
+
+---
+
+### §KKKKKKKKKK — Boltz-2 Embedding Centroid Diversity Bonus for Candidate Selection
+
+**Problem:** Current candidate diversity strategies are:
+- §SSSSSS: max-min Tanimoto (Morgan FP 2048-bit) for disk-cache seeds before SALSA
+- Scaffold diversity filter (`_scaffold_diverse_candidates`) on the top-5 pool candidates
+
+These both operate in the Morgan FP / scaffold space.  Molecules that are Tanimoto-diverse
+may still occupy the same protein–ligand interaction *mode* (e.g., two different scaffolds
+that both bind the same pocket sub-region with similar H-bond donors).  The Boltz-2 embedding
+(§HHHHHHHHHH, 384D mean-pooled evoformer representation, PCA-reduced to 32D) encodes protein-
+conditioned binding geometry — molecules close in embedding space likely adopt similar binding
+poses even if their Morgan FP is different.
+
+**Fix:** When ≥20 Boltz embeddings are stored in the cache (§HHHHHHHHHH tier is active),
+compute the *centroid* of scored molecules' PCA embeddings and add an embedding-distance
+*diversity bonus* to the surrogate candidate score:
+
+```
+embedding_diversity_bonus(mol) = cosine_distance(emb(mol), centroid) × γ
+```
+
+For unscored candidates (no stored embedding), `emb(mol) = zeros_32D` → bonus = 0 (neutral).
+
+The combined ranking score becomes:
+```
+candidate_score = surrogate_UCB(mol) + γ × embedding_diversity_bonus(mol)
+```
+
+`γ` is a tunable weight, defaulting to 0.05 (5% bonus from diversity relative to a typical
+UCB spread of 0.01–0.05).  After §MM hill-climbing converges, the embedding-space centroid
+of scored molecules is tightly clustered around the best-known scaffold family.  The diversity
+bonus steers the NEXT §MM basin-hop away from that cluster toward unexplored interaction modes.
+
+**Implementation:** In `dual_surrogate_ucb_rank_pool_emb`, after computing `ucb_scores`:
+
+```python
+if has_emb and emb_dict and gamma > 0.0:
+    scored_embs = np.array([list(v) for v in emb_dict.values()])  # (N_scored, 32)
+    centroid = scored_embs.mean(axis=0)
+    for i, s in enumerate(smiles_list):
+        mol_emb = emb_dict.get(s)
+        if mol_emb is not None:
+            dist = 1.0 - float(np.dot(mol_emb, centroid) /
+                               (np.linalg.norm(mol_emb) * np.linalg.norm(centroid) + 1e-9))
+            ucb_scores[i] += gamma * dist
+```
+
+**Expected benefit:** +2–5% probability of finding a novel scaffold winner per epoch on
+converged runs (epoch 4+) where §MM has already exhausted the primary scaffold family.
+Complementary to §SSSSSS (which adds Tanimoto diversity at seed-selection time, not at
+surrogate-ranking time).  Adds embedding-mode diversity on top of structural diversity.
+
+**Zero regression risk:** `gamma=0.0` (default) disables the bonus.  Explicit opt-in via
+config key `embedding_diversity_gamma: 0.05` in `config/config.yaml`.
+
+**Files to change:** `utils/surrogate.py` (~30 lines), `config/config.yaml` (1 line).
+
+---
+
+## Implemented Optimisations
 
 **§HHHHHHHHHH — Boltz-2 Embedding Surrogate (`boltz/wrapper.py`, `neurons/miner.py`, `utils/surrogate.py`)**
 
