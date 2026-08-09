@@ -1,62 +1,13 @@
 # Boltz-2 Miner Integration
 
-## Current Status (as of 2026-08-08)
+## Current Status (as of 2026-08-09)
 
-**45 roadmap items implemented.** §HHHHHHHHHH added 2026-08-06.
-3 new optimisations planned (§IIIIIIIIII, §JJJJJJJJJJ, §KKKKKKKKKK) — see below.
+**46 roadmap items implemented.** §IIIIIIIIII added 2026-08-09.
+2 new optimisations planned (§JJJJJJJJJJ, §KKKKKKKKKK) — see below.
 
 ---
 
 ## Planned Optimisations
-
-### §IIIIIIIIII — PSICHIC Ligand Efficiency as Surrogate Training Feature
-
-**Problem:** The dual RF surrogate (§AAAAAA / §HHHHHHHHHH) trains on Boltz-2 scores using
-84D molecular descriptors + 32D PCA Boltz embeddings as features.  These encode the ligand's
-*topology* and *protein-interaction geometry* but not the PSICHIC binding signal.  PSICHIC
-captures protein-ligand complementarity from a different model family — its prediction is
-partially independent of Morgan FP and partially independent of Boltz-2 embeddings.  The
-residual prediction error of the surrogate (Boltz_LE − predicted) often correlates with the
-PSICHIC LE score for that molecule, meaning PSICHIC could reduce surrogate error if included
-as feature 118 in the embedding tier (or feature 85 in the descriptor-only tier).
-
-**Fix — three-part change:**
-
-1. **`neurons/miner.py` — Schema migration:** Add `psichic_le REAL` column to `boltz_cache`
-   via the existing ALTER TABLE migration list in `_init_boltz_cache_db`.  NULL for legacy rows.
-   *(This data-collection step is already committed — see schema migration below.)*
-
-2. **`neurons/miner.py` — Cache write:** At each `_disk_cache_put()` call site inside
-   `run_boltz_prescoring`, look up the molecule's `combined_score` (= PSICHIC LE) from the
-   `candidates` / `all_scores` context and pass it as `psichic_le=...`.  For §MM SALSA-
-   discovered molecules that are not in `candidates`, store NULL (neutral under StandardScaler).
-
-3. **`utils/surrogate.py` — Training and ranking:**
-   - `fit_dual_surrogate_with_embeddings`: query `COALESCE(psichic_le, 0.0)` from cache;
-     append as one extra feature after the 84D descriptor vector and before the 32D PCA
-     embedding block → total 117D feature vector.
-   - `dual_surrogate_ucb_rank_pool_emb`: add `psichic_le_col: str = 'combined_score'`
-     parameter; extract psichic_le from `pool_df[psichic_le_col].fillna(0.0)` and append
-     to each candidate's feature vector before prediction.
-   - Mirror the same change in `fit_dual_surrogate` and `dual_surrogate_ucb_rank_pool`
-     (85D instead of 84D for the non-embedding tier).
-
-**Backward compatibility:** Models are always retrained from scratch each Boltz prescoring
-call — there is no persistent model file.  The feature-dimension increase is invisible to
-callers; only training and ranking code need updating.  Old cache rows with NULL psichic_le
-get 0.0 (neutral) and contribute the same signal as before.  All surrogate failures fall
-back silently to PSICHIC ordering (existing pattern), so zero regression risk.
-
-**Expected benefit:** +3–8% NDCG improvement in surrogate quality from epoch 2+.  Especially
-impactful on week-1 new targets where embeddings are sparse but PSICHIC scores exist for
-every molecule in the training set.  Stacks with §HHHHHHHHHH (PCA embeddings) and §FFFFFFFFFF
-(confidence weighting).
-
-**Files to change:** `neurons/miner.py` (~40 lines), `utils/surrogate.py` (~35 lines).
-
-**Schema data-collection step: already applied (2026-08-08).**
-
----
 
 ### §JJJJJJJJJJ — Mid-Epoch Exploratory Boltz Probe (Cold-Start Surrogate Seed)
 
@@ -171,6 +122,42 @@ config key `embedding_diversity_gamma: 0.05` in `config/config.yaml`.
 ---
 
 ## Implemented Optimisations
+
+**§IIIIIIIIII — PSICHIC Ligand Efficiency as Surrogate Training Feature (`neurons/miner.py`, `utils/surrogate.py`) — added 2026-08-09**
+
+**Problem:** The dual RF surrogate (§AAAAAA / §HHHHHHHHHH) trained on Boltz-2 scores using
+84D molecular descriptors + 32D PCA Boltz embeddings as features — encoding the ligand's
+topology and protein-interaction geometry but not the PSICHIC binding signal.  PSICHIC
+captures protein-ligand complementarity from a different model family; its residual
+correlation with surrogate error was an untapped signal source.
+
+**Implementation (three parts):**
+
+1. **`neurons/miner.py` — Schema migration:** `psichic_le REAL` column added to `boltz_cache`
+   via `_init_boltz_cache_db` ALTER TABLE migrations (applied 2026-08-08).
+
+2. **`neurons/miner.py` — Cache write:** `_psichic_le_map` built at the start of
+   `run_boltz_prescoring` from `global_candidate_pool` / `candidate_molecules`
+   (`combined_score` = PSICHIC LE).  All five `_disk_cache_put()` call sites updated:
+   main prescoring, §FF, §MM (with fallback to row `combined_score`), §XX, and §TTTTTT
+   (latter two store NULL — tautomers have no PSICHIC score).
+
+3. **`utils/surrogate.py` — Training and ranking:** `fit_dual_surrogate` and
+   `fit_dual_surrogate_with_embeddings` query `COALESCE(psichic_le, 0.0)` from cache;
+   psichic_le is appended as feature 85 (after the 84D descriptor block, before 32D PCA) →
+   total 85D (non-embedding tier) or 117D (embedding tier).  `dual_surrogate_rank_pool`,
+   `dual_surrogate_ucb_rank_pool`, `dual_surrogate_ucb_rank_pool_emb`, and
+   `augment_pool_with_surrogate_blend` all updated with `psichic_le_col: str = 'combined_score'`
+   parameter to supply the live pool value at ranking time.
+
+**Backward compatibility:** NULL psichic_le → COALESCE 0.0 → neutral impact, no regression.
+Models always retrained from scratch; no persistent model dimension to migrate.
+
+**Expected benefit:** +3–8% NDCG improvement in surrogate quality from epoch 2+, especially
+on week-1 cold-start targets where PSICHIC scores exist for every candidate but embeddings
+are sparse.
+
+---
 
 **§HHHHHHHHHH — Boltz-2 Embedding Surrogate (`boltz/wrapper.py`, `neurons/miner.py`, `utils/surrogate.py`)**
 

@@ -321,9 +321,11 @@ def fit_dual_surrogate(db_path: str, protein: str, min_points: int = 40):
                 # §XXXXXXXX: COALESCE boltz_ww_std to 0.0 (no inter-seed penalty for rows
                 # that §WW never re-scored or that pre-date §XXXXXXXX).
                 # §FFFFFFFFFF: COALESCE confidence_score to 1.0 for pre-§FFFFFFFFFF rows.
+                # §IIIIIIIIII: COALESCE psichic_le to 0.0 for legacy rows (neutral prior).
                 "SELECT smiles, affinity_prob_binary, affinity_pred_val, "
                 "COALESCE(ligand_iptm, 1.0), COALESCE(boltz_le_std, 0.0), "
-                "COALESCE(boltz_ww_std, 0.0), COALESCE(confidence_score, 1.0) "
+                "COALESCE(boltz_ww_std, 0.0), COALESCE(confidence_score, 1.0), "
+                "COALESCE(psichic_le, 0.0) "
                 "FROM boltz_cache "
                 "WHERE protein=? "
                 "  AND affinity_prob_binary IS NOT NULL "
@@ -342,11 +344,13 @@ def fit_dual_surrogate(db_path: str, protein: str, min_points: int = 40):
     # - high intra-run sample variance (boltz_le_std): further reduce
     # - high inter-seed variance (boltz_ww_std): further reduce
     # - low overall complex confidence (confidence_score): additional reduction
+    # §IIIIIIIIII: append psichic_le as feature 85 so the surrogate learns the
+    # PSICHIC→Boltz correction.  NULL rows get 0.0 (neutral; StandardScaler centres).
     X, y_apb, y_apv, weights = [], [], [], []
-    for smiles, apb, apv, lig_iptm, le_std, ww_std, conf_score in rows:
+    for smiles, apb, apv, lig_iptm, le_std, ww_std, conf_score, psichic_le in rows:
         vec = _descriptor_vector(smiles)
         if vec is not None:
-            X.append(vec)
+            X.append(vec + [float(psichic_le)])  # §IIIIIIIIII: 85D total
             y_apb.append(float(apb))
             y_apv.append(float(apv))
             w = max(0.1, float(lig_iptm)) * max(0.1, float(conf_score)) / (
@@ -382,6 +386,7 @@ def dual_surrogate_rank_pool(
     dual_model,
     smiles_col: str = 'product_smiles',
     ha_col: str = 'heavy_atoms',
+    psichic_le_col: str = 'combined_score',
 ):
     """
     §YYYYY: Re-rank pool_df using the dual APB+APV surrogate.
@@ -401,8 +406,16 @@ def dual_surrogate_rank_pool(
         if n_valid < max(1, len(pool_df) * 0.5):
             return pool_df
 
+        # §IIIIIIIIII: append psichic_le as feature 85 to match fit_dual_surrogate training.
         placeholder = [0.0] * _N_FEATURES
-        X = [v if v is not None else placeholder for v in vecs]
+        psichic_le_vals = (
+            pool_df[psichic_le_col].fillna(0.0).values.astype(float)
+            if psichic_le_col in pool_df.columns else np.zeros(len(pool_df))
+        )
+        X = [
+            (v if v is not None else placeholder) + [float(pl)]
+            for v, pl in zip(vecs, psichic_le_vals)
+        ]
 
         apb_preds = model_apb.predict(X)
         apv_preds = model_apv.predict(X)
@@ -438,6 +451,7 @@ def dual_surrogate_ucb_rank_pool(
     beta: float = 1.0,
     smiles_col: str = 'product_smiles',
     ha_col: str = 'heavy_atoms',
+    psichic_le_col: str = 'combined_score',
 ):
     """
     §AAAAAA: UCB acquisition on the dual APB+APV surrogate.
@@ -471,10 +485,10 @@ def dual_surrogate_ucb_rank_pool(
         _apb_rf = isinstance(model_apb.named_steps.get('model'), RandomForestRegressor)
         _apv_rf = isinstance(model_apv.named_steps.get('model'), RandomForestRegressor)
     except Exception:
-        return dual_surrogate_rank_pool(pool_df, dual_model, smiles_col, ha_col)
+        return dual_surrogate_rank_pool(pool_df, dual_model, smiles_col, ha_col, psichic_le_col)
 
     if not (_apb_rf and _apv_rf):
-        return dual_surrogate_rank_pool(pool_df, dual_model, smiles_col, ha_col)
+        return dual_surrogate_rank_pool(pool_df, dual_model, smiles_col, ha_col, psichic_le_col)
 
     try:
         vecs = [_descriptor_vector(s) for s in pool_df[smiles_col]]
@@ -482,8 +496,16 @@ def dual_surrogate_ucb_rank_pool(
         if n_valid < max(1, len(pool_df) * 0.5):
             return pool_df
 
+        # §IIIIIIIIII: append psichic_le as feature 85 to match fit_dual_surrogate training.
         placeholder = [0.0] * _N_FEATURES
-        X = [v if v is not None else placeholder for v in vecs]
+        psichic_le_vals = (
+            pool_df[psichic_le_col].fillna(0.0).values.astype(float)
+            if psichic_le_col in pool_df.columns else np.zeros(len(pool_df))
+        )
+        X = [
+            (v if v is not None else placeholder) + [float(pl)]
+            for v, pl in zip(vecs, psichic_le_vals)
+        ]
 
         mean_apb, std_apb = predict_with_uncertainty(model_apb, X)
         mean_apv, std_apv = predict_with_uncertainty(model_apv, X)
@@ -509,7 +531,7 @@ def dual_surrogate_ucb_rank_pool(
             .reset_index(drop=True)
         )
     except Exception:
-        return dual_surrogate_rank_pool(pool_df, dual_model, smiles_col, ha_col)
+        return dual_surrogate_rank_pool(pool_df, dual_model, smiles_col, ha_col, psichic_le_col)
 
 
 def augment_pool_with_surrogate_blend(
@@ -562,8 +584,16 @@ def augment_pool_with_surrogate_blend(
         if n_valid < max(1, len(pool_df) * 0.5):
             return pool_df
 
+        # §IIIIIIIIII: append psichic_le as feature 85 to match fit_dual_surrogate training.
         placeholder = [0.0] * _N_FEATURES
-        X = [v if v is not None else placeholder for v in vecs]
+        psichic_le_vals = (
+            pool_df[psichic_col].fillna(0.0).values.astype(float)
+            if psichic_col in pool_df.columns else np.zeros(len(pool_df))
+        )
+        X = [
+            (v if v is not None else placeholder) + [float(pl)]
+            for v, pl in zip(vecs, psichic_le_vals)
+        ]
 
         apb_preds = model_apb.predict(X)
         apv_preds = model_apv.predict(X)
@@ -689,9 +719,11 @@ def fit_dual_surrogate_with_embeddings(db_path: str, protein: str, min_points: i
     try:
         with sqlite3.connect(db_path) as conn:
             rows = conn.execute(
+                # §IIIIIIIIII: COALESCE psichic_le to 0.0 for legacy rows.
                 "SELECT smiles, affinity_prob_binary, affinity_pred_val, "
                 "COALESCE(ligand_iptm, 1.0), COALESCE(boltz_le_std, 0.0), "
-                "COALESCE(boltz_ww_std, 0.0), COALESCE(confidence_score, 1.0) "
+                "COALESCE(boltz_ww_std, 0.0), COALESCE(confidence_score, 1.0), "
+                "COALESCE(psichic_le, 0.0) "
                 "FROM boltz_cache "
                 "WHERE protein=? "
                 "  AND affinity_prob_binary IS NOT NULL "
@@ -704,12 +736,16 @@ def fit_dual_surrogate_with_embeddings(db_path: str, protein: str, min_points: i
     if len(rows) < min_points:
         return None
 
+    # §IIIIIIIIII: feature order is [84D desc] + [psichic_le] + [32D PCA] = 117D.
+    # psichic_le sits between descriptors and PCA so StandardScaler normalises it
+    # alongside the other continuous features before the PCA block.
     zeros_emb = [0.0] * _N_EMB_COMPONENTS
     X, y_apb, y_apv, weights = [], [], [], []
-    for smiles, apb, apv, lig_iptm, le_std, ww_std, conf_score in rows:
+    for smiles, apb, apv, lig_iptm, le_std, ww_std, conf_score, psichic_le in rows:
         vec = _descriptor_vector(smiles)
         if vec is None:
             continue
+        vec = vec + [float(psichic_le)]  # §IIIIIIIIII: 85D descriptor+psichic block
         if has_emb:
             emb_feat = emb_dict.get(smiles)
             vec = vec + (list(emb_feat) if emb_feat is not None else zeros_emb)
@@ -750,6 +786,7 @@ def dual_surrogate_ucb_rank_pool_emb(
     beta: float = 1.0,
     smiles_col: str = 'product_smiles',
     ha_col: str = 'heavy_atoms',
+    psichic_le_col: str = 'combined_score',
 ):
     """§HHHHHHHHHH: UCB ranking using the embedding-augmented dual surrogate.
 
@@ -778,17 +815,24 @@ def dual_surrogate_ucb_rank_pool_emb(
         if n_valid < max(1, len(pool_df) * 0.5):
             return pool_df
 
+        # §IIIIIIIIII: feature order [84D] + [psichic_le] + [32D PCA] = 117D.
         zeros_desc = [0.0] * _N_FEATURES
         zeros_emb = [0.0] * _N_EMB_COMPONENTS
+        psichic_le_vals = (
+            pool_df[psichic_le_col].fillna(0.0).values.astype(float)
+            if psichic_le_col in pool_df.columns else np.zeros(len(pool_df))
+        )
         if has_emb:
             X = [
-                (d if d is not None else zeros_desc) +
-                (list(emb_dict.get(s, np.zeros(_N_EMB_COMPONENTS, dtype=np.float32)))
-                 if has_emb else zeros_emb)
-                for d, s in zip(desc_vecs, smiles_list)
+                (d if d is not None else zeros_desc) + [float(pl)] +
+                list(emb_dict.get(s, np.zeros(_N_EMB_COMPONENTS, dtype=np.float32)))
+                for d, s, pl in zip(desc_vecs, smiles_list, psichic_le_vals)
             ]
         else:
-            X = [d if d is not None else zeros_desc for d in desc_vecs]
+            X = [
+                (d if d is not None else zeros_desc) + [float(pl)]
+                for d, pl in zip(desc_vecs, psichic_le_vals)
+            ]
 
         if ha_col in pool_df.columns:
             ha_vals = pool_df[ha_col].fillna(25).values.astype(float)

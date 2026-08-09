@@ -153,6 +153,7 @@ def _disk_cache_put(
     boltz_le_std: Optional[float] = None,
     confidence_score: Optional[float] = None,
     boltz_embedding: Optional[bytes] = None,
+    psichic_le: Optional[float] = None,
 ) -> None:
     """Upsert a Boltz score into the persistent cache (silently ignores errors).
 
@@ -167,6 +168,8 @@ def _disk_cache_put(
     §FFFFFFFFFF: confidence_score is the overall complex confidence (Boltz-2 combined
     pLDDT-like metric).  Low confidence_score → additional surrogate down-weight
     complementary to ligand_iptm (which measures global structural alignment).
+    §IIIIIIIIII: psichic_le is the PSICHIC ligand-efficiency score at Boltz call time.
+    Stored as surrogate training feature so the RF model learns PSICHIC→Boltz correction.
     """
     try:
         with sqlite3.connect(db_path) as conn:
@@ -174,10 +177,10 @@ def _disk_cache_put(
                 "INSERT OR REPLACE INTO boltz_cache "
                 "(smiles, protein, score, product_name, affinity_prob_binary, "
                 "affinity_pred_val, ligand_iptm, boltz_le_std, confidence_score, "
-                "boltz_embedding) "
-                "VALUES (?,?,?,?,?,?,?,?,?,?)",
+                "boltz_embedding, psichic_le) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
                 (smiles, protein, score, product_name, apb, apv, ligand_iptm,
-                 boltz_le_std, confidence_score, boltz_embedding),
+                 boltz_le_std, confidence_score, boltz_embedding, psichic_le),
             )
     except Exception:
         pass
@@ -1643,6 +1646,19 @@ async def run_boltz_prescoring(state: Dict[str, Any], max_candidates: int = 5) -
     boltz_cache: Dict[Tuple[str, str], float] = state.setdefault('boltz_score_cache', {})
     db_path: str = state.get('boltz_cache_db', BOLTZ_CACHE_DB)
 
+    # §IIIIIIIIII: Build PSICHIC LE map before candidates are resolved.
+    # global_candidate_pool / candidate_molecules have combined_score = PSICHIC LE.
+    # The disk-cache fallback sets combined_score = Boltz score — those get None.
+    _psichic_le_map: Dict[str, float] = {}
+    for _pl_src in (state.get('global_candidate_pool'), state.get('candidate_molecules')):
+        if _pl_src is not None and not _pl_src.empty and 'combined_score' in _pl_src.columns:
+            for _, _pl_row in _pl_src.iterrows():
+                _pl_sm = str(_pl_row.get('product_smiles', ''))
+                _pl_val = _pl_row.get('combined_score')
+                if _pl_sm and isinstance(_pl_val, (int, float)) and math.isfinite(float(_pl_val)):
+                    _psichic_le_map[get_canonical_smiles(_pl_sm)] = float(_pl_val)
+            break  # prefer global_candidate_pool when available
+
     # Prefer global candidate pool (spans entire epoch, sorted by ligand efficiency)
     # so Boltz always evaluates the best molecules seen so far, not just those from
     # the most recent best-batch.  Fall back to current-batch candidates if needed.
@@ -1948,6 +1964,7 @@ async def run_boltz_prescoring(state: Dict[str, Any], max_candidates: int = 5) -
                         boltz_le_std=_wwwwwww_le_std,
                         confidence_score=_fffff_cs if isinstance(_fffff_cs, (int, float)) else None,
                         boltz_embedding=_emb_to_bytes(_comps),
+                        psichic_le=_psichic_le_map.get(canon),  # §IIIIIIIIII
                     )
 
                     # Adaptive trigger: one molecule gives the most accurate per-mol timing
@@ -2151,6 +2168,12 @@ async def run_boltz_prescoring(state: Dict[str, Any], max_candidates: int = 5) -
                                     _ff_apv = _ff_comps.get('affinity_pred_value')
                                     _ff_li = _ff_comps.get('ligand_iptm')
                                     _ff_cs = _ff_comps.get('confidence_score')
+                                    # §IIIIIIIIII: prefer map (PSICHIC candidates), fall back to row (SAVI pool).
+                                    _ff_ple = _psichic_le_map.get(_ff_w_canon)
+                                    if _ff_ple is None:
+                                        _ff_raw = _ff_w_row.get('combined_score')
+                                        if isinstance(_ff_raw, (int, float)) and math.isfinite(float(_ff_raw)):
+                                            _ff_ple = float(_ff_raw)
                                     _disk_cache_put(
                                         db_path, _ff_w_canon, protein, _ff_score,
                                         product_name=_ff_w_row.get('product_name'),
@@ -2160,6 +2183,7 @@ async def run_boltz_prescoring(state: Dict[str, Any], max_candidates: int = 5) -
                                         boltz_le_std=_compute_le_std(_ff_comps),
                                         confidence_score=_ff_cs if isinstance(_ff_cs, (int, float)) else None,
                                         boltz_embedding=_emb_to_bytes(_ff_comps),
+                                        psichic_le=_ff_ple,  # §IIIIIIIIII
                                     )
                                     bt.logging.info(
                                         f"§FF §NN full-scored winner: {_ff_w_row.get('product_name', '?')} "
@@ -2429,6 +2453,12 @@ async def run_boltz_prescoring(state: Dict[str, Any], max_candidates: int = 5) -
                             _mm_apv = _mm_comps.get('affinity_pred_value')
                             _mm_li = _mm_comps.get('ligand_iptm')
                             _mm_cs = _mm_comps.get('confidence_score')
+                            # §IIIIIIIIII: prefer map (PSICHIC candidates), fall back to row (SAVI pool).
+                            _mm_ple = _psichic_le_map.get(_mm_w_canon)
+                            if _mm_ple is None:
+                                _mm_raw = _mm_w_row.get('combined_score')
+                                if isinstance(_mm_raw, (int, float)) and math.isfinite(float(_mm_raw)):
+                                    _mm_ple = float(_mm_raw)
                             _disk_cache_put(
                                 db_path, _mm_w_canon, protein, _mm_score,
                                 product_name=_mm_w_row.get('product_name'),
@@ -2438,6 +2468,7 @@ async def run_boltz_prescoring(state: Dict[str, Any], max_candidates: int = 5) -
                                 boltz_le_std=_compute_le_std(_mm_comps),
                                 confidence_score=_mm_cs if isinstance(_mm_cs, (int, float)) else None,
                                 boltz_embedding=_emb_to_bytes(_mm_comps),
+                                psichic_le=_mm_ple,  # §IIIIIIIIII
                             )
                             if wrapper.last_inference_duration > 0:
                                 state['boltz_time_per_mol'] = wrapper.last_inference_duration
@@ -2817,6 +2848,7 @@ async def run_boltz_prescoring(state: Dict[str, Any], max_candidates: int = 5) -
                                                     _xx_cs, (int, float)
                                                 ) else None,
                                                 boltz_embedding=_emb_to_bytes(_xx_comps),
+                                                psichic_le=None,  # §IIIIIIIIII: tautomer
                                             )
                                             if wrapper.last_inference_duration > 0:
                                                 state['boltz_time_per_mol'] = (
@@ -3083,6 +3115,7 @@ async def run_boltz_prescoring(state: Dict[str, Any], max_candidates: int = 5) -
                                         _tt_cs, (int, float)
                                     ) else None,
                                     boltz_embedding=_emb_to_bytes(_tt_comps),
+                                    psichic_le=None,  # §IIIIIIIIII: tautomer
                                 )
                                 if wrapper.last_inference_duration > 0:
                                     state['boltz_time_per_mol'] = (
