@@ -37,6 +37,12 @@ molecule_validation:
   combination_strategy: "heavy_atom_normalization" # "heavy_atom_normalization" or "average"
   boltz_mode: "max" # "max" or "min"
   sample_selection: "first" # "random" or "first"
+  # §KKKKKKKKKK: embedding centroid diversity bonus weight for candidate UCB ranking.
+  # When > 0 and ≥2 Boltz embeddings are cached, scored molecules' PCA embedding
+  # centroid is computed and candidates far from it in cosine space get a bonus.
+  # Steers evaluation toward unexplored binding-pose modes on converged runs (epoch 4+).
+  # Set to 0.0 to disable. Recommended: 0.05 (5% of typical UCB spread).
+  embedding_diversity_gamma: 0.05
 
 # Reaction filtering configuration
 reaction_filtering:

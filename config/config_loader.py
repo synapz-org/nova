@@ -38,6 +38,7 @@ def load_config(path: str = "config/config.yaml"):
     combination_strategy = validation_config["combination_strategy"]
     boltz_mode = validation_config["boltz_mode"]
     sample_selection = validation_config["sample_selection"]
+    embedding_diversity_gamma = validation_config.get("embedding_diversity_gamma", 0.0)
 
     # Load protein constraints
     protein_constraints = config["protein_constraints"]
@@ -76,5 +77,6 @@ def load_config(path: str = "config/config.yaml"):
         'max_distance': max_distance,
         'force': force,
         'boltz_weight': boltz_weight,
-        'sample_selection': sample_selection
+        'sample_selection': sample_selection,
+        'embedding_diversity_gamma': embedding_diversity_gamma,
     }

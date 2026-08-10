@@ -358,7 +358,7 @@ Even a partial result (1 of 5 molecules scored) improves on the PSICHIC-only bas
 
 ## Implementation Roadmap (priority order)
 
-Items 1–45 are **implemented** (§HHHHHHHHHH added 2026-08-06). Items 5 and 7 remain as conditional/research directions.
+Items 1–48 are **implemented** (§KKKKKKKKKK added 2026-08-10). Items 5 and 7 remain as conditional/research directions.
 
 | Priority | Approach | Effort | Status | Expected gain |
 |----------|----------|--------|--------|---------------|
@@ -407,9 +407,9 @@ Items 1–45 are **implemented** (§HHHHHHHHHH added 2026-08-06). Items 5 and 7 
 | 43 | §FFFFFFFFFF: Persist Boltz-2 `confidence_score` (overall complex structural confidence, 0–1) to SQLite cache and GitHub export; extend dual RF surrogate weight to `lig_iptm * conf_score / ((1+10*le_std)*(1+10*ww_std))` so structurally uncertain molecules are down-weighted in surrogate training | ~50 lines | ✅ Done | ~1–3% NDCG improvement on structurally mixed cache; reduces false-positive UCB candidates when training set contains noisier low-confidence Boltz runs |
 | 44 | §GGGGGGGGGG: Fast-mode structure recycling 3→1 + disable FK potentials — two Boltz-2 call parameters never previously adapted for fast mode; saves 30–40% fast-call wall time on A100/H100 | ~15 lines | ✅ Done | +1–4 §MM rounds/epoch on A100/H100; equivalent to 2–6% higher expected Boltz LE per epoch |
 | 45 | §HHHHHHHHHH: Boltz-2 embedding surrogate — use `write_embeddings=True` to extract 384D ligand embeddings from Boltz-2, PCA-reduce to 32D, concatenate with Morgan FP+physchem descriptor for protein-conditioned surrogate features | ~200 lines | ✅ Done | +3–8% surrogate NDCG on epoch 3+ (estimated); especially impactful on week-1 new targets with few cache points |
-| 46 | §IIIIIIIIII: PSICHIC LE as surrogate training feature — store PSICHIC `combined_score` at Boltz call time; use as feature 85 (or 118 with embeddings) in surrogate training to learn PSICHIC→Boltz correction | ~75 lines | 🔜 Planned | +3–8% NDCG; especially impacts week-1 runs where embeddings are sparse but PSICHIC scores are universal |
-| 47 | §JJJJJJJJJJ: Mid-epoch exploratory Boltz probe — fire one ultra-fast Boltz call (≈15 s) when pool ≥1000 molecules and cache is empty; seeds surrogate 20–40 min earlier on cold-start epoch 1 | ~40 lines | 🔜 Planned | +3–6% Boltz LE on epoch 1 of new weekly target with no GitHub cache |
-| 48 | §KKKKKKKKKK: Boltz-2 embedding centroid diversity bonus — add cosine-distance bonus (γ=0.05) from centroid of scored molecules' PCA embeddings to UCB score; diversifies candidate selection in binding-pose space beyond Morgan FP Tanimoto | ~30 lines | 🔜 Planned | +2–5% novel scaffold winner probability per epoch on week-4+ converged runs |
+| 46 | §IIIIIIIIII: PSICHIC LE as surrogate training feature — store PSICHIC `combined_score` at Boltz call time; use as feature 85 (or 118 with embeddings) in surrogate training to learn PSICHIC→Boltz correction | ~75 lines | ✅ Done | +3–8% NDCG; especially impacts week-1 runs where embeddings are sparse but PSICHIC scores are universal |
+| 47 | §JJJJJJJJJJ: Mid-epoch exploratory Boltz probe — fire one ultra-fast Boltz call (≈15–50 s, fast=True) when pool ≥1000 molecules and cache is empty; seeds surrogate 20–40 min earlier on cold-start epoch 1 | ~65 lines | ✅ Done | +3–6% Boltz LE on epoch 1 of new weekly target with no GitHub cache |
+| 48 | §KKKKKKKKKK: Boltz-2 embedding centroid diversity bonus — add cosine-distance bonus (γ=0.05) from centroid of scored molecules' PCA embeddings to UCB score; diversifies candidate selection in binding-pose space beyond Morgan FP Tanimoto | ~30 lines | ✅ Done | +2–5% novel scaffold winner probability per epoch on week-4+ converged runs |
 
 All approaches share the same submission constraint: molecules must map to valid SAVI-2020
 product names. SALSA and GradientGA both solve this via nearest-neighbour SAVI-2020 lookup.

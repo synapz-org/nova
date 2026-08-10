@@ -784,6 +784,7 @@ def dual_surrogate_ucb_rank_pool_emb(
     pool_df,
     emb_result,
     beta: float = 1.0,
+    gamma: float = 0.0,
     smiles_col: str = 'product_smiles',
     ha_col: str = 'heavy_atoms',
     psichic_le_col: str = 'combined_score',
@@ -794,6 +795,10 @@ def dual_surrogate_ucb_rank_pool_emb(
     fit_dual_surrogate_with_embeddings().  Pool molecules not in emb_dict get
     zero-padded PCA components (neutral prior).  Falls back to plain mean ranking
     when RF variance is unavailable (Ridge tier or error).
+
+    §KKKKKKKKKK: When gamma > 0 and embeddings are available, a cosine-distance
+    bonus from the centroid of already-scored molecules is added to the UCB score,
+    rewarding candidates that occupy unexplored binding-pose space.
     """
     if emb_result is None:
         return pool_df
@@ -849,6 +854,36 @@ def dual_surrogate_ucb_rank_pool_emb(
             apb_preds = model_apb.predict(X)
             apv_preds = model_apv.predict(X)
             scores = (apb_preds - apv_preds) / ha_vals
+
+        # §KKKKKKKKKK: embedding centroid diversity bonus.
+        # When gamma > 0 and the cache has scored molecules with stored embeddings,
+        # compute the centroid of their PCA vectors and reward pool candidates whose
+        # embedding is far (in cosine distance) from that centroid.  This steers the
+        # next Boltz evaluation round toward unexplored protein–ligand interaction modes
+        # beyond the scaffold family that hill-climbing has already converged to.
+        # Only activates when ≥2 distinct scored embeddings exist; otherwise the
+        # centroid is undefined and the bonus is silently skipped.
+        if has_emb and emb_dict and gamma > 0.0:
+            try:
+                scored_embs = np.array(
+                    [list(v) for v in emb_dict.values()], dtype=np.float32
+                )
+                if scored_embs.shape[0] >= 2:
+                    centroid = scored_embs.mean(axis=0)
+                    centroid_norm = float(np.linalg.norm(centroid))
+                    if centroid_norm > 1e-9:
+                        for i, s in enumerate(smiles_list):
+                            mol_emb = emb_dict.get(s)
+                            if mol_emb is not None:
+                                mol_norm = float(np.linalg.norm(mol_emb))
+                                if mol_norm > 1e-9:
+                                    cos_sim = float(
+                                        np.dot(mol_emb, centroid)
+                                        / (mol_norm * centroid_norm)
+                                    )
+                                    scores[i] += gamma * (1.0 - cos_sim)
+            except Exception:
+                pass
 
         pool_copy = pool_df.copy()
         pool_copy['surrogate_score'] = scores

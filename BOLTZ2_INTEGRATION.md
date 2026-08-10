@@ -1,15 +1,14 @@
 # Boltz-2 Miner Integration
 
-## Current Status (as of 2026-08-09)
+## Current Status (as of 2026-08-10)
 
-**46 roadmap items implemented.** §IIIIIIIIII added 2026-08-09.
-2 new optimisations planned (§JJJJJJJJJJ, §KKKKKKKKKK) — see below.
+**48 roadmap items implemented.** §JJJJJJJJJJ and §KKKKKKKKKK added 2026-08-10.
 
 ---
 
-## Planned Optimisations
+## Implemented Optimisations (recent)
 
-### §JJJJJJJJJJ — Mid-Epoch Exploratory Boltz Probe (Cold-Start Surrogate Seed)
+### §JJJJJJJJJJ — Mid-Epoch Exploratory Boltz Probe (Cold-Start Surrogate Seed) — added 2026-08-10
 
 **Problem:** On epoch 1 of a new weekly target, the disk cache is empty and no GitHub export
 exists.  The §YYYYYY startup surrogate cannot activate (<40 cache points), §HHHHHHHHHH
@@ -17,107 +16,70 @@ embeddings are unavailable, and all surrogate-based SALSA improvements are dorma
 runs PSICHIC-only ranking for the entire pre-trigger window (~50 min) before Boltz fires at
 epoch end.  This is the weakest epoch precisely when the target is newest.
 
-**Fix:** After `savi_stream_pool` reaches ≥ 1000 molecules AND no Boltz cache data exists for
-the current protein (cold-start detection), fire ONE fast Boltz call on the top PSICHIC
-candidate.  Use the `fast=True` path with an even more aggressive configuration:
-`sampling_steps_affinity=25, diffusion_samples_affinity=1, recycling_steps_affinity=1,
-recycling_steps=1` (≈ 15–20 s on A100, ≈ 8–12 s on H100).
+**Implementation:** `_run_jj_probe()` async function added to `neurons/miner.py` (~65 lines).
+Fires as a background `asyncio.create_task` when:
 
-```python
-# §JJJJJJJJJJ: Mid-epoch cold-start probe — fires once per epoch when cache is empty.
-_jj_protein = state['config'].weekly_target
-_jj_probe_done = state.get('jj_probe_done', False)
-_jj_cache_empty = not bool(_disk_cache_get_candidates(db_path, _jj_protein, limit=1))
-if (
-    not _jj_probe_done
-    and _jj_cache_empty
-    and len(state.get('savi_stream_pool', [])) >= 1000
-    and blocks_until_epoch > boltz_trigger + 50   # stay well clear of normal trigger
-):
-    _jj_candidate = state['global_candidate_pool'].iloc[0]['product_smiles']
-    # Run a 1-molecule ultra-fast Boltz call in background thread (non-blocking)
-    asyncio.create_task(_run_jj_probe(state, _jj_candidate))
-    state['jj_probe_done'] = True   # fire only once per epoch
-```
+- `savi_stream_pool ≥ 1000` molecules (enough for a reliable top PSICHIC candidate)
+- disk cache is empty (`_disk_cache_get_candidates` returns nothing for the current protein)
+- `blocks_until_epoch > boltz_trigger + 50` (well clear of normal trigger window)
+- `boltz_prescored == False` (normal Boltz scoring hasn't started)
+- `jj_probe_done == False` (one-shot per epoch)
 
-The probe result is written to the disk cache immediately.  On the next PSICHIC chunk, the
-cache reaches 1 entry and the startup surrogate activates (§YYYYYY with min_points=1 override
-for this fast path).  SALSA subsequently uses a surrogate-blended pool from that point.
+Uses `fast=True` mode (50 affinity steps, 1 diffusion sample, 1-2 recycling passes) for ≈15–50 s
+wall time.  Writes result to SQLite cache with `product_name`, `apb`, `apv`, `ligand_iptm`,
+`confidence_score`, and `psichic_le`.  After the probe, the cache has ≥1 entry and the
+§YYYYYY startup surrogate can activate on subsequent chunks.
 
-**Reset:** `jj_probe_done` is cleared in the epoch-boundary reset block alongside other
-per-epoch flags.
+`jj_probe_done` is cleared in the epoch reset block alongside `salsa_run_this_epoch` etc.
 
-**Guard:** If Boltz is already running (§FF/§MM active), skip probe.  If probe fails (any
-exception), log and continue — zero regression.
-
-**Expected benefit:** On cold-start epoch 1 (no GitHub cache, new protein), enables surrogate-
-guided SALSA seeding 20–40 min earlier than the normal trigger.  This is the scenario where
-the surrogate benefit is largest (unknown chemistry → high exploration value).  Estimated
-+3–6% Boltz LE on epoch 1 of a new weekly target rotation.
-
-**Cost:** 15–20 s of GPU time, fired once mid-epoch when no other GPU work is running.
-Effectively free on A100/H100 which otherwise idles until the trigger window.
-
-**Files to change:** `neurons/miner.py` (~40 lines).
+**Files changed:** `neurons/miner.py` (~65 lines: `_run_jj_probe` function + trigger block + state init + epoch reset).
 
 ---
 
-### §KKKKKKKKKK — Boltz-2 Embedding Centroid Diversity Bonus for Candidate Selection
+### §KKKKKKKKKK — Boltz-2 Embedding Centroid Diversity Bonus for Candidate Selection — added 2026-08-10
 
-**Problem:** Current candidate diversity strategies are:
-- §SSSSSS: max-min Tanimoto (Morgan FP 2048-bit) for disk-cache seeds before SALSA
-- Scaffold diversity filter (`_scaffold_diverse_candidates`) on the top-5 pool candidates
+**Problem:** Prior candidate diversity strategies (§SSSSSS max-min Tanimoto, scaffold filter)
+operate in Morgan FP / scaffold space.  Molecules that are Tanimoto-diverse may still occupy
+the same protein–ligand interaction *mode*.  The Boltz-2 embedding (§HHHHHHHHHH, 384D
+mean-pooled evoformer representation, PCA-reduced to 32D) encodes protein-conditioned binding
+geometry — molecules close in embedding space likely adopt similar binding poses even if their
+Morgan FP differs.
 
-These both operate in the Morgan FP / scaffold space.  Molecules that are Tanimoto-diverse
-may still occupy the same protein–ligand interaction *mode* (e.g., two different scaffolds
-that both bind the same pocket sub-region with similar H-bond donors).  The Boltz-2 embedding
-(§HHHHHHHHHH, 384D mean-pooled evoformer representation, PCA-reduced to 32D) encodes protein-
-conditioned binding geometry — molecules close in embedding space likely adopt similar binding
-poses even if their Morgan FP is different.
-
-**Fix:** When ≥20 Boltz embeddings are stored in the cache (§HHHHHHHHHH tier is active),
-compute the *centroid* of scored molecules' PCA embeddings and add an embedding-distance
-*diversity bonus* to the surrogate candidate score:
-
-```
-embedding_diversity_bonus(mol) = cosine_distance(emb(mol), centroid) × γ
-```
-
-For unscored candidates (no stored embedding), `emb(mol) = zeros_32D` → bonus = 0 (neutral).
-
-The combined ranking score becomes:
-```
-candidate_score = surrogate_UCB(mol) + γ × embedding_diversity_bonus(mol)
-```
-
-`γ` is a tunable weight, defaulting to 0.05 (5% bonus from diversity relative to a typical
-UCB spread of 0.01–0.05).  After §MM hill-climbing converges, the embedding-space centroid
-of scored molecules is tightly clustered around the best-known scaffold family.  The diversity
-bonus steers the NEXT §MM basin-hop away from that cluster toward unexplored interaction modes.
-
-**Implementation:** In `dual_surrogate_ucb_rank_pool_emb`, after computing `ucb_scores`:
+**Implementation:** `dual_surrogate_ucb_rank_pool_emb` in `utils/surrogate.py` now accepts a
+`gamma: float = 0.0` parameter.  When `gamma > 0` and ≥2 Boltz embeddings are present in
+`emb_dict`, the function computes the centroid of all scored molecules' PCA embeddings and
+adds a cosine-distance diversity bonus to each candidate's UCB score:
 
 ```python
 if has_emb and emb_dict and gamma > 0.0:
-    scored_embs = np.array([list(v) for v in emb_dict.values()])  # (N_scored, 32)
-    centroid = scored_embs.mean(axis=0)
-    for i, s in enumerate(smiles_list):
-        mol_emb = emb_dict.get(s)
-        if mol_emb is not None:
-            dist = 1.0 - float(np.dot(mol_emb, centroid) /
-                               (np.linalg.norm(mol_emb) * np.linalg.norm(centroid) + 1e-9))
-            ucb_scores[i] += gamma * dist
+    scored_embs = np.array([list(v) for v in emb_dict.values()], dtype=np.float32)
+    if scored_embs.shape[0] >= 2:
+        centroid = scored_embs.mean(axis=0)
+        centroid_norm = float(np.linalg.norm(centroid))
+        if centroid_norm > 1e-9:
+            for i, s in enumerate(smiles_list):
+                mol_emb = emb_dict.get(s)
+                if mol_emb is not None:
+                    mol_norm = float(np.linalg.norm(mol_emb))
+                    if mol_norm > 1e-9:
+                        cos_sim = float(np.dot(mol_emb, centroid) / (mol_norm * centroid_norm))
+                        scores[i] += gamma * (1.0 - cos_sim)
 ```
 
-**Expected benefit:** +2–5% probability of finding a novel scaffold winner per epoch on
-converged runs (epoch 4+) where §MM has already exhausted the primary scaffold family.
-Complementary to §SSSSSS (which adds Tanimoto diversity at seed-selection time, not at
-surrogate-ranking time).  Adds embedding-mode diversity on top of structural diversity.
+In `neurons/miner.py`, `gamma` is read from `state['config'].embedding_diversity_gamma` and
+passed to `dual_surrogate_ucb_rank_pool_emb` at each pre-Boltz re-ranking call.  Logging
+emits `+diversity(γ=0.05)` tag when active.
 
-**Zero regression risk:** `gamma=0.0` (default) disables the bonus.  Explicit opt-in via
-config key `embedding_diversity_gamma: 0.05` in `config/config.yaml`.
+`embedding_diversity_gamma: 0.05` added to `config/config.yaml` (with inline comment) and
+loaded via `.get("embedding_diversity_gamma", 0.0)` in `config/config_loader.py`.
 
-**Files to change:** `utils/surrogate.py` (~30 lines), `config/config.yaml` (1 line).
+**Zero regression risk:** `gamma=0.0` (the default before config load) disables the bonus
+entirely — no code path changes for existing installs until the config key is present.
+Guard on `scored_embs.shape[0] >= 2` prevents division-by-zero on single-entry caches.
+
+**Files changed:** `utils/surrogate.py` (gamma param + centroid diversity block),
+`config/config.yaml` (1 line + comment block), `config/config_loader.py` (1 load + 1 return),
+`neurons/miner.py` (gamma read + pass-through + log tag).
 
 ---
 

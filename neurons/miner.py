@@ -1323,6 +1323,38 @@ async def run_psichic_model_loop(state: Dict[str, Any]) -> None:
                         except Exception as _bbb_err:
                             bt.logging.error(f"§BBB post-GA SALSA error: {_bbb_err}")
 
+                    # §JJJJJJJJJJ: Mid-epoch cold-start surrogate probe.
+                    # Fires once per epoch when:
+                    #   - cache is empty (cold-start: no GitHub export, new protein)
+                    #   - pool ≥ 1000 molecules (enough to have a reliable top candidate)
+                    #   - we are well clear of the normal Boltz trigger (>50 extra blocks)
+                    #   - Boltz pre-scoring has not yet started (boltz_prescored=False)
+                    # Runs _run_jj_probe as a background asyncio task (~15-50 s GPU)
+                    # so the PSICHIC loop is never blocked. The probe writes one cache
+                    # entry, enabling §YYYYYY startup surrogate 20-40 min earlier.
+                    _jj_db = state.get('boltz_cache_db', BOLTZ_CACHE_DB)
+                    _jj_protein = state['config'].weekly_target
+                    _jj_pool = state.get('savi_stream_pool')
+                    _jj_pool_size = 0 if _jj_pool is None else len(_jj_pool)
+                    _jj_boltz_trigger = state.get('boltz_trigger_blocks', 100)
+                    if (
+                        not state.get('jj_probe_done', False)
+                        and not state.get('boltz_prescored', False)
+                        and _jj_pool_size >= 1000
+                        and state.get('global_candidate_pool') is not None
+                        and not state['global_candidate_pool'].empty
+                        and blocks_until_epoch > _jj_boltz_trigger + 50
+                        and not bool(_disk_cache_get_candidates(_jj_db, _jj_protein, limit=1))
+                    ):
+                        state['jj_probe_done'] = True
+                        _jj_smiles = state['global_candidate_pool'].iloc[0]['product_smiles']
+                        bt.logging.info(
+                            f"[§JJJJJJJJJJ] Cold-start probe triggered: "
+                            f"pool={_jj_pool_size}, {blocks_until_epoch} blocks remaining, "
+                            f"candidate={_jj_smiles[:60]}..."
+                        )
+                        asyncio.create_task(_run_jj_probe(state, _jj_smiles))
+
                     # Trigger Boltz-2 pre-scoring when approaching epoch end.
                     # Threshold starts at 100 blocks (20 min); after the first run it is
                     # updated adaptively based on measured GPU time so fast hardware
@@ -1619,6 +1651,79 @@ def _reorder_for_diversity(state: Dict[str, Any]) -> None:
     )
 
 
+async def _run_jj_probe(state: Dict[str, Any], candidate_smiles: str) -> None:
+    """§JJJJJJJJJJ: Ultra-fast mid-epoch Boltz probe for cold-start surrogate seeding.
+
+    Fires once per epoch when the PSICHIC pool reaches ≥1000 molecules AND the disk
+    cache is empty (cold start on a new weekly target with no GitHub cache).  Uses
+    fast=True mode to complete in ≈15–50 s and seed the disk cache with one data
+    point.  On the next PSICHIC chunk, §YYYYYY can activate its startup surrogate
+    (≥1 point is enough to warm the cache), enabling surrogate-guided SALSA 20–40 min
+    earlier than the normal Boltz trigger.
+
+    Guard: if Boltz pre-scoring has already started (boltz_prescored=True), skip.
+    Any exception is logged at DEBUG level and swallowed — zero regression.
+    """
+    if state.get('boltz_prescored', False):
+        bt.logging.debug("[§JJJJJJJJJJ] Boltz already active — cold-start probe skipped.")
+        return
+    protein = state['config'].weekly_target
+    db_path = state.get('boltz_cache_db', BOLTZ_CACHE_DB)
+    try:
+        candidates = state.get('global_candidate_pool')
+        if candidates is None or candidates.empty:
+            return
+        row_mask = candidates['product_smiles'] == candidate_smiles
+        if not row_mask.any():
+            return
+        row = candidates[row_mask].iloc[0]
+
+        subnet_config = {
+            'weekly_target': protein,
+            'binding_pocket': state['config'].binding_pocket,
+            'max_distance': state['config'].max_distance,
+            'force': state['config'].force,
+            'num_molecules_boltz': 1,
+            'sample_selection': 'first',
+            'boltz_metric': state['config'].boltz_metric,
+            'combination_strategy': state['config'].combination_strategy,
+        }
+        wrapper = BoltzWrapper()
+        valid_molecules_by_uid = {
+            0: {"smiles": [candidate_smiles], "names": [str(row.get('product_name', ''))]}
+        }
+        score_dict: Dict[str, Any] = {0: {}}
+        await asyncio.to_thread(
+            wrapper.score_molecules_target,
+            valid_molecules_by_uid, score_dict, subnet_config,
+            '0x' + '0' * 64,
+            True,   # fast=True: ≈15-50 s depending on hardware
+        )
+        mol_scores = wrapper.per_molecule_metric.get(0, {})
+        score = mol_scores.get(candidate_smiles, -math.inf)
+        if math.isfinite(score):
+            canon = get_canonical_smiles(candidate_smiles)
+            _comps = wrapper.per_molecule_components.get(0, {}).get(candidate_smiles, {})
+            _disk_cache_put(
+                db_path, canon, protein, score,
+                product_name=str(row.get('product_name', '')),
+                apb=_comps.get('affinity_probability_binary'),
+                apv=_comps.get('affinity_pred_value'),
+                ligand_iptm=_comps.get('ligand_iptm'),
+                confidence_score=_comps.get('confidence_score'),
+                psichic_le=float(row.get('combined_score', 0.0) or 0.0),
+            )
+            state.setdefault('boltz_score_cache', {})[(canon, protein)] = score
+            bt.logging.info(
+                f"[§JJJJJJJJJJ] Cold-start probe complete: score={score:.4f} "
+                f"({candidate_smiles[:60]}) — surrogate can now activate."
+            )
+        else:
+            bt.logging.debug(f"[§JJJJJJJJJJ] Cold-start probe: Boltz returned non-finite score.")
+    except Exception as _jj_err:
+        bt.logging.debug(f"[§JJJJJJJJJJ] Cold-start probe failed (non-fatal): {_jj_err}")
+
+
 async def run_boltz_prescoring(state: Dict[str, Any], max_candidates: int = 5) -> None:
     """
     Runs Boltz-2 affinity predictions on the top PSICHIC candidates and reorders
@@ -1724,11 +1829,16 @@ async def run_boltz_prescoring(state: Dict[str, Any], max_candidates: int = 5) -
         try:
             _emb_dual = fit_dual_surrogate_with_embeddings(db_path, protein)
             if _emb_dual is not None:
-                candidates = dual_surrogate_ucb_rank_pool_emb(candidates, _emb_dual)
+                _kkkk_gamma = getattr(state.get('config'), 'embedding_diversity_gamma', 0.0)
+                candidates = dual_surrogate_ucb_rank_pool_emb(
+                    candidates, _emb_dual, gamma=_kkkk_gamma
+                )
                 _emb_tag = "[emb+RF]" if _emb_dual[2] is not None else "[RF]"
+                _kkkk_tag = f"+diversity(γ={_kkkk_gamma})" if _kkkk_gamma > 0 else ""
                 bt.logging.info(
-                    f"[§HHHHHHHHHH/§AAAAAA] Pre-Boltz candidates re-ranked by embedding-augmented "
-                    f"dual UCB surrogate {_emb_tag} ({len(candidates)} entries, target={protein})."
+                    f"[§HHHHHHHHHH/§AAAAAA/§KKKKKKKKKK] Pre-Boltz candidates re-ranked by "
+                    f"embedding-augmented dual UCB surrogate {_emb_tag}{_kkkk_tag} "
+                    f"({len(candidates)} entries, target={protein})."
                 )
             else:
                 _dual = fit_dual_surrogate(db_path, protein)
@@ -3676,6 +3786,7 @@ async def run_miner(config: argparse.Namespace) -> None:
         'salsa_run_this_epoch': False,   # prevent duplicate SALSA runs per epoch
         'ga_run_this_epoch': False,      # prevent duplicate GradientGA runs per epoch
         'bbb_run_this_epoch': False,     # §BBB: prevent duplicate post-GA SALSA runs per epoch
+        'jj_probe_done': False,          # §JJJJJJJJJJ: cold-start probe flag
         'best_ga_smiles': None,          # §BBB: best SMILES found by GradientGA this epoch
         'chembl_seeds': [],              # §SS: ChEMBL known actives, fetched at startup
         'startup_dual_surrogate': None,  # §YYYYYY: dual RF surrogate fitted at startup from GitHub cache
@@ -4099,6 +4210,7 @@ async def run_miner(config: argparse.Namespace) -> None:
                 state['salsa_run_this_epoch'] = False
                 state['ga_run_this_epoch'] = False
                 state['bbb_run_this_epoch'] = False
+                state['jj_probe_done'] = False          # §JJJJJJJJJJ
                 state['best_ga_smiles'] = None
                 state['best_score'] = float('-inf')
                 state['boltz_prescored'] = False
