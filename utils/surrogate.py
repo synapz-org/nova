@@ -124,7 +124,7 @@ def fit_surrogate(db_path: str, protein: str, min_points: int = 40):
                 # (no additional penalty when the column doesn't exist yet).
                 "SELECT smiles, score, COALESCE(ligand_iptm, 1.0), "
                 "COALESCE(boltz_le_std, 0.0), COALESCE(boltz_ww_std, 0.0), "
-                "COALESCE(confidence_score, 1.0) "
+                "COALESCE(confidence_score, 1.0), COALESCE(complex_iplddt, 1.0) "
                 "FROM boltz_cache WHERE protein=?",
                 (protein,),
             ).fetchall()
@@ -144,14 +144,19 @@ def fit_surrogate(db_path: str, protein: str, min_points: int = 40):
     # §FFFFFFFFFF: additionally multiply by COALESCE(confidence_score, 1.0) — low overall
     # complex confidence flags predictions where the Boltz structure is unreliable,
     # complementing ligand_iptm (global inter-chain alignment) with a holistic signal.
+    # §MMMMMMMMMM: additionally multiply by COALESCE(complex_iplddt, 1.0) — interface pLDDT
+    # down-weights poses with poor interface confidence (disordered binding region).
     X, y, weights = [], [], []
-    for smiles, score, lig_iptm, le_std, ww_std, conf_score in rows:
+    for smiles, score, lig_iptm, le_std, ww_std, conf_score, iplddt in rows:
         vec = _descriptor_vector(smiles)
         if vec is not None:
             X.append(vec)
             y.append(float(score))
-            w = max(0.1, float(lig_iptm)) * max(0.1, float(conf_score)) / (
-                (1.0 + 10.0 * float(le_std)) * (1.0 + 10.0 * float(ww_std))
+            w = (
+                max(0.1, float(lig_iptm))
+                * max(0.1, float(conf_score))
+                * max(0.1, float(iplddt))  # §MMMMMMMMMM
+                / ((1.0 + 10.0 * float(le_std)) * (1.0 + 10.0 * float(ww_std)))
             )
             weights.append(max(0.05, w))
 
@@ -322,10 +327,11 @@ def fit_dual_surrogate(db_path: str, protein: str, min_points: int = 40):
                 # that §WW never re-scored or that pre-date §XXXXXXXX).
                 # §FFFFFFFFFF: COALESCE confidence_score to 1.0 for pre-§FFFFFFFFFF rows.
                 # §IIIIIIIIII: COALESCE psichic_le to 0.0 for legacy rows (neutral prior).
+                # §MMMMMMMMMM: COALESCE complex_iplddt to 1.0 for pre-§MMMMMMMMMM rows.
                 "SELECT smiles, affinity_prob_binary, affinity_pred_val, "
                 "COALESCE(ligand_iptm, 1.0), COALESCE(boltz_le_std, 0.0), "
                 "COALESCE(boltz_ww_std, 0.0), COALESCE(confidence_score, 1.0), "
-                "COALESCE(psichic_le, 0.0) "
+                "COALESCE(psichic_le, 0.0), COALESCE(complex_iplddt, 1.0) "
                 "FROM boltz_cache "
                 "WHERE protein=? "
                 "  AND affinity_prob_binary IS NOT NULL "
@@ -346,15 +352,20 @@ def fit_dual_surrogate(db_path: str, protein: str, min_points: int = 40):
     # - low overall complex confidence (confidence_score): additional reduction
     # §IIIIIIIIII: append psichic_le as feature 85 so the surrogate learns the
     # PSICHIC→Boltz correction.  NULL rows get 0.0 (neutral; StandardScaler centres).
+    # §MMMMMMMMMM: additionally multiply by complex_iplddt — interface pLDDT down-weights
+    # poses with poor interface confidence (disordered binding region).
     X, y_apb, y_apv, weights = [], [], [], []
-    for smiles, apb, apv, lig_iptm, le_std, ww_std, conf_score, psichic_le in rows:
+    for smiles, apb, apv, lig_iptm, le_std, ww_std, conf_score, psichic_le, iplddt in rows:
         vec = _descriptor_vector(smiles)
         if vec is not None:
             X.append(vec + [float(psichic_le)])  # §IIIIIIIIII: 85D total
             y_apb.append(float(apb))
             y_apv.append(float(apv))
-            w = max(0.1, float(lig_iptm)) * max(0.1, float(conf_score)) / (
-                (1.0 + 10.0 * float(le_std)) * (1.0 + 10.0 * float(ww_std))
+            w = (
+                max(0.1, float(lig_iptm))
+                * max(0.1, float(conf_score))
+                * max(0.1, float(iplddt))  # §MMMMMMMMMM
+                / ((1.0 + 10.0 * float(le_std)) * (1.0 + 10.0 * float(ww_std)))
             )
             weights.append(max(0.05, w))
 
@@ -720,10 +731,11 @@ def fit_dual_surrogate_with_embeddings(db_path: str, protein: str, min_points: i
         with sqlite3.connect(db_path) as conn:
             rows = conn.execute(
                 # §IIIIIIIIII: COALESCE psichic_le to 0.0 for legacy rows.
+                # §MMMMMMMMMM: COALESCE complex_iplddt to 1.0 for pre-§MMMMMMMMMM rows.
                 "SELECT smiles, affinity_prob_binary, affinity_pred_val, "
                 "COALESCE(ligand_iptm, 1.0), COALESCE(boltz_le_std, 0.0), "
                 "COALESCE(boltz_ww_std, 0.0), COALESCE(confidence_score, 1.0), "
-                "COALESCE(psichic_le, 0.0) "
+                "COALESCE(psichic_le, 0.0), COALESCE(complex_iplddt, 1.0) "
                 "FROM boltz_cache "
                 "WHERE protein=? "
                 "  AND affinity_prob_binary IS NOT NULL "
@@ -739,9 +751,10 @@ def fit_dual_surrogate_with_embeddings(db_path: str, protein: str, min_points: i
     # §IIIIIIIIII: feature order is [84D desc] + [psichic_le] + [32D PCA] = 117D.
     # psichic_le sits between descriptors and PCA so StandardScaler normalises it
     # alongside the other continuous features before the PCA block.
+    # §MMMMMMMMMM: complex_iplddt used as surrogate weight only (not a feature).
     zeros_emb = [0.0] * _N_EMB_COMPONENTS
     X, y_apb, y_apv, weights = [], [], [], []
-    for smiles, apb, apv, lig_iptm, le_std, ww_std, conf_score, psichic_le in rows:
+    for smiles, apb, apv, lig_iptm, le_std, ww_std, conf_score, psichic_le, iplddt in rows:
         vec = _descriptor_vector(smiles)
         if vec is None:
             continue
@@ -752,8 +765,11 @@ def fit_dual_surrogate_with_embeddings(db_path: str, protein: str, min_points: i
         X.append(vec)
         y_apb.append(float(apb))
         y_apv.append(float(apv))
-        w = max(0.1, float(lig_iptm)) * max(0.1, float(conf_score)) / (
-            (1.0 + 10.0 * float(le_std)) * (1.0 + 10.0 * float(ww_std))
+        w = (
+            max(0.1, float(lig_iptm))
+            * max(0.1, float(conf_score))
+            * max(0.1, float(iplddt))  # §MMMMMMMMMM
+            / ((1.0 + 10.0 * float(le_std)) * (1.0 + 10.0 * float(ww_std)))
         )
         weights.append(max(0.05, w))
 

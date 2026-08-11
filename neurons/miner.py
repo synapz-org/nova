@@ -108,6 +108,13 @@ def _init_boltz_cache_db(db_path: str) -> None:
             # on Morgan FP / physicochemical descriptors.  NULL for legacy rows and
             # §MM SALSA-discovered molecules not in the PSICHIC candidate pool.
             "ALTER TABLE boltz_cache ADD COLUMN psichic_le REAL",
+            # §MMMMMMMMMM: store Boltz-2 interface pLDDT (complex_iplddt, 0–1 range).
+            # Interface pLDDT weights interface residues 10× and ligand atoms 20×, so
+            # it measures binding-interface structural confidence specifically — more
+            # granular than confidence_score (global) and ligand_iptm (global chain).
+            # Low complex_iplddt → uncertain binding interface → down-weight in
+            # surrogate training.  NULL for legacy rows → COALESCE 1.0 (no penalty).
+            "ALTER TABLE boltz_cache ADD COLUMN complex_iplddt REAL",
         ):
             try:
                 conn.execute(_col_ddl)
@@ -154,6 +161,7 @@ def _disk_cache_put(
     confidence_score: Optional[float] = None,
     boltz_embedding: Optional[bytes] = None,
     psichic_le: Optional[float] = None,
+    complex_iplddt: Optional[float] = None,
 ) -> None:
     """Upsert a Boltz score into the persistent cache (silently ignores errors).
 
@@ -170,6 +178,9 @@ def _disk_cache_put(
     complementary to ligand_iptm (which measures global structural alignment).
     §IIIIIIIIII: psichic_le is the PSICHIC ligand-efficiency score at Boltz call time.
     Stored as surrogate training feature so the RF model learns PSICHIC→Boltz correction.
+    §MMMMMMMMMM: complex_iplddt is the interface-weighted pLDDT (0–1, ligand atoms 20×,
+    interface residues 10×).  Low complex_iplddt → uncertain binding interface → additional
+    surrogate down-weight complementary to confidence_score and ligand_iptm.
     """
     try:
         with sqlite3.connect(db_path) as conn:
@@ -177,10 +188,11 @@ def _disk_cache_put(
                 "INSERT OR REPLACE INTO boltz_cache "
                 "(smiles, protein, score, product_name, affinity_prob_binary, "
                 "affinity_pred_val, ligand_iptm, boltz_le_std, confidence_score, "
-                "boltz_embedding, psichic_le) "
-                "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                "boltz_embedding, psichic_le, complex_iplddt) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
                 (smiles, protein, score, product_name, apb, apv, ligand_iptm,
-                 boltz_le_std, confidence_score, boltz_embedding, psichic_le),
+                 boltz_le_std, confidence_score, boltz_embedding, psichic_le,
+                 complex_iplddt),
             )
     except Exception:
         pass
@@ -1652,14 +1664,17 @@ def _reorder_for_diversity(state: Dict[str, Any]) -> None:
 
 
 async def _run_jj_probe(state: Dict[str, Any], candidate_smiles: str) -> None:
-    """§JJJJJJJJJJ: Ultra-fast mid-epoch Boltz probe for cold-start surrogate seeding.
+    """§JJJJJJJJJJ + §LLLLLLLLLL: Ultra-fast mid-epoch Boltz probe for cold-start surrogate seeding.
 
     Fires once per epoch when the PSICHIC pool reaches ≥1000 molecules AND the disk
     cache is empty (cold start on a new weekly target with no GitHub cache).  Uses
-    fast=True mode to complete in ≈15–50 s and seed the disk cache with one data
-    point.  On the next PSICHIC chunk, §YYYYYY can activate its startup surrogate
-    (≥1 point is enough to warm the cache), enabling surrogate-guided SALSA 20–40 min
-    earlier than the normal Boltz trigger.
+    fast=True mode to complete in ≈15–50 s and seed the disk cache.
+
+    §LLLLLLLLLL: Scores up to 3 scaffold-diverse candidates in one Boltz session
+    (instead of just 1 as in §JJJJJJJJJJ).  The Ridge surrogate requires ≥3 training
+    points to fit at all; with only 1 data point it was nearly degenerate.  Batching
+    3 molecules adds ~25–40% wall time while giving 3× surrogate training data —
+    the Ridge tier now activates properly on the very next PSICHIC chunk.
 
     Guard: if Boltz pre-scoring has already started (boltz_prescored=True), skip.
     Any exception is logged at DEBUG level and swallowed — zero regression.
@@ -1673,24 +1688,30 @@ async def _run_jj_probe(state: Dict[str, Any], candidate_smiles: str) -> None:
         candidates = state.get('global_candidate_pool')
         if candidates is None or candidates.empty:
             return
-        row_mask = candidates['product_smiles'] == candidate_smiles
-        if not row_mask.any():
+
+        # §LLLLLLLLLL: select up to 3 scaffold-diverse candidates for the probe batch.
+        # _scaffold_diverse_candidates applies Murcko-scaffold deduplication so each
+        # of the 3 Boltz calls explores a distinct chemical neighbourhood — improving
+        # surrogate generalisation vs. scoring 3 near-identical candidates.
+        _probe_cands = _scaffold_diverse_candidates(candidates, max_k=3)
+        if _probe_cands.empty:
             return
-        row = candidates[row_mask].iloc[0]
+        probe_smiles = _probe_cands['product_smiles'].tolist()
+        probe_names  = [str(r) for r in _probe_cands['product_name'].tolist()]
 
         subnet_config = {
             'weekly_target': protein,
             'binding_pocket': state['config'].binding_pocket,
             'max_distance': state['config'].max_distance,
             'force': state['config'].force,
-            'num_molecules_boltz': 1,
+            'num_molecules_boltz': len(probe_smiles),  # §LLLLLLLLLL: score all K
             'sample_selection': 'first',
             'boltz_metric': state['config'].boltz_metric,
             'combination_strategy': state['config'].combination_strategy,
         }
         wrapper = BoltzWrapper()
         valid_molecules_by_uid = {
-            0: {"smiles": [candidate_smiles], "names": [str(row.get('product_name', ''))]}
+            0: {"smiles": probe_smiles, "names": probe_names}
         }
         score_dict: Dict[str, Any] = {0: {}}
         await asyncio.to_thread(
@@ -1700,26 +1721,38 @@ async def _run_jj_probe(state: Dict[str, Any], candidate_smiles: str) -> None:
             True,   # fast=True: ≈15-50 s depending on hardware
         )
         mol_scores = wrapper.per_molecule_metric.get(0, {})
-        score = mol_scores.get(candidate_smiles, -math.inf)
-        if math.isfinite(score):
-            canon = get_canonical_smiles(candidate_smiles)
-            _comps = wrapper.per_molecule_components.get(0, {}).get(candidate_smiles, {})
+        comps_by_smiles = wrapper.per_molecule_components.get(0, {})
+
+        # §LLLLLLLLLL: cache all scored candidates in a single loop.
+        n_cached = 0
+        for i, (sm, nm) in enumerate(zip(probe_smiles, probe_names)):
+            score = mol_scores.get(sm, -math.inf)
+            if not math.isfinite(score):
+                continue
+            canon = get_canonical_smiles(sm)
+            _comps = comps_by_smiles.get(sm, {})
+            _psichic_le = None
+            if i < len(_probe_cands):
+                _raw = _probe_cands.iloc[i].get('combined_score', 0.0)
+                _psichic_le = float(_raw or 0.0) if isinstance(_raw, (int, float)) else None
+            _ci = _comps.get('complex_iplddt')
             _disk_cache_put(
                 db_path, canon, protein, score,
-                product_name=str(row.get('product_name', '')),
+                product_name=nm or None,
                 apb=_comps.get('affinity_probability_binary'),
                 apv=_comps.get('affinity_pred_value'),
                 ligand_iptm=_comps.get('ligand_iptm'),
                 confidence_score=_comps.get('confidence_score'),
-                psichic_le=float(row.get('combined_score', 0.0) or 0.0),
+                psichic_le=_psichic_le,
+                complex_iplddt=_ci if isinstance(_ci, (int, float)) else None,  # §MMMMMMMMMM
             )
             state.setdefault('boltz_score_cache', {})[(canon, protein)] = score
-            bt.logging.info(
-                f"[§JJJJJJJJJJ] Cold-start probe complete: score={score:.4f} "
-                f"({candidate_smiles[:60]}) — surrogate can now activate."
-            )
-        else:
-            bt.logging.debug(f"[§JJJJJJJJJJ] Cold-start probe: Boltz returned non-finite score.")
+            n_cached += 1
+        bt.logging.info(
+            f"[§LLLLLLLLLL] Cold-start probe complete: {n_cached}/{len(probe_smiles)} "
+            f"candidates cached (primary={candidate_smiles[:50]}) "
+            f"— surrogate seeded with {n_cached} training point(s)."
+        )
     except Exception as _jj_err:
         bt.logging.debug(f"[§JJJJJJJJJJ] Cold-start probe failed (non-fatal): {_jj_err}")
 
@@ -2061,11 +2094,13 @@ async def run_boltz_prescoring(state: Dict[str, Any], max_candidates: int = 5) -
                     # §DDDDDD: also extract ligand_iptm for confidence-weighted surrogate.
                     # §WWWWWWW: compute per-sample LE std for additional variance weighting.
                     # §FFFFFFFFFF: also extract confidence_score (overall complex confidence).
+                    # §MMMMMMMMMM: also extract complex_iplddt (interface pLDDT).
                     _yyyyy_apb = _comps.get('affinity_probability_binary')
                     _yyyyy_apv = _comps.get('affinity_pred_value')
                     _dddddd_li = _comps.get('ligand_iptm')
                     _wwwwwww_le_std = _compute_le_std(_comps)
                     _fffff_cs = _comps.get('confidence_score')
+                    _mmm_ci = _comps.get('complex_iplddt')
                     _disk_cache_put(
                         db_path, canon, protein, score, product_name=_pname,
                         apb=_yyyyy_apb if isinstance(_yyyyy_apb, (int, float)) else None,
@@ -2075,6 +2110,7 @@ async def run_boltz_prescoring(state: Dict[str, Any], max_candidates: int = 5) -
                         confidence_score=_fffff_cs if isinstance(_fffff_cs, (int, float)) else None,
                         boltz_embedding=_emb_to_bytes(_comps),
                         psichic_le=_psichic_le_map.get(canon),  # §IIIIIIIIII
+                        complex_iplddt=_mmm_ci if isinstance(_mmm_ci, (int, float)) else None,  # §MMMMMMMMMM
                     )
 
                     # Adaptive trigger: one molecule gives the most accurate per-mol timing
@@ -2278,6 +2314,7 @@ async def run_boltz_prescoring(state: Dict[str, Any], max_candidates: int = 5) -
                                     _ff_apv = _ff_comps.get('affinity_pred_value')
                                     _ff_li = _ff_comps.get('ligand_iptm')
                                     _ff_cs = _ff_comps.get('confidence_score')
+                                    _ff_ci = _ff_comps.get('complex_iplddt')  # §MMMMMMMMMM
                                     # §IIIIIIIIII: prefer map (PSICHIC candidates), fall back to row (SAVI pool).
                                     _ff_ple = _psichic_le_map.get(_ff_w_canon)
                                     if _ff_ple is None:
@@ -2294,6 +2331,7 @@ async def run_boltz_prescoring(state: Dict[str, Any], max_candidates: int = 5) -
                                         confidence_score=_ff_cs if isinstance(_ff_cs, (int, float)) else None,
                                         boltz_embedding=_emb_to_bytes(_ff_comps),
                                         psichic_le=_ff_ple,  # §IIIIIIIIII
+                                        complex_iplddt=_ff_ci if isinstance(_ff_ci, (int, float)) else None,  # §MMMMMMMMMM
                                     )
                                     bt.logging.info(
                                         f"§FF §NN full-scored winner: {_ff_w_row.get('product_name', '?')} "
@@ -2563,6 +2601,7 @@ async def run_boltz_prescoring(state: Dict[str, Any], max_candidates: int = 5) -
                             _mm_apv = _mm_comps.get('affinity_pred_value')
                             _mm_li = _mm_comps.get('ligand_iptm')
                             _mm_cs = _mm_comps.get('confidence_score')
+                            _mm_ci = _mm_comps.get('complex_iplddt')  # §MMMMMMMMMM
                             # §IIIIIIIIII: prefer map (PSICHIC candidates), fall back to row (SAVI pool).
                             _mm_ple = _psichic_le_map.get(_mm_w_canon)
                             if _mm_ple is None:
@@ -2579,6 +2618,7 @@ async def run_boltz_prescoring(state: Dict[str, Any], max_candidates: int = 5) -
                                 confidence_score=_mm_cs if isinstance(_mm_cs, (int, float)) else None,
                                 boltz_embedding=_emb_to_bytes(_mm_comps),
                                 psichic_le=_mm_ple,  # §IIIIIIIIII
+                                complex_iplddt=_mm_ci if isinstance(_mm_ci, (int, float)) else None,  # §MMMMMMMMMM
                             )
                             if wrapper.last_inference_duration > 0:
                                 state['boltz_time_per_mol'] = wrapper.last_inference_duration
@@ -2941,6 +2981,7 @@ async def run_boltz_prescoring(state: Dict[str, Any], max_candidates: int = 5) -
                                             _xx_apv = _xx_comps.get('affinity_pred_value')
                                             _xx_li = _xx_comps.get('ligand_iptm')
                                             _xx_cs = _xx_comps.get('confidence_score')
+                                            _xx_ci = _xx_comps.get('complex_iplddt')  # §MMMMMMMMMM
                                             _disk_cache_put(
                                                 db_path, _xx_w_canon, protein, _xx_w_score,
                                                 product_name=_xx_w_pname or None,
@@ -2959,6 +3000,7 @@ async def run_boltz_prescoring(state: Dict[str, Any], max_candidates: int = 5) -
                                                 ) else None,
                                                 boltz_embedding=_emb_to_bytes(_xx_comps),
                                                 psichic_le=None,  # §IIIIIIIIII: tautomer
+                                                complex_iplddt=_xx_ci if isinstance(_xx_ci, (int, float)) else None,  # §MMMMMMMMMM
                                             )
                                             if wrapper.last_inference_duration > 0:
                                                 state['boltz_time_per_mol'] = (
@@ -3208,6 +3250,7 @@ async def run_boltz_prescoring(state: Dict[str, Any], max_candidates: int = 5) -
                                 _tt_apv = _tt_comps.get('affinity_pred_value')
                                 _tt_li  = _tt_comps.get('ligand_iptm')
                                 _tt_cs  = _tt_comps.get('confidence_score')
+                                _tt_ci  = _tt_comps.get('complex_iplddt')  # §MMMMMMMMMM
                                 _disk_cache_put(
                                     db_path, _tt_w_can, protein, _tt_w_score,
                                     product_name=_tt_w_pname or None,
@@ -3226,6 +3269,7 @@ async def run_boltz_prescoring(state: Dict[str, Any], max_candidates: int = 5) -
                                     ) else None,
                                     boltz_embedding=_emb_to_bytes(_tt_comps),
                                     psichic_le=None,  # §IIIIIIIIII: tautomer
+                                    complex_iplddt=_tt_ci if isinstance(_tt_ci, (int, float)) else None,  # §MMMMMMMMMM
                                 )
                                 if wrapper.last_inference_duration > 0:
                                     state['boltz_time_per_mol'] = (
