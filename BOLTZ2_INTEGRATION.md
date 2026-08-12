@@ -1,12 +1,65 @@
 # Boltz-2 Miner Integration
 
-## Current Status (as of 2026-08-11)
+## Current Status (as of 2026-08-12)
 
-**50 roadmap items implemented.** §LLLLLLLLLL and §MMMMMMMMMM added 2026-08-11.
+**51 roadmap items implemented.** §NNNNNNNNNNN added 2026-08-12.
 
 ---
 
 ## Implemented Optimisations (recent)
+
+### §NNNNNNNNNNN — Cross-Target Seeds in Cold-Start Probe — added 2026-08-12
+
+**Problem:** The §LLLLLLLLLL cold-start probe scores 3 scaffold-diverse PSICHIC top candidates
+in fast mode to seed the Ridge surrogate.  These candidates are high-scoring under PSICHIC but
+have unknown Boltz-2 affinity on the new weekly target — the surrogate receives 3 data points
+scattered across the score distribution, with no guarantee that any of them fall in the confirmed-
+binder region.  On epoch 1 of a protein-family rotation (e.g., kinase A → kinase B, 45% sequence
+identity), the `cross_target_seeds` (§WWWWW/§RRRRRR) hold molecules validated as Boltz-2 binders
+on the prior protein.  These molecules have a strong prior for high Boltz-2 affinity on the new
+target yet were never included in the cold-start probe — they only appeared as SALSA seeds later.
+
+**Implementation:** `_run_jj_probe()` in `neurons/miner.py` extended (~20 lines) to append up to 2
+cross-target seed SMILES to the probe batch after building the 3-scaffold PSICHIC candidate pool:
+
+```python
+_xts = [
+    s for s in state.get('cross_target_seeds', [])
+    if s not in probe_smiles
+    and Chem.MolFromSmiles(s) is not None
+    and is_boltz_safe_smiles(s)[0]
+][:2]
+if _xts:
+    probe_smiles.extend(_xts)
+    probe_names.extend([None] * len(_xts))
+```
+
+Cross-target entries are stored with `product_name=None` — they are not submittable but are
+included in surrogate training via the existing `SELECT … FROM boltz_cache WHERE protein=?`
+queries (which do not filter on `product_name IS NOT NULL`).  The existing per-molecule cache
+loop already handles `None` product names gracefully (`product_name=nm or None`).
+
+**Expected benefit:**
+
+On protein-family rotations where `cross_target_seeds` is populated (§WWWWW found homologs with
+≥40% sequence identity), the probe now includes confirmed binders alongside novel PSICHIC top
+candidates.  The Ridge surrogate receives reference points anchoring the high-affinity end of the
+score distribution, which materially improves NDCG at low training-set sizes where a single
+high-scoring outlier provides the most regression slope.
+
+| Condition | Probe size (before) | Probe size (after) | Surrogate benefit |
+|-----------|--------------------|--------------------|-------------------|
+| Cold start, no homologs | 3 | 3 (unchanged) | None |
+| Cold start, 1 homolog | 3 | 4 | Confirmed-binder anchor |
+| Cold start, 2+ homologs | 3 | 5 | Two calibration points |
+
+Expected gain: +2–4% surrogate NDCG on epoch 1 of family-member rotations.  Zero regression
+when `cross_target_seeds` is empty (the common case on first-ever weekly target) — the probe
+runs exactly as before.
+
+**Files changed:** `neurons/miner.py` (~20 lines: extension block in `_run_jj_probe`).
+
+---
 
 ### §JJJJJJJJJJ — Mid-Epoch Exploratory Boltz Probe (Cold-Start Surrogate Seed) — added 2026-08-10
 

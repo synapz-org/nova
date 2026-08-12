@@ -1699,6 +1699,26 @@ async def _run_jj_probe(state: Dict[str, Any], candidate_smiles: str) -> None:
         probe_smiles = _probe_cands['product_smiles'].tolist()
         probe_names  = [str(r) for r in _probe_cands['product_name'].tolist()]
 
+        # §NNNNNNNNNNN: extend probe with up to 2 cross-target seeds from homologous
+        # prior-target proteins.  These molecules have proven affinity on a related
+        # protein; scoring them on the NEW weekly target gives the surrogate calibrated
+        # high-end reference points — anchoring the score distribution so the Ridge
+        # model can separate binders from non-binders from the very first epoch.
+        # Stored with product_name=None (not submittable; used for surrogate training).
+        _xts = [
+            s for s in state.get('cross_target_seeds', [])
+            if s not in probe_smiles
+            and Chem.MolFromSmiles(s) is not None
+            and is_boltz_safe_smiles(s)[0]
+        ][:2]
+        if _xts:
+            probe_smiles.extend(_xts)
+            probe_names.extend([None] * len(_xts))
+            bt.logging.info(
+                f"[§NNNNNNNNNNN] {len(_xts)} cross-target seed(s) added to cold-start "
+                f"probe — known-binder calibration for surrogate."
+            )
+
         subnet_config = {
             'weekly_target': protein,
             'binding_pocket': state['config'].binding_pocket,

@@ -358,7 +358,7 @@ Even a partial result (1 of 5 molecules scored) improves on the PSICHIC-only bas
 
 ## Implementation Roadmap (priority order)
 
-Items 1–48 are **implemented** (§KKKKKKKKKK added 2026-08-10). Items 5 and 7 remain as conditional/research directions.
+Items 1–51 are **implemented** (§NNNNNNNNNNN added 2026-08-12). Items 5 and 7 remain as conditional/research directions.
 
 | Priority | Approach | Effort | Status | Expected gain |
 |----------|----------|--------|--------|---------------|
@@ -410,6 +410,9 @@ Items 1–48 are **implemented** (§KKKKKKKKKK added 2026-08-10). Items 5 and 7 
 | 46 | §IIIIIIIIII: PSICHIC LE as surrogate training feature — store PSICHIC `combined_score` at Boltz call time; use as feature 85 (or 118 with embeddings) in surrogate training to learn PSICHIC→Boltz correction | ~75 lines | ✅ Done | +3–8% NDCG; especially impacts week-1 runs where embeddings are sparse but PSICHIC scores are universal |
 | 47 | §JJJJJJJJJJ: Mid-epoch exploratory Boltz probe — fire one ultra-fast Boltz call (≈15–50 s, fast=True) when pool ≥1000 molecules and cache is empty; seeds surrogate 20–40 min earlier on cold-start epoch 1 | ~65 lines | ✅ Done | +3–6% Boltz LE on epoch 1 of new weekly target with no GitHub cache |
 | 48 | §KKKKKKKKKK: Boltz-2 embedding centroid diversity bonus — add cosine-distance bonus (γ=0.05) from centroid of scored molecules' PCA embeddings to UCB score; diversifies candidate selection in binding-pose space beyond Morgan FP Tanimoto | ~30 lines | ✅ Done | +2–5% novel scaffold winner probability per epoch on week-4+ converged runs |
+| 49 | §LLLLLLLLLL: Multi-molecule cold-start probe (3-scaffold batch) — rewrite §JJJJJJJJJJ to score 3 scaffold-diverse molecules instead of 1; Ridge surrogate requires ≥3 training points to fit at all | ~40 lines | ✅ Done (2026-08-11) | 3× surrogate training data from probe; Ridge tier activates on next chunk vs. degenerate with 1 pt |
+| 50 | §MMMMMMMMMM: `complex_iplddt` surrogate confidence weight — persist Boltz-2 interface-weighted pLDDT to SQLite and add `max(0.1, iplddt)` down-weight to surrogate training alongside ligand_iptm and confidence_score | ~80 lines | ✅ Done (2026-08-11) | Cleaner surrogate signal; poses with disordered binding interface ≤5× lower training weight |
+| 51 | §NNNNNNNNNNN: Cross-target seeds in cold-start probe — extend §LLLLLLLLLL probe with up to 2 homolog-protein validated molecules; scoring them on the new target creates known-binder calibration points for the surrogate | ~20 lines | ✅ Done (2026-08-12) | +2–4% surrogate NDCG on epoch 1 of family-member protein rotations; anchors high end of score distribution from first probe |
 
 All approaches share the same submission constraint: molecules must map to valid SAVI-2020
 product names. SALSA and GradientGA both solve this via nearest-neighbour SAVI-2020 lookup.
