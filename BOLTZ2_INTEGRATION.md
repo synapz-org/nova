@@ -1,12 +1,76 @@
 # Boltz-2 Miner Integration
 
-## Current Status (as of 2026-08-12)
+## Current Status (as of 2026-08-13)
 
-**51 roadmap items implemented.** §NNNNNNNNNNN added 2026-08-12.
+**52 roadmap items implemented.** §OOOOOOOOOOO added 2026-08-13.
 
 ---
 
 ## Implemented Optimisations (recent)
+
+### §OOOOOOOOOOO — FBLD Fragment Probe in Cold-Start — added 2026-08-13
+
+**Problem:** The §LLLLLLLLLL cold-start probe scores 3–5 drug-like molecules (typically 20–30 HA)
+to seed the surrogate.  The Boltz-2 scoring formula `(APB − APV) / heavy_atom_count` intrinsically
+rewards smaller, more efficient binders — a molecule with 12 HA can outscore a 28 HA molecule even
+with lower raw affinity.  Fragment-Based Lead Discovery (FBLD) has been a documented research
+direction since the first arxiv-survey.md draft but was marked "Research — needs empirical Boltz
+calibration study" because it was unknown whether Boltz-2 reliably predicts fragment binding.
+The cold-start epoch is exactly when empirical data costs the least (GPU already warm from the
+main probe) and matters most (§OOOOOO's fragment slot quota adapts from cache evidence — but on
+epoch 1 the cache contains zero fragment-sized molecules).
+
+**Implementation:** At the end of `_run_jj_probe()`, after the main probe's results are cached,
+a second fast-mode Boltz pass scores up to 3 top-PSICHIC-scoring molecules with 10–15 heavy atoms
+from `savi_stream_pool` (~80 lines added to `neurons/miner.py`):
+
+```python
+# Select top-3 fragment candidates from stream pool
+_fbld_mask = (
+    (_fbld_pool['heavy_atoms'] >= 10)
+    & (_fbld_pool['heavy_atoms'] <= 15)
+    & _fbld_safe_mask
+    & ~_fbld_pool['product_smiles'].isin(probe_smiles)
+)
+_fbld_cands = _fbld_pool[_fbld_mask].sort_values('combined_score', ascending=False).head(3)
+
+# Score with fast-mode Boltz, cache results, log LE comparison
+await asyncio.to_thread(
+    _frag_wrapper.score_molecules_target,
+    _frag_valid_mols, _frag_score_dict, _frag_subnet_cfg,
+    '0x' + '0' * 64,
+    True,   # fast=True: ≈10-25 s for 10-15 HA molecules
+)
+```
+
+Results are cached to SQLite and `boltz_score_cache` with the full schema (APB, APV, ligand_iptm,
+confidence_score, psichic_le, complex_iplddt) using the same `_disk_cache_put` call as the main
+probe.  The success log compares fragment mean LE vs drug-like mean LE so miners can observe
+empirically whether fragments outperform drug-like molecules on this week's protein target.
+
+**Guard conditions (identical to main probe):** fires only inside the `_run_jj_probe` try block,
+has its own nested try/except so a failure cannot affect the main probe, and skips cleanly when
+`savi_stream_pool` has no 10–15 HA Boltz-safe molecules not already covered by the main probe.
+
+**Expected benefit:**
+
+| Condition | Before §OOOOOOOOOOO | After §OOOOOOOOOOO |
+|-----------|--------------------|--------------------|
+| Epoch 1, cold cache, fragments in pool | §OOOOOO quota blind to fragment LE | Fragment LE cached → §OOOOOO adapts quota correctly |
+| Fragment LE > drug-like LE | Surrogate never learns this | Fragment calibration anchors high end of LE distribution |
+| Fragment LE < drug-like LE | Missed discovery | Confirmed low LE → §OOOOOO reduces fragment quota |
+| No 10-15 HA molecules in pool | — | Skip (zero regression) |
+
+Wall time added: ≈10–30 s per epoch on cold-start epochs when 10-15 HA molecules are in the pool.
+The `blocks_until_epoch > boltz_trigger + 50` guard guarantees ≥10 min headroom before normal Boltz.
+
+Expected gain: +1–4% surrogate NDCG on epoch 1 from correctly-calibrated fragment slot quota;
++2–6% expected Boltz LE on epoch 2+ if fragments prove to be the dominant chemical class for
+the weekly target (enables §OOOOOO to allocate 2500 fragment slots instead of the default 500).
+
+**Files changed:** `neurons/miner.py` (~80 lines: nested try block at end of `_run_jj_probe`).
+
+---
 
 ### §NNNNNNNNNNN — Cross-Target Seeds in Cold-Start Probe — added 2026-08-12
 

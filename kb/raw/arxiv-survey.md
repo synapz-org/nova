@@ -358,7 +358,7 @@ Even a partial result (1 of 5 molecules scored) improves on the PSICHIC-only bas
 
 ## Implementation Roadmap (priority order)
 
-Items 1–51 are **implemented** (§NNNNNNNNNNN added 2026-08-12). Items 5 and 7 remain as conditional/research directions.
+Items 1–52 are **implemented** (§OOOOOOOOOOO added 2026-08-13). Item 5 remains as a conditional direction.
 
 | Priority | Approach | Effort | Status | Expected gain |
 |----------|----------|--------|--------|---------------|
@@ -368,7 +368,7 @@ Items 1–51 are **implemented** (§NNNNNNNNNNN added 2026-08-12). Items 5 and 7
 | 4 | SALSA (§N + §DD/§GG/§HH/§II/§Q/§FF/§MM) | 200+ lines | ✅ Done | Directed search + hill-climbing |
 | 5 | Binding-pocket docking filter (§D) | 150 lines | ⏳ Conditional | Only needed when `binding_pocket` set |
 | 6 | GradientGA (§O) | 350 lines | ✅ Done | Population-level optimisation |
-| 7 | FBLD (fragments) | Research | ⏳ Research | Needs empirical Boltz calibration study |
+| 7 | FBLD (fragments, §OOOOOOOOOOO) | ~80 lines | ✅ Done (2026-08-13) | Fragment cold-start probe; empirical calibration now live |
 | 8 | §NN: Reduced-sample §MM/§FF screening | 60 lines | ✅ Done | ~2× more §MM rounds per epoch budget |
 | 9 | §PP: Full-coverage SALSA perturbations (n_perturb 60→200) + SAVI pool 5k→10k | 4 lines | ✅ Done | Ring walk + terminal removal now contribute to every SALSA call |
 | 10 | §QQQQ: RF surrogate above 100 training points | 30 lines | ✅ Done | 5–20% NDCG improvement on week-2+ runs |
@@ -413,6 +413,7 @@ Items 1–51 are **implemented** (§NNNNNNNNNNN added 2026-08-12). Items 5 and 7
 | 49 | §LLLLLLLLLL: Multi-molecule cold-start probe (3-scaffold batch) — rewrite §JJJJJJJJJJ to score 3 scaffold-diverse molecules instead of 1; Ridge surrogate requires ≥3 training points to fit at all | ~40 lines | ✅ Done (2026-08-11) | 3× surrogate training data from probe; Ridge tier activates on next chunk vs. degenerate with 1 pt |
 | 50 | §MMMMMMMMMM: `complex_iplddt` surrogate confidence weight — persist Boltz-2 interface-weighted pLDDT to SQLite and add `max(0.1, iplddt)` down-weight to surrogate training alongside ligand_iptm and confidence_score | ~80 lines | ✅ Done (2026-08-11) | Cleaner surrogate signal; poses with disordered binding interface ≤5× lower training weight |
 | 51 | §NNNNNNNNNNN: Cross-target seeds in cold-start probe — extend §LLLLLLLLLL probe with up to 2 homolog-protein validated molecules; scoring them on the new target creates known-binder calibration points for the surrogate | ~20 lines | ✅ Done (2026-08-12) | +2–4% surrogate NDCG on epoch 1 of family-member protein rotations; anchors high end of score distribution from first probe |
+| 52 | §OOOOOOOOOOO: FBLD fragment probe in cold-start — after main §LLLLLLLLLL probe, score top-3 PSICHIC-scoring molecules with 10–15 HA from savi_stream_pool using a second fast Boltz pass; provides fragment-scale LE calibration data so §OOOOOO correctly sizes the fragment slot quota from epoch 1 | ~80 lines | ✅ Done (2026-08-13) | +1–4% surrogate NDCG from correctly-calibrated fragment quota; +2–6% Boltz LE on epoch 2+ when fragments prove to be the dominant chemical class for the weekly target |
 
 All approaches share the same submission constraint: molecules must map to valid SAVI-2020
 product names. SALSA and GradientGA both solve this via nearest-neighbour SAVI-2020 lookup.

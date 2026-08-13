@@ -1773,6 +1773,106 @@ async def _run_jj_probe(state: Dict[str, Any], candidate_smiles: str) -> None:
             f"candidates cached (primary={candidate_smiles[:50]}) "
             f"— surrogate seeded with {n_cached} training point(s)."
         )
+        # §OOOOOOOOOOO: FBLD fragment probe — empirical validation of Fragment-Based Lead
+        # Discovery for the current weekly target.  The Boltz-2 scoring formula
+        # (APB − APV) / heavy_atom_count intrinsically rewards smaller, more efficient
+        # binders.  Scoring the top-3 PSICHIC-ranking small molecules (10-15 HA) alongside
+        # the drug-like probe gives the surrogate fragment-scale reference points from epoch 1,
+        # enabling §OOOOOO to correctly size the fragment slot quota on the very next update.
+        # Zero regression: skips cleanly when no 10-15 HA molecules exist in the pool.
+        try:
+            _fbld_pool = state.get('savi_stream_pool')
+            if (
+                _fbld_pool is not None
+                and not _fbld_pool.empty
+                and 'heavy_atoms' in _fbld_pool.columns
+                and 'product_smiles' in _fbld_pool.columns
+            ):
+                _fbld_safe_mask = _fbld_pool['product_smiles'].apply(
+                    lambda s: is_boltz_safe_smiles(s)[0]
+                )
+                _fbld_mask = (
+                    (_fbld_pool['heavy_atoms'] >= 10)
+                    & (_fbld_pool['heavy_atoms'] <= 15)
+                    & _fbld_safe_mask
+                    & ~_fbld_pool['product_smiles'].isin(probe_smiles)
+                )
+                _fbld_cands = (
+                    _fbld_pool[_fbld_mask]
+                    .sort_values('combined_score', ascending=False)
+                    .head(3)
+                )
+                if not _fbld_cands.empty:
+                    _frag_smiles = _fbld_cands['product_smiles'].tolist()
+                    _frag_names  = [str(r) for r in _fbld_cands['product_name'].tolist()]
+                    _frag_subnet_cfg = {
+                        'weekly_target':       protein,
+                        'binding_pocket':      state['config'].binding_pocket,
+                        'max_distance':        state['config'].max_distance,
+                        'force':               state['config'].force,
+                        'num_molecules_boltz': len(_frag_smiles),
+                        'sample_selection':    'first',
+                        'boltz_metric':        state['config'].boltz_metric,
+                        'combination_strategy': state['config'].combination_strategy,
+                    }
+                    _frag_wrapper    = BoltzWrapper()
+                    _frag_valid_mols = {0: {"smiles": _frag_smiles, "names": _frag_names}}
+                    _frag_score_dict: Dict[str, Any] = {0: {}}
+                    await asyncio.to_thread(
+                        _frag_wrapper.score_molecules_target,
+                        _frag_valid_mols, _frag_score_dict, _frag_subnet_cfg,
+                        '0x' + '0' * 64,
+                        True,   # fast=True: ≈10-25 s for 10-15 HA molecules
+                    )
+                    _frag_mol_scores   = _frag_wrapper.per_molecule_metric.get(0, {})
+                    _frag_comps_by_smi = _frag_wrapper.per_molecule_components.get(0, {})
+                    _fbld_n_cached = 0
+                    _fbld_le_vals: List[float] = []
+                    for _fi, (_fsm, _fnm) in enumerate(zip(_frag_smiles, _frag_names)):
+                        _fscore = _frag_mol_scores.get(_fsm, -math.inf)
+                        if not math.isfinite(_fscore):
+                            continue
+                        _fcanon = get_canonical_smiles(_fsm)
+                        _fcomps = _frag_comps_by_smi.get(_fsm, {})
+                        _fci    = _fcomps.get('complex_iplddt')
+                        _fpsi   = None
+                        if _fi < len(_fbld_cands):
+                            _fraw = _fbld_cands.iloc[_fi].get('combined_score', 0.0)
+                            _fpsi = float(_fraw or 0.0) if isinstance(_fraw, (int, float)) else None
+                        _disk_cache_put(
+                            db_path, _fcanon, protein, _fscore,
+                            product_name=_fnm or None,
+                            apb=_fcomps.get('affinity_probability_binary'),
+                            apv=_fcomps.get('affinity_pred_value'),
+                            ligand_iptm=_fcomps.get('ligand_iptm'),
+                            confidence_score=_fcomps.get('confidence_score'),
+                            psichic_le=_fpsi,
+                            complex_iplddt=_fci if isinstance(_fci, (int, float)) else None,
+                        )
+                        state.setdefault('boltz_score_cache', {})[(_fcanon, protein)] = _fscore
+                        _fbld_n_cached += 1
+                        _fbld_le_vals.append(_fscore)
+                    if _fbld_n_cached > 0:
+                        _frag_mean = float(np.mean(_fbld_le_vals))
+                        _drug_vals: List[float] = [
+                            mol_scores.get(s, -math.inf)
+                            for s in probe_smiles[:len(_probe_cands)]
+                            if math.isfinite(mol_scores.get(s, -math.inf))
+                        ]
+                        _drug_mean_str = (
+                            f"vs drug-like mean LE={float(np.mean(_drug_vals)):.4f} "
+                            if _drug_vals else ""
+                        )
+                        bt.logging.info(
+                            f"[§OOOOOOOOOOO] FBLD fragment probe: "
+                            f"{_fbld_n_cached}/{len(_frag_smiles)} fragment(s) (10-15 HA) "
+                            f"cached, mean LE={_frag_mean:.4f} {_drug_mean_str}"
+                            f"— surrogate now has fragment-scale calibration data."
+                        )
+        except Exception as _oo_err:
+            bt.logging.debug(
+                f"[§OOOOOOOOOOO] Fragment probe failed (non-fatal): {_oo_err}"
+            )
     except Exception as _jj_err:
         bt.logging.debug(f"[§JJJJJJJJJJ] Cold-start probe failed (non-fatal): {_jj_err}")
 
