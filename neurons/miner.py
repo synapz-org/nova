@@ -4052,6 +4052,34 @@ async def run_miner(config: argparse.Namespace) -> None:
                     f"[§PPPPPP] Imported {_pppppp_imported}/{len(_pppppp_entries)} cache entries "
                     f"from GitHub export (protein={config.weekly_target!r})."
                 )
+                # §PPPPPPPPPP: Import Boltz-2 embedding blobs from GitHub export so the
+                # embedding-augmented surrogate (§HHHHHHHHHH) can warm-start from epoch 1.
+                _pppppppppp_embs = _pppppp_data.get('embeddings', [])
+                if _pppppppppp_embs:
+                    _pppppppppp_n = 0
+                    with sqlite3.connect(state['boltz_cache_db']) as _ppe_conn:
+                        for _ppe in _pppppppppp_embs:
+                            try:
+                                _ppe_sm = _ppe.get('smiles', '')
+                                _ppe_b64 = _ppe.get('emb_b64', '')
+                                if not _ppe_sm or not _ppe_b64:
+                                    continue
+                                _ppe_blob = base64.b64decode(_ppe_b64)
+                                if len(_ppe_blob) != 384 * 4:
+                                    continue
+                                _ppe_conn.execute(
+                                    "UPDATE boltz_cache SET boltz_embedding=? "
+                                    "WHERE smiles=? AND protein=? AND boltz_embedding IS NULL",
+                                    (_ppe_blob, _ppe_sm, config.weekly_target),
+                                )
+                                _pppppppppp_n += 1
+                            except Exception:
+                                pass
+                    if _pppppppppp_n:
+                        bt.logging.info(
+                            f"[§PPPPPPPPPP] Imported {_pppppppppp_n} Boltz-2 embedding(s) from "
+                            f"GitHub export — embedding surrogate warm-start enabled."
+                        )
             # §RRRRRR: Import cross-target history regardless of protein match.
             # On fresh container + protein rotation, §WWWWW found nothing (empty SQLite).
             # History entries for prior proteins enable a second §WWWWW pass here so

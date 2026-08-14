@@ -1,12 +1,43 @@
 # Boltz-2 Miner Integration
 
-## Current Status (as of 2026-08-13)
+## Current Status (as of 2026-08-14)
 
-**52 roadmap items implemented.** §OOOOOOOOOOO added 2026-08-13.
+**53 roadmap items implemented.** §PPPPPPPPPP added 2026-08-14.
 
 ---
 
 ## Implemented Optimisations (recent)
+
+### §PPPPPPPPPP — Boltz-2 Embedding Export/Import in GitHub Cache — added 2026-08-14
+
+**Problem:** The embedding-augmented surrogate (§HHHHHHHHHH) concatenates 32D PCA-reduced Boltz-2
+trunk embeddings with 84D physchem+Morgan features for 117D total, and requires ≥20 rows with
+`boltz_embedding IS NOT NULL` before it activates.  The GitHub cache export (§PPPPPP) persisted
+scores, metadata, and miner_state across container restarts but did NOT export the 384D embedding
+blobs stored in the `boltz_embedding` SQLite column.  On container restart, the embedding surrogate
+always cold-started even when the score cache was warm, requiring many new Boltz runs before
+§HHHHHHHHHH became active.
+
+**Fix:** Two-part change:
+- `utils/github.py` `upload_boltz_cache_export()`: query top-20 `(smiles, boltz_embedding)` rows for
+  the current protein, validate shape is `(384,)`, base64-encode each blob, and include them under
+  an `"embeddings"` key in the gzip-compressed export JSON.  ~30 KB raw, ~12 KB gzip — negligible
+  within the 1 MB GitHub Contents API limit.  Backward compatible: old exporters omit the key and
+  old importers ignore it.
+- `neurons/miner.py` startup (after §PPPPPP entry import): read `_pppppp_data['embeddings']`,
+  decode each base64 blob, validate 384×4 byte length, and `UPDATE boltz_cache SET boltz_embedding=?`
+  for rows where the score was already imported but the embedding was missing (uses `IS NULL` guard
+  to avoid overwriting fresh Boltz results).
+
+**Expected benefit:**
+
+| Condition | Before §PPPPPPPPPP | After §PPPPPPPPPP |
+|-----------|--------------------|--------------------|
+| Fresh container, protein unchanged | §HHHHHHHHHH cold-starts (0 embeddings) | §HHHHHHHHHH warm-starts with up to 20 embeddings |
+| Epoch 1 surrogate quality | Ridge-only (84D) until 20+ new Boltz runs | RF+embedding (117D) from epoch 1 if cache was warm |
+| Container restart cost | Must re-run Boltz 20+ times for embedding surrogate | Near-zero: embeddings already in SQLite from import |
+
+---
 
 ### §OOOOOOOOOOO — FBLD Fragment Probe in Cold-Start — added 2026-08-13
 

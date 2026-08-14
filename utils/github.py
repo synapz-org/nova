@@ -142,6 +142,35 @@ def upload_boltz_cache_export(db_path: str, protein: str) -> bool:
         except Exception:
             pass
 
+        # §PPPPPPPPPP: Export top-20 Boltz-2 embedding blobs (384D float32 vectors).
+        # Enables the embedding-augmented surrogate (§HHHHHHHHHH) to warm-start from
+        # epoch 1 on any container restart.  Each vector is 1536 bytes raw; 20 vectors
+        # ≈ 30 KB, ~12 KB after gzip — well within the per-export size budget.
+        # Backward compatible: old downloaders ignore unknown keys gracefully.
+        embeddings = []
+        try:
+            import numpy as _np_emb
+            c.execute(
+                "SELECT smiles, boltz_embedding FROM boltz_cache "
+                "WHERE protein=? AND boltz_embedding IS NOT NULL "
+                "ORDER BY score DESC LIMIT 20",
+                (protein,),
+            )
+            for _esm, _eblob in c.fetchall():
+                if not _eblob:
+                    continue
+                try:
+                    _ea = _np_emb.frombuffer(_eblob, dtype=_np_emb.float32)
+                    if _ea.shape == (384,):
+                        embeddings.append({
+                            "smiles": _esm,
+                            "emb_b64": base64.b64encode(_eblob).decode(),
+                        })
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
         conn.close()
 
         export = {
@@ -150,6 +179,7 @@ def upload_boltz_cache_export(db_path: str, protein: str) -> bool:
             "entries": entries,
             "state": state_out,
             "history": history,
+            "embeddings": embeddings,  # §PPPPPPPPPP
         }
         # §EEEEEEEEEE: gzip-compress JSON before base64 encoding.
         # JSON is highly compressible (~65-75% reduction); 1000 entries compress to
