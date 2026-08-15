@@ -358,7 +358,7 @@ Even a partial result (1 of 5 molecules scored) improves on the PSICHIC-only bas
 
 ## Implementation Roadmap (priority order)
 
-Items 1–52 are **implemented** (§OOOOOOOOOOO added 2026-08-13). Item 5 remains as a conditional direction.
+Items 1–53 are **implemented** (§QQQQQQQQQQ added 2026-08-15). Item 5 remains as a conditional direction.
 
 | Priority | Approach | Effort | Status | Expected gain |
 |----------|----------|--------|--------|---------------|
@@ -414,6 +414,10 @@ Items 1–52 are **implemented** (§OOOOOOOOOOO added 2026-08-13). Item 5 remain
 | 50 | §MMMMMMMMMM: `complex_iplddt` surrogate confidence weight — persist Boltz-2 interface-weighted pLDDT to SQLite and add `max(0.1, iplddt)` down-weight to surrogate training alongside ligand_iptm and confidence_score | ~80 lines | ✅ Done (2026-08-11) | Cleaner surrogate signal; poses with disordered binding interface ≤5× lower training weight |
 | 51 | §NNNNNNNNNNN: Cross-target seeds in cold-start probe — extend §LLLLLLLLLL probe with up to 2 homolog-protein validated molecules; scoring them on the new target creates known-binder calibration points for the surrogate | ~20 lines | ✅ Done (2026-08-12) | +2–4% surrogate NDCG on epoch 1 of family-member protein rotations; anchors high end of score distribution from first probe |
 | 52 | §OOOOOOOOOOO: FBLD fragment probe in cold-start — after main §LLLLLLLLLL probe, score top-3 PSICHIC-scoring molecules with 10–15 HA from savi_stream_pool using a second fast Boltz pass; provides fragment-scale LE calibration data so §OOOOOO correctly sizes the fragment slot quota from epoch 1 | ~80 lines | ✅ Done (2026-08-13) | +1–4% surrogate NDCG from correctly-calibrated fragment quota; +2–6% Boltz LE on epoch 2+ when fragments prove to be the dominant chemical class for the weekly target |
+| 53 | §PPPPPPPPPP: Boltz-2 embedding export/import in GitHub cache — base64-encode top-20 384D embeddings in the gzip-compressed export JSON; import on container restart via UPDATE boltz_cache SET boltz_embedding=? WHERE boltz_embedding IS NULL; §HHHHHHHHHH warm-starts from epoch 1 | ~50 lines | ✅ Done (2026-08-14) | Embedding surrogate active immediately on container restart; +3–8% NDCG on restart sessions vs. cold-embedding start |
+| 54 | §QQQQQQQQQQ: TF32 Tensor Core matmul enable — `torch.set_float32_matmul_precision('high')` replaces `'highest'` in `boltz/src/boltz/main.py`; routes float32 matmul through Tensor Cores on Ampere+ GPUs | 1 line | ✅ Done (2026-08-15) | 20–50% overall inference speedup on A100/H100/RTX 3090+; 1–4 extra §MM rounds per epoch |
+| 55 | §RRRRRRRRRR: BF16 mixed precision on A100/H100 — `precision="bf16-mixed"` in Lightning Trainer (hardware-gated ≥38 GiB); additional ~1.5× forward-pass speedup via AMP | ~20 lines | ⏳ Proposed | Additional 1.3–1.8× speedup on top of §QQQQQQQQQQ; combined 2–3× total vs baseline |
+| 56 | §SSSSSSSSSS: `torch.compile()` graph fusion — JIT-compile model after checkpoint load for 10–20% more speedup via kernel fusion and Python dispatch elimination | ~15 lines | ⏳ Proposed | Best when scoring multiple molecules per predict() call; stacks with §QQQQQQQQQQ + §RRRRRRRRRR |
 
 All approaches share the same submission constraint: molecules must map to valid SAVI-2020
 product names. SALSA and GradientGA both solve this via nearest-neighbour SAVI-2020 lookup.
