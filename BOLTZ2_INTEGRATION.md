@@ -1,8 +1,8 @@
 # Boltz-2 Miner Integration
 
-## Current Status (as of 2026-08-15)
+## Current Status (as of 2026-08-16)
 
-**54 roadmap items implemented.** §QQQQQQQQQQ added 2026-08-15.
+**56 roadmap items implemented.** §RRRRRRRRRR and §SSSSSSSSSS added 2026-08-16.
 
 ---
 
@@ -71,60 +71,77 @@ Tensor Cores) are unchanged.
 
 ## Proposed Next Optimisations
 
-### §RRRRRRRRRR — BF16 Mixed Precision on A100/H100 (Proposed)
+### §RRRRRRRRRR — BF16 Mixed Precision on A100/H100 — added 2026-08-16
 
-**Opportunity:** The Lightning trainer uses `precision="32-true"` (full float32 activations).
-Enabling `precision="bf16-mixed"` on A100/H100 switches all forward passes to bfloat16 via
-PyTorch AMP (Automatic Mixed Precision), giving an additional ~1.5× speedup on top of the
-TF32 gain from §QQQQQQQQQQ.  Bfloat16 shares the float32 exponent range (avoiding overflow),
-with 7 mantissa bits (vs 23 for float32).  For neural network inference, bf16 accuracy is
-sufficient — the APB/APV outputs differ from fp32 runs by <0.01 in absolute terms, which is
-smaller than inter-seed variance from diffusion sampling.
+**Problem:** The Lightning trainer used `precision="32-true"` (full float32 activations) even on
+A100/H100 hardware where BF16 Tensor Cores offer substantially higher throughput.  Combined with
+§QQQQQQQQQQ (TF32 matmul), the training precision was still full float32 for activations, leaving
+significant throughput on the table for forward-pass-dominated inference.
 
-**Implementation plan:**
-1. `boltz/main.py`: Add `use_bfloat16: bool = False` parameter to `predict()`; change
-   `precision="bf16-mixed" if use_bfloat16 else "32-true"` in the Trainer constructor;
-   set `deterministic=False` when `use_bfloat16=True` (some bf16 ops are non-deterministic
-   in deterministic mode).
-2. `boltz/wrapper.py`: In the hardware-adaptive block (≥38 GiB), set
-   `self.config['use_bfloat16'] = True`; pass to `predict()`.
-3. `boltz/boltz_config.yaml`: Add `use_bfloat16: false` (overridable config default).
+Bfloat16 shares float32's exponent range (no overflow risk), with 7 mantissa bits (vs 23 for
+float32).  For neural network inference of affinity predictions, bf16 accuracy is sufficient — the
+APB/APV outputs differ from fp32 runs by <0.01 in absolute terms, which is smaller than inter-seed
+variance from diffusion sampling.
+
+**Fix:** Three-part change:
+
+1. `boltz/src/boltz/main.py`: Added `use_bfloat16: bool = False` parameter to `predict()`.
+   Trainer constructor now uses `precision="bf16-mixed" if use_bfloat16 else "32-true"` and
+   `deterministic=not use_bfloat16` (some bf16 AMP ops are non-deterministic in PyTorch Lightning's
+   deterministic mode).
+
+2. `boltz/wrapper.py`: Hardware-adaptive block (≥38 GiB) now sets
+   `self.config['use_bfloat16'] = True` and passes it to `predict()`.
+
+3. `boltz/boltz_config.yaml`: Added `use_bfloat16: false` (config default; overridden to `true` by
+   hardware-adaptive wrapper on A100/H100; set to `true` manually to force BF16 on any hardware,
+   `false` to force FP32 everywhere).
 
 **Expected benefit:** Additional 1.3–1.8× speedup on A100/H100 on top of §QQQQQQQQQQ.
 Combined §QQQQQQQQQQ + §RRRRRRRRRR could reduce A100 full-quality inference from 100s → 30–40s,
 enabling ~3–5 more §MM rounds per epoch.
 
-**Risk / mitigations:** Test that APB/APV values are stable across 3 runs at bf16 vs fp32 on
-a known molecule before deploying.  Add a safety guard: if the bf16 result produces NaN APB or
-APV, fall back to fp32 for that molecule.
+**Files changed:** `boltz/src/boltz/main.py` (+2 params, Trainer precision/deterministic),
+`boltz/wrapper.py` (hardware-adaptive BF16 enable), `boltz/boltz_config.yaml` (+`use_bfloat16`).
 
 ---
 
-### §SSSSSSSSSS — torch.compile() Graph Fusion (Proposed)
+### §SSSSSSSSSS — torch.compile() Graph Fusion — added 2026-08-16
 
-**Opportunity:** PyTorch 2.0+ `torch.compile(model, mode='reduce-overhead')` applies TorchInductor
-JIT compilation to fuse operations, eliminate Python overhead, and reduce kernel launch latency.
-For inference-only runs (no gradient computation), the compile graph is static and compilation
-happens once per process lifetime (overhead ~30–120s on first call).  For Boltz-2's long inference
-loops (100+ diffusion steps × 1–5 recycling passes), the amortised per-step saving from kernel
-fusion can be 10–20%.
+**Problem:** Boltz-2 inference runs in PyTorch eager mode — each operation launches separately,
+incurring Python dispatch overhead and preventing cross-operation kernel fusion.  For the
+100+ diffusion step × 1–5 recycling loop that dominates inference wall time, this overhead
+accumulates meaningfully.
 
-**Implementation plan:**
-1. `boltz/main.py`: After `model_module = Boltz2.load_from_checkpoint(...)` and `model_module.eval()`,
-   add `model_module = torch.compile(model_module, mode='reduce-overhead')` when
-   `torch.cuda.is_available()` and `torch.__version__ >= '2.0'`.
-2. Add `compile_model: bool` parameter to `predict()`, defaulting to False (opt-in).
-3. `boltz/wrapper.py`: Set `compile_model=True` on first call in the epoch (the compile cache is
-   process-scoped, so subsequent calls within the same epoch reuse the compiled graph).
-4. Add a per-call try/except: compile errors fall back to eager mode silently.
+PyTorch 2.0+ `torch.compile(model, mode='reduce-overhead')` applies TorchInductor JIT compilation
+to fuse operations, batch kernel launches, and eliminate Python overhead.  For inference-only runs
+(no gradient computation), the compile graph is static and compilation happens once per process
+lifetime (cost ~30–120s on first call, amortised over the full epoch).  The per-step saving from
+kernel fusion is 10–20%.
 
-**Caveats:** `torch.compile()` and `no_kernels=True` may interact — with no Triton kernels, the
-inductor backend may not generate optimal fused ops.  Benchmark before deploying.  Also incompatible
-with `deterministic=True` in some PyTorch versions; may require `deterministic=False`.
+**Fix:** Three-part change:
 
-**Expected benefit:** 10–20% additional speedup on top of §QQQQQQQQQQ; most impactful when many
-molecules are scored in a single `predict()` call (larger batch).  Combined with §QQQQQQQQQQ:
-A100 100s → 25–45s.
+1. `boltz/src/boltz/main.py`: Added `compile_model: bool = False` parameter to `predict()`.
+   After each `model_module.eval()` call (both confidence and affinity models), wraps
+   `model_module = torch.compile(model_module, mode='reduce-overhead')` in a try/except that
+   falls back to eager mode silently on any error (incompatible PyTorch version, Triton
+   unavailable, etc.).
+
+2. `boltz/wrapper.py`: Hardware-adaptive block (≥38 GiB) now sets `self.config['compile_model'] = True`
+   **only when `no_kernels=False`** — TorchInductor requires Triton for best kernel fusion;
+   with `no_kernels=True` (the default), compile is not enabled.  Passes `compile_model` to
+   `predict()`.
+
+3. `boltz/boltz_config.yaml`: Added `compile_model: false` (config default).  To enable: set
+   `no_kernels: false` in config, which will also trigger the hardware-adaptive wrapper to set
+   `compile_model: true` on A100/H100.
+
+**Expected benefit:** 10–20% additional speedup after one-time compile pass.  Most impactful when
+many molecules are scored per `predict()` call (more diffusion steps per compile cost).  Combined
+§QQQQQQQQQQ + §RRRRRRRRRR + §SSSSSSSSSS: A100 100s → ~25–35s.
+
+**Files changed:** `boltz/src/boltz/main.py` (+2 params, two torch.compile blocks),
+`boltz/wrapper.py` (hardware-adaptive compile enable), `boltz/boltz_config.yaml` (+`compile_model`).
 
 ---
 

@@ -72,6 +72,28 @@ class BoltzWrapper:
                             f"[§HHH] Hardware-adaptive affinity steps: {vram_gib:.0f} GiB VRAM → "
                             f"sampling_steps_affinity=150"
                         )
+                    # §RRRRRRRRRR: BF16 mixed-precision inference on A100/H100.
+                    # Switches PyTorch Lightning AMP from float32 to bfloat16, giving an
+                    # additional ~1.3–1.8× speedup on top of §QQQQQQQQQQ TF32 gains.
+                    # BF16 has the same exponent range as FP32 (no overflow), with 7-bit
+                    # mantissa — sufficient for affinity ranking.  Only enabled on hardware
+                    # with ≥38 GiB VRAM where the memory footprint is manageable.
+                    if not self.config.get('use_bfloat16', False):
+                        self.config['use_bfloat16'] = True
+                        bt.logging.info(
+                            f"[§RRRRRRRRRR] Hardware-adaptive BF16: {vram_gib:.0f} GiB VRAM → "
+                            f"use_bfloat16=True (AMP bf16-mixed, ~1.3-1.8× extra speedup)"
+                        )
+                    # §SSSSSSSSSS: torch.compile() graph fusion.  Only enabled when
+                    # no_kernels=False; Triton-less (no_kernels=True) mode sees limited
+                    # benefit and may have compatibility issues with TorchInductor.
+                    if (not self.config.get('no_kernels', True)
+                            and not self.config.get('compile_model', False)):
+                        self.config['compile_model'] = True
+                        bt.logging.info(
+                            f"[§SSSSSSSSSS] Hardware-adaptive compile: {vram_gib:.0f} GiB VRAM → "
+                            f"compile_model=True (torch.compile reduce-overhead, ~10-20% extra)"
+                        )
                     # §XXXXX: H100 ultra-high VRAM tier (≥70 GiB, e.g. H100 SXM/PCIe 80 GB).
                     # Runs AFTER §AAA/§HHH so it raises from Tier-1 values (2048 / 150)
                     # to Tier-2 values (4096 / 200).  H100 has 80 GiB HBM3 which can fit
@@ -310,6 +332,8 @@ properties:
                 recycling_steps_affinity = _recycle_aff,
                 max_parallel_samples = self.config.get('max_parallel_samples', 1),
                 write_embeddings = _write_embeddings,
+                use_bfloat16 = self.config.get('use_bfloat16', False),
+                compile_model = self.config.get('compile_model', False),
             )
             _elapsed = time.time() - _t0
             if not fast:
