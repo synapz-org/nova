@@ -6859,3 +6859,82 @@ The bug fix in `boltz/src/boltz/main.py` has zero effect on hardware where `max_
 - `boltz/src/boltz/main.py`: `"max_parallel_samples": 1` → `"max_parallel_samples": max_parallel_samples` in `predict_affinity_args`
 - `boltz/wrapper.py`: §LLLLLL block in `__init__` H100 tier; `max_parallel_samples` kwarg added to `predict()` call
 - `boltz/boltz_config.yaml`: `max_parallel_samples: 1` config key with comment
+
+---
+
+## Proposed Next Optimisations
+
+### §TTTTTTTTTT — Streaming Saturation Redirect to §MM — proposed 2026-08-17
+
+**Problem:** The PSICHIC streaming loop runs continuously until the §MM/§FF Boltz trigger window opens,
+consuming CPU and blocking §MM scheduling.  From epoch 3+ onward — when ≥40 Boltz cache points
+exist — the surrogate blend (§YYYYYY) already guides the streaming pool toward high-scoring chemistry,
+and the pool's top-5 predicted LE typically converges within the first 20–30 streaming chunks.
+Continuing to score 1000–2000 new molecules/chunk for the remaining 30–40 minutes provides
+diminishing returns: the surrogate-blended max rarely improves after convergence because the entire
+visible SAVI-2020 shard has already been explored.
+
+This means the streaming thread is consuming CPU that could instead trigger an earlier §MM round
+or a second §SALSA pass.  §MM is GPU-bound and is scheduled between streaming chunk completions,
+so reducing streaming intensity creates real scheduling headroom.
+
+**Detection:** Track `_stream_peak_blend` (running max of `0.4*psichic + 0.6*surrogate_pred` scores)
+over the last `N_SATUR = 3` consecutive chunks.  If peak doesn't improve by `SATUR_EPS = 1e-4`
+for 3 straight chunks AND the surrogate is active (≥40 training points), declare streaming
+saturated.  Guard: only trigger when ≥20 blocks remain in the epoch (enough time for §MM to run).
+
+**Implementation (neurons/miner.py, ~40 lines):**
+
+```python
+# Constants (module-level)
+_SATUR_CHUNKS = 3       # consecutive stagnant chunks before declaring saturated
+_SATUR_EPS   = 1e-4     # minimum blend-score improvement to reset stagnation counter
+_SATUR_SLEEP = 300      # seconds between low-intensity sampling passes once saturated
+
+# Inside run_psichic_model_loop(), after each chunk:
+if surrogate_active and n_boltz_cache >= 40:
+    chunk_peak = max(blend_scores_this_chunk) if blend_scores_this_chunk else 0.0
+    if chunk_peak > _stream_peak_blend + _SATUR_EPS:
+        _stream_peak_blend = chunk_peak
+        _stagnant_chunks   = 0
+    else:
+        _stagnant_chunks += 1
+
+    if _stagnant_chunks >= _SATUR_CHUNKS:
+        blocks_remaining = target_block - current_block
+        if blocks_remaining >= 20:
+            bt.logging.info(
+                f"[§TTTTTTTTTT] Streaming saturated ({_SATUR_CHUNKS} stagnant chunks). "
+                f"Yielding to §MM; resuming low-intensity scan in {_SATUR_SLEEP}s."
+            )
+            state['stream_saturated'] = True
+            time.sleep(_SATUR_SLEEP)  # frees CPU for §MM thread
+            _stagnant_chunks = 0     # reset — continue at low rate
+```
+
+The `stream_saturated` flag is checked by the §MM scheduler: when `True` and Boltz trigger blocks
+threshold has not yet been reached, the scheduler may fire one additional §MM round from the
+surrogate-pool fallback (§CCCCCCCCCC) without waiting for the next streaming chunk to complete.
+
+**Regression guards:**
+- `surrogate_active` check: epoch 1 (no cache) never saturates → zero regression on cold starts.
+- `blocks_remaining >= 20` guard: prevents saturation redirect when the epoch is nearly over.
+- Low-intensity resume after `_SATUR_SLEEP`: streaming continues at reduced rate so genuinely new
+  molecules (from a freshly shuffled SAVI shard) can still surface after the surrogate-guided peak.
+- `_stagnant_chunks` reset on any improvement: a genuine late-epoch discovery re-activates full
+  streaming immediately.
+
+**Expected benefit:**
+
+| Scenario | Streaming saves | §MM gain |
+|----------|----------------|----------|
+| Warm cache (≥100 pts), convergent target | 20–40 min CPU | +1–3 §MM rounds |
+| Medium cache (40–100 pts), partial conv. | 10–20 min CPU | +1–2 §MM rounds |
+| Epoch 1 / cold cache | 0 (guard blocks) | 0 (no regression) |
+
++1–3 §MM rounds is equivalent to the throughput gain from §QQQQQQQQQQ (TF32) or §RRRRRRRRRR (BF16)
+— but costs zero GPU compute; it is purely a scheduling rebalancing.
+
+**Files to change:** `neurons/miner.py` (~40 lines in `run_psichic_model_loop` and §MM scheduler).
+`config/config.yaml`: optionally expose `stream_satur_chunks: 3` and `stream_satur_eps: 0.0001`.
+
