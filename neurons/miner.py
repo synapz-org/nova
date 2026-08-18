@@ -773,6 +773,15 @@ async def run_psichic_model_loop(state: Dict[str, Any]) -> None:
             and -1.0 <= Descriptors.MolLogP(mol) <= 5.0
         )
 
+    # §TTTTTTTTTT: Streaming saturation detection constants and per-epoch state.
+    # Resets naturally on each epoch: run_psichic_model_loop is cancelled and
+    # restarted by the main loop so these local variables reinitialise.
+    _SATUR_CHUNKS      = 3       # consecutive stagnant chunks before declaring saturated
+    _SATUR_EPS         = 1e-4    # minimum blend-score improvement to reset counter
+    _SATUR_SLEEP       = 300     # seconds of CPU yield once saturated
+    _stream_peak_blend = -math.inf  # running max of per-chunk peak blend score
+    _stagnant_chunks   = 0          # consecutive stagnant chunk counter
+
     while not state['shutdown_event'].is_set():
         try:
             # Create a fresh iterator each outer cycle so that when one streaming
@@ -879,6 +888,13 @@ async def run_psichic_model_loop(state: Dict[str, Any]) -> None:
                             'surrogate_salsa_score', ascending=False
                         ).drop(columns=['surrogate_salsa_score'])
                         df.reset_index(drop=True, inplace=True)
+                        # §TTTTTTTTTT: track per-chunk peak blend score for saturation detection.
+                        _ttttt_peak = float(_yyyyyy_aug['surrogate_salsa_score'].max())
+                        if _ttttt_peak > _stream_peak_blend + _SATUR_EPS:
+                            _stream_peak_blend = _ttttt_peak
+                            _stagnant_chunks = 0
+                        else:
+                            _stagnant_chunks += 1
 
                 # Select top 10 molecules
                 top_molecules = df.iloc[:10]
@@ -965,6 +981,26 @@ async def run_psichic_model_loop(state: Dict[str, Any]) -> None:
                     blocks_until_epoch = next_epoch_block - current_block
 
                     bt.logging.debug(f"Current block: {current_block}, Epoch length: {state['epoch_length']}, Next epoch block: {next_epoch_block}, Blocks until epoch: {blocks_until_epoch}")
+
+                    # §TTTTTTTTTT: Yield CPU when streaming pool has saturated.
+                    # Condition: surrogate active (RF model, ≥100 pts), 3 consecutive
+                    # chunks with no blend-score improvement, and ≥20 blocks remain.
+                    # Sleeping 300 s frees CPU for §MM SALSA hill-climbing.
+                    # _stagnant_chunks resets on any genuine improvement or after sleep.
+                    if (
+                        _stagnant_chunks >= _SATUR_CHUNKS
+                        and _yyyyyy_sds is not None
+                        and blocks_until_epoch >= 20
+                    ):
+                        bt.logging.info(
+                            f"[§TTTTTTTTTT] Streaming saturated ({_SATUR_CHUNKS} stagnant "
+                            f"chunks, blend peak={_stream_peak_blend:.4f}). "
+                            f"Yielding {_SATUR_SLEEP}s CPU to §MM; "
+                            f"{blocks_until_epoch} blocks remain."
+                        )
+                        state['stream_saturated'] = True
+                        await asyncio.sleep(_SATUR_SLEEP)
+                        _stagnant_chunks = 0  # reset — resume at low rate
 
                     # ---------------------------------------------------------------
                     # SALSA trigger: run once per epoch when the stream pool is
@@ -4403,6 +4439,7 @@ async def run_miner(config: argparse.Namespace) -> None:
                 state['ga_run_this_epoch'] = False
                 state['bbb_run_this_epoch'] = False
                 state['jj_probe_done'] = False          # §JJJJJJJJJJ
+                state['stream_saturated'] = False       # §TTTTTTTTTT
                 state['best_ga_smiles'] = None
                 state['best_score'] = float('-inf')
                 state['boltz_prescored'] = False

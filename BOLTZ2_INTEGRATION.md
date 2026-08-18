@@ -6864,7 +6864,7 @@ The bug fix in `boltz/src/boltz/main.py` has zero effect on hardware where `max_
 
 ## Proposed Next Optimisations
 
-### §TTTTTTTTTT — Streaming Saturation Redirect to §MM — proposed 2026-08-17
+### §TTTTTTTTTT — Streaming Saturation Redirect to §MM — implemented 2026-08-18
 
 **Problem:** The PSICHIC streaming loop runs continuously until the §MM/§FF Boltz trigger window opens,
 consuming CPU and blocking §MM scheduling.  From epoch 3+ onward — when ≥40 Boltz cache points
@@ -6935,6 +6935,9 @@ surrogate-pool fallback (§CCCCCCCCCC) without waiting for the next streaming ch
 +1–3 §MM rounds is equivalent to the throughput gain from §QQQQQQQQQQ (TF32) or §RRRRRRRRRR (BF16)
 — but costs zero GPU compute; it is purely a scheduling rebalancing.
 
-**Files to change:** `neurons/miner.py` (~40 lines in `run_psichic_model_loop` and §MM scheduler).
-`config/config.yaml`: optionally expose `stream_satur_chunks: 3` and `stream_satur_eps: 0.0001`.
+**Files changed:** `neurons/miner.py` — saturation constants + local state before while loop;
+blend-score tracking inside `_yyyyyy_sds` block; saturation sleep after `blocks_until_epoch`;
+`state['stream_saturated'] = False` in epoch reset block.
+
+**Status: IMPLEMENTED 2026-08-18.**
 
