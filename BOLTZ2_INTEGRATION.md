@@ -2,7 +2,7 @@
 
 ## Current Status (as of 2026-08-16)
 
-**56 roadmap items implemented.** §RRRRRRRRRR and §SSSSSSSSSS added 2026-08-16.
+**58 roadmap items implemented.** §UUUUUUUUUU (`complex_ipde` surrogate weight) added 2026-08-19.
 
 ---
 
@@ -3520,8 +3520,10 @@ Two conditional/research items remain (§D, FBLD). §TTTT–§SSSS implemented 2
 | MMMMMM | Cross-call SALSA pool fingerprint cache: eliminate redundant `precompute_pool_fps` across §MM rounds | utils/salsa.py | ✅ |
 | NNNNNN | Scaffold-diverse §FF/§MM fast-screen hit selection (top_k 3→5 + diversity filter) | neurons/miner.py | ✅ |
 | QQQQQQQQQQ | TF32 Tensor Core matmul enable: `float32_matmul_precision` 'highest'→'high'; 20–50% inference speedup on A100/H100/RTX 3090+ | boltz/src/boltz/main.py | ✅ |
-| RRRRRRRRRR | BF16 mixed precision on A100/H100: `precision="bf16-mixed"` in trainer; additional 1.3–1.8× speedup | boltz/main.py, boltz/wrapper.py | ⏳ proposed |
-| SSSSSSSSSS | torch.compile() graph fusion: JIT-compile model for 10–20% extra speedup via kernel fusion | boltz/main.py | ⏳ proposed |
+| RRRRRRRRRR | BF16 mixed precision on A100/H100: `precision="bf16-mixed"` in trainer; additional 1.3–1.8× speedup | boltz/main.py, boltz/wrapper.py | ✅ |
+| SSSSSSSSSS | torch.compile() graph fusion: JIT-compile model for 10–20% extra speedup via kernel fusion | boltz/main.py | ✅ |
+| TTTTTTTTTT | Streaming saturation redirect: yield CPU to §MM when RF surrogate detects 3 consecutive stagnant chunks; sleep 300s | neurons/miner.py | ✅ |
+| UUUUUUUUUU | `complex_ipde` surrogate weight: store interface predicted distance error (Å) in SQLite; `/ (1 + 0.3×ipde)` in all 3 surrogate training functions | neurons/miner.py, utils/surrogate.py | ✅ |
 
 ---
 
@@ -6940,4 +6942,78 @@ blend-score tracking inside `_yyyyyy_sds` block; saturation sleep after `blocks_
 `state['stream_saturated'] = False` in epoch reset block.
 
 **Status: IMPLEMENTED 2026-08-18.**
+
+---
+
+## Implemented Optimisations (continued)
+
+### §UUUUUUUUUU — `complex_ipde` Surrogate Confidence Weight — implemented 2026-08-19
+
+**Background:** Boltz-2 writes several per-complex quality metrics to its output JSON. Of these,
+`complex_ipde` (interface predicted distance error, in Ångströms) was parsed by the wrapper but
+never stored in the SQLite cache or used in surrogate training. The metric measures the
+**geometric uncertainty at the binding interface**: it is the mean PDE over interface token-pairs,
+weighted by contact probability, so it captures exactly the uncertainty that matters for the
+Boltz-2 scoring formula (APB − APV).
+
+**Relationship to existing confidence signals:**
+
+| Signal | Type | Range | Already used |
+|--------|------|-------|-------------|
+| `ligand_iptm` | Structure confidence (chain) | 0–1 (↑ = better) | ✅ multiply |
+| `confidence_score` | Overall complex quality | 0–1 (↑ = better) | ✅ multiply |
+| `complex_iplddt` | Interface pLDDT | 0–1 (↑ = better) | ✅ multiply |
+| `boltz_le_std` | Intra-run sample variance | 0+ (↓ = better) | ✅ divide |
+| `boltz_ww_std` | Inter-seed variance | 0+ (↓ = better) | ✅ divide |
+| **`complex_ipde`** | **Interface geometry error (Å)** | **0+ (↓ = better)** | **✅ divide (new)** |
+
+`complex_ipde` and `complex_iplddt` are complementary: high iplddt measures confident atom
+placement; low ipde measures small expected inter-atom displacement errors. They can diverge
+for partially-disordered binding regions where local B-factors look acceptable but inter-residue
+distances are uncertain.
+
+**Weight formula (updated in all 3 surrogate training functions):**
+
+```python
+w = (
+    max(0.1, lig_iptm)         # structural alignment
+    * max(0.1, conf_score)     # overall quality
+    * max(0.1, iplddt)         # interface pLDDT  §MMMMMMMMMM
+    / ((1.0 + 10.0 * le_std)   # intra-run variance §WWWWWWW
+       * (1.0 + 10.0 * ww_std) # inter-seed variance §XXXXXXXX
+       * (1.0 + 0.3 * ipde))   # interface geometry error §UUUUUUUUUU
+)
+```
+
+Scale factor 0.3 is calibrated for typical Boltz-2 interface PDE values (1–5 Å for good
+predictions). At 3.3 Å the weight is halved; at 10 Å it is reduced to 0.25. COALESCE(ipde, 0.0)
+means old cache rows without this column get divisor = 1.0 (no penalty).
+
+**Files changed:**
+
+- `neurons/miner.py`:
+  - Schema: `ALTER TABLE boltz_cache ADD COLUMN complex_ipde REAL`
+  - `_disk_cache_put` signature: add `complex_ipde: Optional[float] = None`
+  - INSERT statement: include `complex_ipde` in column list and values
+  - 7 `_disk_cache_put` call sites: extract `comps.get('complex_ipde')` and pass as kwarg
+
+- `utils/surrogate.py` (all 3 training functions):
+  - `fit_surrogate`: SELECT + unpack + weight formula
+  - `fit_dual_surrogate`: SELECT + unpack + weight formula
+  - `fit_dual_surrogate_emb`: SELECT + unpack + weight formula
+
+**Regression guards:**
+
+- COALESCE(complex_ipde, 0.0) → legacy rows unaffected (divisor = 1.0)
+- `_disk_cache_put` uses keyword argument → all other call-site params unchanged
+- `max(0.05, w)` floor in all weight calculations → no training example is silenced entirely
+
+**Expected benefit:**
+
++1–3% surrogate NDCG on epoch 3+ runs where the cache contains a mix of well-docked and
+poorly-docked poses. The marginal gain over `complex_iplddt` alone is largest when a molecule
+has plausible local B-factors but globally uncertain binding geometry — a failure mode that
+iplddt underestimates but ipde captures directly.
+
+**Status: IMPLEMENTED 2026-08-19.**
 

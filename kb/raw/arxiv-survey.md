@@ -358,7 +358,7 @@ Even a partial result (1 of 5 molecules scored) improves on the PSICHIC-only bas
 
 ## Implementation Roadmap (priority order)
 
-Items 1–56 are **implemented** (§RRRRRRRRRR + §SSSSSSSSSS added 2026-08-16). Item 5 remains as a conditional direction. §TTTTTTTTTT (item 57) is proposed.
+Items 1–57 are **implemented** (§TTTTTTTTTT added 2026-08-18). Item 5 remains as a conditional direction (binding-pocket docking filter, only relevant when `binding_pocket` is set in config). §UUUUUUUUUU (interface PDE surrogate weight) added 2026-08-19.
 
 | Priority | Approach | Effort | Status | Expected gain |
 |----------|----------|--------|--------|---------------|
@@ -418,7 +418,8 @@ Items 1–56 are **implemented** (§RRRRRRRRRR + §SSSSSSSSSS added 2026-08-16).
 | 54 | §QQQQQQQQQQ: TF32 Tensor Core matmul enable — `torch.set_float32_matmul_precision('high')` replaces `'highest'` in `boltz/src/boltz/main.py`; routes float32 matmul through Tensor Cores on Ampere+ GPUs | 1 line | ✅ Done (2026-08-15) | 20–50% overall inference speedup on A100/H100/RTX 3090+; 1–4 extra §MM rounds per epoch |
 | 55 | §RRRRRRRRRR: BF16 mixed precision on A100/H100 — `precision="bf16-mixed"` in Lightning Trainer (hardware-gated ≥38 GiB); additional ~1.5× forward-pass speedup via AMP | ~20 lines | ✅ Done (2026-08-16) | Additional 1.3–1.8× speedup on top of §QQQQQQQQQQ; combined 2–3× total vs baseline |
 | 56 | §SSSSSSSSSS: `torch.compile()` graph fusion — JIT-compile model after checkpoint load for 10–20% more speedup via kernel fusion and Python dispatch elimination | ~15 lines | ✅ Done (2026-08-16) | Best when scoring multiple molecules per predict() call; stacks with §QQQQQQQQQQ + §RRRRRRRRRR |
-| 57 | §TTTTTTTTTT: Streaming saturation redirect — when surrogate (≥40 pts) detects no improvement in top predicted score for 3 consecutive chunks, yield streaming thread to §MM and reduce batch rate to 1 chunk/5 min | ~40 lines | ⏳ Proposed | +1–3 §MM rounds on warm-cache epochs where the PSICHIC pool has converged; zero regression on epoch 1 |
+| 57 | §TTTTTTTTTT: Streaming saturation redirect — when surrogate (≥40 pts) detects no improvement in top predicted score for 3 consecutive chunks, yield streaming thread to §MM and reduce batch rate to 1 chunk/5 min | ~40 lines | ✅ Done (2026-08-18) | +1–3 §MM rounds on warm-cache epochs where the PSICHIC pool has converged; zero regression on epoch 1 |
+| 58 | §UUUUUUUUUU: `complex_ipde` surrogate weight — store Boltz-2 interface predicted distance error (Å) in SQLite cache; add `/ (1 + 0.3 × ipde)` down-weight to all 3 surrogate training functions so uncertain-geometry runs contribute less to RF/Ridge training | ~50 lines | ✅ Done (2026-08-19) | +1–3% surrogate NDCG by filtering noise from geometrically uncertain Boltz runs; stacks with §MMMMMMMMMM (iplddt) and §FFFFFFFFFF (confidence_score) |
 
 All approaches share the same submission constraint: molecules must map to valid SAVI-2020
 product names. SALSA and GradientGA both solve this via nearest-neighbour SAVI-2020 lookup.

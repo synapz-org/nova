@@ -115,6 +115,12 @@ def _init_boltz_cache_db(db_path: str) -> None:
             # Low complex_iplddt → uncertain binding interface → down-weight in
             # surrogate training.  NULL for legacy rows → COALESCE 1.0 (no penalty).
             "ALTER TABLE boltz_cache ADD COLUMN complex_iplddt REAL",
+            # §UUUUUUUUUU: store Boltz-2 interface predicted distance error (Å, lower=better).
+            # complex_ipde weights interface token-pairs by contact probability, directly
+            # measuring binding-pose geometric uncertainty.  High ipde → uncertain interface
+            # → additional surrogate training down-weight via / (1 + 0.3×ipde).
+            # NULL for legacy rows → COALESCE 0.0 → divisor 1.0 → no penalty.
+            "ALTER TABLE boltz_cache ADD COLUMN complex_ipde REAL",
         ):
             try:
                 conn.execute(_col_ddl)
@@ -162,6 +168,7 @@ def _disk_cache_put(
     boltz_embedding: Optional[bytes] = None,
     psichic_le: Optional[float] = None,
     complex_iplddt: Optional[float] = None,
+    complex_ipde: Optional[float] = None,
 ) -> None:
     """Upsert a Boltz score into the persistent cache (silently ignores errors).
 
@@ -181,6 +188,9 @@ def _disk_cache_put(
     §MMMMMMMMMM: complex_iplddt is the interface-weighted pLDDT (0–1, ligand atoms 20×,
     interface residues 10×).  Low complex_iplddt → uncertain binding interface → additional
     surrogate down-weight complementary to confidence_score and ligand_iptm.
+    §UUUUUUUUUU: complex_ipde is the interface predicted distance error (Å, 0+=lower is
+    better).  High ipde → uncertain binding geometry → additional surrogate down-weight
+    via / (1 + 0.3 × ipde).  Complements complex_iplddt (different dimension of uncertainty).
     """
     try:
         with sqlite3.connect(db_path) as conn:
@@ -188,11 +198,11 @@ def _disk_cache_put(
                 "INSERT OR REPLACE INTO boltz_cache "
                 "(smiles, protein, score, product_name, affinity_prob_binary, "
                 "affinity_pred_val, ligand_iptm, boltz_le_std, confidence_score, "
-                "boltz_embedding, psichic_le, complex_iplddt) "
-                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                "boltz_embedding, psichic_le, complex_iplddt, complex_ipde) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (smiles, protein, score, product_name, apb, apv, ligand_iptm,
                  boltz_le_std, confidence_score, boltz_embedding, psichic_le,
-                 complex_iplddt),
+                 complex_iplddt, complex_ipde),
             )
     except Exception:
         pass
@@ -1792,6 +1802,7 @@ async def _run_jj_probe(state: Dict[str, Any], candidate_smiles: str) -> None:
                 _raw = _probe_cands.iloc[i].get('combined_score', 0.0)
                 _psichic_le = float(_raw or 0.0) if isinstance(_raw, (int, float)) else None
             _ci = _comps.get('complex_iplddt')
+            _ci_ipde = _comps.get('complex_ipde')
             _disk_cache_put(
                 db_path, canon, protein, score,
                 product_name=nm or None,
@@ -1801,6 +1812,7 @@ async def _run_jj_probe(state: Dict[str, Any], candidate_smiles: str) -> None:
                 confidence_score=_comps.get('confidence_score'),
                 psichic_le=_psichic_le,
                 complex_iplddt=_ci if isinstance(_ci, (int, float)) else None,  # §MMMMMMMMMM
+                complex_ipde=_ci_ipde if isinstance(_ci_ipde, (int, float)) else None,  # §UUUUUUUUUU
             )
             state.setdefault('boltz_score_cache', {})[(canon, protein)] = score
             n_cached += 1
@@ -1871,6 +1883,7 @@ async def _run_jj_probe(state: Dict[str, Any], candidate_smiles: str) -> None:
                         _fcanon = get_canonical_smiles(_fsm)
                         _fcomps = _frag_comps_by_smi.get(_fsm, {})
                         _fci    = _fcomps.get('complex_iplddt')
+                        _fipde  = _fcomps.get('complex_ipde')
                         _fpsi   = None
                         if _fi < len(_fbld_cands):
                             _fraw = _fbld_cands.iloc[_fi].get('combined_score', 0.0)
@@ -1884,6 +1897,7 @@ async def _run_jj_probe(state: Dict[str, Any], candidate_smiles: str) -> None:
                             confidence_score=_fcomps.get('confidence_score'),
                             psichic_le=_fpsi,
                             complex_iplddt=_fci if isinstance(_fci, (int, float)) else None,
+                            complex_ipde=_fipde if isinstance(_fipde, (int, float)) else None,  # §UUUUUUUUUU
                         )
                         state.setdefault('boltz_score_cache', {})[(_fcanon, protein)] = _fscore
                         _fbld_n_cached += 1
@@ -2251,12 +2265,14 @@ async def run_boltz_prescoring(state: Dict[str, Any], max_candidates: int = 5) -
                     # §WWWWWWW: compute per-sample LE std for additional variance weighting.
                     # §FFFFFFFFFF: also extract confidence_score (overall complex confidence).
                     # §MMMMMMMMMM: also extract complex_iplddt (interface pLDDT).
+                    # §UUUUUUUUUU: also extract complex_ipde (interface distance error).
                     _yyyyy_apb = _comps.get('affinity_probability_binary')
                     _yyyyy_apv = _comps.get('affinity_pred_value')
                     _dddddd_li = _comps.get('ligand_iptm')
                     _wwwwwww_le_std = _compute_le_std(_comps)
                     _fffff_cs = _comps.get('confidence_score')
                     _mmm_ci = _comps.get('complex_iplddt')
+                    _uuu_ipde = _comps.get('complex_ipde')
                     _disk_cache_put(
                         db_path, canon, protein, score, product_name=_pname,
                         apb=_yyyyy_apb if isinstance(_yyyyy_apb, (int, float)) else None,
@@ -2267,6 +2283,7 @@ async def run_boltz_prescoring(state: Dict[str, Any], max_candidates: int = 5) -
                         boltz_embedding=_emb_to_bytes(_comps),
                         psichic_le=_psichic_le_map.get(canon),  # §IIIIIIIIII
                         complex_iplddt=_mmm_ci if isinstance(_mmm_ci, (int, float)) else None,  # §MMMMMMMMMM
+                        complex_ipde=_uuu_ipde if isinstance(_uuu_ipde, (int, float)) else None,  # §UUUUUUUUUU
                     )
 
                     # Adaptive trigger: one molecule gives the most accurate per-mol timing
@@ -2471,6 +2488,7 @@ async def run_boltz_prescoring(state: Dict[str, Any], max_candidates: int = 5) -
                                     _ff_li = _ff_comps.get('ligand_iptm')
                                     _ff_cs = _ff_comps.get('confidence_score')
                                     _ff_ci = _ff_comps.get('complex_iplddt')  # §MMMMMMMMMM
+                                    _ff_ipde = _ff_comps.get('complex_ipde')   # §UUUUUUUUUU
                                     # §IIIIIIIIII: prefer map (PSICHIC candidates), fall back to row (SAVI pool).
                                     _ff_ple = _psichic_le_map.get(_ff_w_canon)
                                     if _ff_ple is None:
@@ -2488,6 +2506,7 @@ async def run_boltz_prescoring(state: Dict[str, Any], max_candidates: int = 5) -
                                         boltz_embedding=_emb_to_bytes(_ff_comps),
                                         psichic_le=_ff_ple,  # §IIIIIIIIII
                                         complex_iplddt=_ff_ci if isinstance(_ff_ci, (int, float)) else None,  # §MMMMMMMMMM
+                                        complex_ipde=_ff_ipde if isinstance(_ff_ipde, (int, float)) else None,  # §UUUUUUUUUU
                                     )
                                     bt.logging.info(
                                         f"§FF §NN full-scored winner: {_ff_w_row.get('product_name', '?')} "
@@ -2758,6 +2777,7 @@ async def run_boltz_prescoring(state: Dict[str, Any], max_candidates: int = 5) -
                             _mm_li = _mm_comps.get('ligand_iptm')
                             _mm_cs = _mm_comps.get('confidence_score')
                             _mm_ci = _mm_comps.get('complex_iplddt')  # §MMMMMMMMMM
+                            _mm_ipde = _mm_comps.get('complex_ipde')   # §UUUUUUUUUU
                             # §IIIIIIIIII: prefer map (PSICHIC candidates), fall back to row (SAVI pool).
                             _mm_ple = _psichic_le_map.get(_mm_w_canon)
                             if _mm_ple is None:
@@ -2775,6 +2795,7 @@ async def run_boltz_prescoring(state: Dict[str, Any], max_candidates: int = 5) -
                                 boltz_embedding=_emb_to_bytes(_mm_comps),
                                 psichic_le=_mm_ple,  # §IIIIIIIIII
                                 complex_iplddt=_mm_ci if isinstance(_mm_ci, (int, float)) else None,  # §MMMMMMMMMM
+                                complex_ipde=_mm_ipde if isinstance(_mm_ipde, (int, float)) else None,  # §UUUUUUUUUU
                             )
                             if wrapper.last_inference_duration > 0:
                                 state['boltz_time_per_mol'] = wrapper.last_inference_duration
@@ -3138,6 +3159,7 @@ async def run_boltz_prescoring(state: Dict[str, Any], max_candidates: int = 5) -
                                             _xx_li = _xx_comps.get('ligand_iptm')
                                             _xx_cs = _xx_comps.get('confidence_score')
                                             _xx_ci = _xx_comps.get('complex_iplddt')  # §MMMMMMMMMM
+                                            _xx_ipde = _xx_comps.get('complex_ipde')  # §UUUUUUUUUU
                                             _disk_cache_put(
                                                 db_path, _xx_w_canon, protein, _xx_w_score,
                                                 product_name=_xx_w_pname or None,
@@ -3157,6 +3179,7 @@ async def run_boltz_prescoring(state: Dict[str, Any], max_candidates: int = 5) -
                                                 boltz_embedding=_emb_to_bytes(_xx_comps),
                                                 psichic_le=None,  # §IIIIIIIIII: tautomer
                                                 complex_iplddt=_xx_ci if isinstance(_xx_ci, (int, float)) else None,  # §MMMMMMMMMM
+                                                complex_ipde=_xx_ipde if isinstance(_xx_ipde, (int, float)) else None,  # §UUUUUUUUUU
                                             )
                                             if wrapper.last_inference_duration > 0:
                                                 state['boltz_time_per_mol'] = (
@@ -3407,6 +3430,7 @@ async def run_boltz_prescoring(state: Dict[str, Any], max_candidates: int = 5) -
                                 _tt_li  = _tt_comps.get('ligand_iptm')
                                 _tt_cs  = _tt_comps.get('confidence_score')
                                 _tt_ci  = _tt_comps.get('complex_iplddt')  # §MMMMMMMMMM
+                                _tt_ipde = _tt_comps.get('complex_ipde')    # §UUUUUUUUUU
                                 _disk_cache_put(
                                     db_path, _tt_w_can, protein, _tt_w_score,
                                     product_name=_tt_w_pname or None,
@@ -3426,6 +3450,7 @@ async def run_boltz_prescoring(state: Dict[str, Any], max_candidates: int = 5) -
                                     boltz_embedding=_emb_to_bytes(_tt_comps),
                                     psichic_le=None,  # §IIIIIIIIII: tautomer
                                     complex_iplddt=_tt_ci if isinstance(_tt_ci, (int, float)) else None,  # §MMMMMMMMMM
+                                    complex_ipde=_tt_ipde if isinstance(_tt_ipde, (int, float)) else None,  # §UUUUUUUUUU
                                 )
                                 if wrapper.last_inference_duration > 0:
                                     state['boltz_time_per_mol'] = (
