@@ -124,10 +124,12 @@ def fit_surrogate(db_path: str, protein: str, min_points: int = 40):
                 # (no additional penalty when the column doesn't exist yet).
                 # §UUUUUUUUUU: COALESCE complex_ipde to 0.0 for pre-§UUUUUUUUUU rows
                 # (0 Å → divisor 1.0 → no penalty for legacy rows).
+                # §VVVVVVVVVV: COALESCE iptm to 1.0 for pre-§VVVVVVVVVV rows
+                # (1.0 → * 1.0 → no penalty for legacy rows without the column).
                 "SELECT smiles, score, COALESCE(ligand_iptm, 1.0), "
                 "COALESCE(boltz_le_std, 0.0), COALESCE(boltz_ww_std, 0.0), "
                 "COALESCE(confidence_score, 1.0), COALESCE(complex_iplddt, 1.0), "
-                "COALESCE(complex_ipde, 0.0) "
+                "COALESCE(complex_ipde, 0.0), COALESCE(iptm, 1.0) "
                 "FROM boltz_cache WHERE protein=?",
                 (protein,),
             ).fetchall()
@@ -152,14 +154,17 @@ def fit_surrogate(db_path: str, protein: str, min_points: int = 40):
     # §UUUUUUUUUU: additionally divide by (1 + 0.3 × complex_ipde) — interface predicted
     # distance error (Å) down-weights poses with uncertain binding geometry; orthogonal
     # to iplddt (error vs confidence are complementary quality signals).
+    # §VVVVVVVVVV: additionally multiply by COALESCE(iptm, 1.0) — overall interface iPTM
+    # captures protein-side binding uncertainty complementary to ligand_iptm.
     X, y, weights = [], [], []
-    for smiles, score, lig_iptm, le_std, ww_std, conf_score, iplddt, ipde in rows:
+    for smiles, score, lig_iptm, le_std, ww_std, conf_score, iplddt, ipde, iptm in rows:
         vec = _descriptor_vector(smiles)
         if vec is not None:
             X.append(vec)
             y.append(float(score))
             w = (
                 max(0.1, float(lig_iptm))
+                * max(0.1, float(iptm))    # §VVVVVVVVVV
                 * max(0.1, float(conf_score))
                 * max(0.1, float(iplddt))  # §MMMMMMMMMM
                 / ((1.0 + 10.0 * float(le_std)) * (1.0 + 10.0 * float(ww_std))
@@ -336,11 +341,12 @@ def fit_dual_surrogate(db_path: str, protein: str, min_points: int = 40):
                 # §IIIIIIIIII: COALESCE psichic_le to 0.0 for legacy rows (neutral prior).
                 # §MMMMMMMMMM: COALESCE complex_iplddt to 1.0 for pre-§MMMMMMMMMM rows.
                 # §UUUUUUUUUU: COALESCE complex_ipde to 0.0 for pre-§UUUUUUUUUU rows.
+                # §VVVVVVVVVV: COALESCE iptm to 1.0 for pre-§VVVVVVVVVV rows.
                 "SELECT smiles, affinity_prob_binary, affinity_pred_val, "
                 "COALESCE(ligand_iptm, 1.0), COALESCE(boltz_le_std, 0.0), "
                 "COALESCE(boltz_ww_std, 0.0), COALESCE(confidence_score, 1.0), "
                 "COALESCE(psichic_le, 0.0), COALESCE(complex_iplddt, 1.0), "
-                "COALESCE(complex_ipde, 0.0) "
+                "COALESCE(complex_ipde, 0.0), COALESCE(iptm, 1.0) "
                 "FROM boltz_cache "
                 "WHERE protein=? "
                 "  AND affinity_prob_binary IS NOT NULL "
@@ -365,8 +371,10 @@ def fit_dual_surrogate(db_path: str, protein: str, min_points: int = 40):
     # poses with poor interface confidence (disordered binding region).
     # §UUUUUUUUUU: additionally divide by (1 + 0.3 × complex_ipde) — interface predicted
     # distance error (Å) provides a complementary geometric uncertainty signal to iplddt.
+    # §VVVVVVVVVV: additionally multiply by iptm — overall interface iPTM captures
+    # protein-side binding uncertainty complementary to ligand_iptm.
     X, y_apb, y_apv, weights = [], [], [], []
-    for smiles, apb, apv, lig_iptm, le_std, ww_std, conf_score, psichic_le, iplddt, ipde in rows:
+    for smiles, apb, apv, lig_iptm, le_std, ww_std, conf_score, psichic_le, iplddt, ipde, iptm in rows:
         vec = _descriptor_vector(smiles)
         if vec is not None:
             X.append(vec + [float(psichic_le)])  # §IIIIIIIIII: 85D total
@@ -374,6 +382,7 @@ def fit_dual_surrogate(db_path: str, protein: str, min_points: int = 40):
             y_apv.append(float(apv))
             w = (
                 max(0.1, float(lig_iptm))
+                * max(0.1, float(iptm))    # §VVVVVVVVVV
                 * max(0.1, float(conf_score))
                 * max(0.1, float(iplddt))  # §MMMMMMMMMM
                 / ((1.0 + 10.0 * float(le_std)) * (1.0 + 10.0 * float(ww_std))
@@ -745,11 +754,12 @@ def fit_dual_surrogate_with_embeddings(db_path: str, protein: str, min_points: i
                 # §IIIIIIIIII: COALESCE psichic_le to 0.0 for legacy rows.
                 # §MMMMMMMMMM: COALESCE complex_iplddt to 1.0 for pre-§MMMMMMMMMM rows.
                 # §UUUUUUUUUU: COALESCE complex_ipde to 0.0 for pre-§UUUUUUUUUU rows.
+                # §VVVVVVVVVV: COALESCE iptm to 1.0 for pre-§VVVVVVVVVV rows.
                 "SELECT smiles, affinity_prob_binary, affinity_pred_val, "
                 "COALESCE(ligand_iptm, 1.0), COALESCE(boltz_le_std, 0.0), "
                 "COALESCE(boltz_ww_std, 0.0), COALESCE(confidence_score, 1.0), "
                 "COALESCE(psichic_le, 0.0), COALESCE(complex_iplddt, 1.0), "
-                "COALESCE(complex_ipde, 0.0) "
+                "COALESCE(complex_ipde, 0.0), COALESCE(iptm, 1.0) "
                 "FROM boltz_cache "
                 "WHERE protein=? "
                 "  AND affinity_prob_binary IS NOT NULL "
@@ -767,9 +777,10 @@ def fit_dual_surrogate_with_embeddings(db_path: str, protein: str, min_points: i
     # alongside the other continuous features before the PCA block.
     # §MMMMMMMMMM: complex_iplddt used as surrogate weight only (not a feature).
     # §UUUUUUUUUU: complex_ipde used as surrogate weight only (not a feature).
+    # §VVVVVVVVVV: iptm used as surrogate weight only (not a feature).
     zeros_emb = [0.0] * _N_EMB_COMPONENTS
     X, y_apb, y_apv, weights = [], [], [], []
-    for smiles, apb, apv, lig_iptm, le_std, ww_std, conf_score, psichic_le, iplddt, ipde in rows:
+    for smiles, apb, apv, lig_iptm, le_std, ww_std, conf_score, psichic_le, iplddt, ipde, iptm in rows:
         vec = _descriptor_vector(smiles)
         if vec is None:
             continue
@@ -782,6 +793,7 @@ def fit_dual_surrogate_with_embeddings(db_path: str, protein: str, min_points: i
         y_apv.append(float(apv))
         w = (
             max(0.1, float(lig_iptm))
+            * max(0.1, float(iptm))    # §VVVVVVVVVV
             * max(0.1, float(conf_score))
             * max(0.1, float(iplddt))  # §MMMMMMMMMM
             / ((1.0 + 10.0 * float(le_std)) * (1.0 + 10.0 * float(ww_std))

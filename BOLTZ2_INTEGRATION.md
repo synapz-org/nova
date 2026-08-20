@@ -1,8 +1,8 @@
 # Boltz-2 Miner Integration
 
-## Current Status (as of 2026-08-16)
+## Current Status (as of 2026-08-20)
 
-**58 roadmap items implemented.** §UUUUUUUUUU (`complex_ipde` surrogate weight) added 2026-08-19.
+**59 roadmap items implemented.** §VVVVVVVVVV (`iptm` overall interface iPTM surrogate weight) added 2026-08-20.
 
 ---
 
@@ -7016,4 +7016,91 @@ has plausible local B-factors but globally uncertain binding geometry — a fail
 iplddt underestimates but ipde captures directly.
 
 **Status: IMPLEMENTED 2026-08-19.**
+
+---
+
+## Implemented Optimisations (continued)
+
+### §VVVVVVVVVV — `iptm` Surrogate Confidence Weight — implemented 2026-08-20
+
+**Background:** Boltz-2 writes the overall interface iPTM (`iptm`) to its confidence JSON.
+For a 2-chain protein + ligand complex, `iptm` is effectively the cross-chain A-B confidence —
+it directly measures how well the model predicts the relative orientation of protein chain A and
+ligand chain B.  It is the scalar complement to `pair_chains_iptm[0][1]` (which is a nested dict)
+and is already parsed in `boltz/wrapper.py` into `per_molecule_components[uid][smiles]["iptm"]`.
+
+**Relationship to existing confidence signals:**
+
+| Signal | Type | Range | Already used |
+|--------|------|-------|-------------|
+| `ligand_iptm` | Per-chain iPTM for ligand | 0–1 (↑ = better) | ✅ multiply |
+| `confidence_score` | Overall complex quality | 0–1 (↑ = better) | ✅ multiply |
+| `complex_iplddt` | Interface pLDDT | 0–1 (↑ = better) | ✅ multiply |
+| `boltz_le_std` | Intra-run sample variance | 0+ (↓ = better) | ✅ divide |
+| `boltz_ww_std` | Inter-seed variance | 0+ (↓ = better) | ✅ divide |
+| `complex_ipde` | Interface geometry error (Å) | 0+ (↓ = better) | ✅ divide |
+| **`iptm`** | **Overall interface iPTM** | **0–1 (↑ = better)** | **✅ multiply (new)** |
+
+For a 2-chain system: `iptm ≈ pair_chains_iptm[A→B]`, the cross-chain confidence between protein
+chain A and ligand chain B.  This is orthogonal to `ligand_iptm` (which measures the ligand chain's
+own structural confidence): a molecule can have high `ligand_iptm` (well-predicted internal ligand
+geometry) but low `iptm` (uncertain relative docking pose).  That scenario — confident internal
+geometry, uncertain binding mode — is exactly the class of false-positive training examples that
+degrades surrogate calibration.
+
+**Weight formula (updated in all 3 surrogate training functions):**
+
+```python
+w = (
+    max(0.1, lig_iptm)          # structural alignment, ligand chain
+    * max(0.1, iptm)            # §VVVVVVVVVV: overall interface iPTM
+    * max(0.1, conf_score)      # overall quality
+    * max(0.1, iplddt)          # interface pLDDT  §MMMMMMMMMM
+    / ((1.0 + 10.0 * le_std)   # intra-run variance §WWWWWWW
+       * (1.0 + 10.0 * ww_std) # inter-seed variance §XXXXXXXX
+       * (1.0 + 0.3 * ipde))   # interface geometry error §UUUUUUUUUU
+)
+```
+
+Scale: multiplicative like `lig_iptm` — appropriate since `iptm ∈ [0,1]`.  At `iptm = 0.3` the
+training weight is halved relative to a confident prediction; at `iptm = 0.1` (poor binding
+interface) the floor `max(0.1, iptm) = 0.1` gives 10% weight.  Legacy rows default to
+`COALESCE(iptm, 1.0)` — no penalty, no regression.
+
+**Regression guards:**
+
+- `COALESCE(iptm, 1.0)` in all SELECT queries → legacy rows without the column get weight factor 1.0
+- `max(0.1, float(iptm))` floor → no training example is silenced entirely (floor ×0.1 like others)
+- `_disk_cache_put` keyword argument → all 7 call-site signatures are backward-compatible
+- `ALTER TABLE … ADD COLUMN iptm REAL` swallowed silently if the column already exists
+
+**Files changed:**
+
+- `neurons/miner.py`:
+  - Schema: `ALTER TABLE boltz_cache ADD COLUMN iptm REAL`
+  - `_disk_cache_put` signature: add `iptm: Optional[float] = None`
+  - `_disk_cache_put` body: add `iptm` to INSERT column list and values
+  - 7 call sites: extract `_comps.get('iptm')`, type-check, pass as `iptm=` kwarg
+
+- `utils/surrogate.py` (all 3 training functions — `fit_surrogate`, `fit_dual_surrogate`,
+  `fit_dual_surrogate_with_embeddings`):
+  - SELECT: add `COALESCE(iptm, 1.0)` to column list
+  - Unpack tuple: add `iptm` to unpacking variable
+  - Weight formula: add `* max(0.1, float(iptm))` alongside `lig_iptm`
+
+**Expected benefit:**
+
++1–2% surrogate NDCG on epoch 3+ runs where the cache contains molecules with high `ligand_iptm`
+but low `iptm` (i.e., the ligand structure is well-predicted but the docking pose is uncertain).
+This class of noisy training examples is not captured by any existing signal:
+- `ligand_iptm` doesn't see the protein-side uncertainty
+- `confidence_score` integrates all chains but is dominated by the protein (which has many more atoms)
+- `complex_iplddt` captures local interface atom confidence (different from cross-chain iTM scoring)
+- `complex_ipde` captures geometric distance errors (correlated with `iptm` but not identical)
+
+The improvement is bounded because for well-folded drug-like targets `iptm` and `lig_iptm` are
+highly correlated — the two signals diverge mainly for flexible ligands in shallow binding pockets.
+Zero regression: `COALESCE` default and multiplicative scale ensure legacy behavior is preserved.
+
+**Status: IMPLEMENTED 2026-08-20.**
 

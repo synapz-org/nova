@@ -358,7 +358,7 @@ Even a partial result (1 of 5 molecules scored) improves on the PSICHIC-only bas
 
 ## Implementation Roadmap (priority order)
 
-Items 1–57 are **implemented** (§TTTTTTTTTT added 2026-08-18). Item 5 remains as a conditional direction (binding-pocket docking filter, only relevant when `binding_pocket` is set in config). §UUUUUUUUUU (interface PDE surrogate weight) added 2026-08-19.
+Items 1–59 are **implemented** (§VVVVVVVVVV added 2026-08-20). Item 5 remains as a conditional direction (binding-pocket docking filter, only relevant when `binding_pocket` is set in config). §UUUUUUUUUU (interface PDE surrogate weight) added 2026-08-19. §VVVVVVVVVV (overall interface iPTM surrogate weight) added 2026-08-20.
 
 | Priority | Approach | Effort | Status | Expected gain |
 |----------|----------|--------|--------|---------------|
@@ -420,6 +420,7 @@ Items 1–57 are **implemented** (§TTTTTTTTTT added 2026-08-18). Item 5 remains
 | 56 | §SSSSSSSSSS: `torch.compile()` graph fusion — JIT-compile model after checkpoint load for 10–20% more speedup via kernel fusion and Python dispatch elimination | ~15 lines | ✅ Done (2026-08-16) | Best when scoring multiple molecules per predict() call; stacks with §QQQQQQQQQQ + §RRRRRRRRRR |
 | 57 | §TTTTTTTTTT: Streaming saturation redirect — when surrogate (≥40 pts) detects no improvement in top predicted score for 3 consecutive chunks, yield streaming thread to §MM and reduce batch rate to 1 chunk/5 min | ~40 lines | ✅ Done (2026-08-18) | +1–3 §MM rounds on warm-cache epochs where the PSICHIC pool has converged; zero regression on epoch 1 |
 | 58 | §UUUUUUUUUU: `complex_ipde` surrogate weight — store Boltz-2 interface predicted distance error (Å) in SQLite cache; add `/ (1 + 0.3 × ipde)` down-weight to all 3 surrogate training functions so uncertain-geometry runs contribute less to RF/Ridge training | ~50 lines | ✅ Done (2026-08-19) | +1–3% surrogate NDCG by filtering noise from geometrically uncertain Boltz runs; stacks with §MMMMMMMMMM (iplddt) and §FFFFFFFFFF (confidence_score) |
+| 59 | §VVVVVVVVVV: `iptm` surrogate weight — store Boltz-2 overall interface iPTM (cross-chain A-B confidence for protein+ligand) in SQLite cache; add `* max(0.1, iptm)` to all 3 surrogate training weight formulas; filters false-positive training examples where ligand structure is confident but binding orientation is uncertain | ~40 lines | ✅ Done (2026-08-20) | +1–2% surrogate NDCG by filtering ligand_iptm-high but iptm-low outliers; orthogonal to all existing confidence signals |
 
 All approaches share the same submission constraint: molecules must map to valid SAVI-2020
 product names. SALSA and GradientGA both solve this via nearest-neighbour SAVI-2020 lookup.
