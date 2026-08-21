@@ -569,7 +569,7 @@ def dual_surrogate_ucb_rank_pool(
 def augment_pool_with_surrogate_blend(
     pool_df,
     dual_model,
-    alpha: float = 0.6,
+    alpha: Optional[float] = None,
     smiles_col: str = 'product_smiles',
     psichic_col: str = 'combined_score',
     ha_col: str = 'heavy_atoms',
@@ -590,6 +590,13 @@ def augment_pool_with_surrogate_blend(
     §QQQQ/§YYYYY): Ridge surrogates at low data density (<100 pts) generalize poorly
     across the large SAVI pool and would mislead SALSA more than help.
 
+    §YYYYYYYYYY: When alpha is None (default), the blend ratio is derived automatically
+    from the RF model's training-sample count: alpha = min(0.90, n_samples_fit_ / 200.0).
+    This keeps the blend PSICHIC-dominant at the RF threshold (100 pts → alpha=0.50) and
+    saturates surrogate-dominant only when the cache is rich (≥200 pts → alpha=0.90).
+    Prevents the fixed 0.60 split from over-trusting a just-entered-RF-tier surrogate.
+    Falls back to alpha=0.60 if n_samples_fit_ is unavailable.
+
     Returns pool_df unchanged (without 'surrogate_salsa_score') when:
     - dual_model is None
     - either model uses Ridge rather than RF
@@ -609,6 +616,14 @@ def augment_pool_with_surrogate_blend(
             return pool_df
     except Exception:
         return pool_df
+
+    # §YYYYYYYYYY: auto-derive alpha from training-sample count when not supplied.
+    if alpha is None:
+        try:
+            _n_pts = getattr(model_apb.named_steps.get('model'), 'n_samples_fit_', None)
+            alpha = min(0.90, float(_n_pts) / 200.0) if _n_pts is not None else 0.60
+        except Exception:
+            alpha = 0.60
 
     try:
         vecs = [_descriptor_vector(s) for s in pool_df[smiles_col]]

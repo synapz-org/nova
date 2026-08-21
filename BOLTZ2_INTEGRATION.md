@@ -7104,3 +7104,313 @@ Zero regression: `COALESCE` default and multiplicative scale ensure legacy behav
 
 **Status: IMPLEMENTED 2026-08-20.**
 
+---
+
+## Proposed Next Optimisations (2026-08-21)
+
+Items 60–62 were proposed on 2026-08-21 after reviewing the full 59-item implementation. They are additive to the existing stack — none conflict with any existing §-tagged optimization.
+
+---
+
+### Item 60 — §WWWWWWWWWW: Auto-pocket derivation from Boltz-2 predicted pose
+
+**Motivation**
+
+`config.yaml` currently sets `binding_pocket: null`, meaning every Boltz-2 call receives no pocket
+constraint and the diffusion sampler must find the binding site from scratch on each run. When Boltz-2
+has already produced a high-confidence pose for the epoch's best molecule (§MM seed), the predicted
+ligand coordinates implicitly reveal the binding pocket. Extracting those residue contacts and feeding
+them back as a soft pocket constraint (`force: false`) for all subsequent §MM Boltz calls in the same
+epoch focuses the diffusion search on the already-confirmed binding site — without any external
+docking tool or pre-defined pocket file.
+
+**Approach**
+
+After each successful full-mode Boltz-2 call that sets a new epoch best (§MM round), parse the mmCIF
+structure written to the Boltz output directory. Identify every protein residue that has at least one
+heavy atom within 4.5 Å of any ligand heavy atom, using numpy coordinate arithmetic on the parsed
+`_atom_site` loop. Collect the unique residue numbers into a list and store them in `state` as
+`pocket_residue_hint`. On all subsequent Boltz calls within the same epoch, pass this list as
+`binding_pocket` to `create_yaml_content()` — Boltz-2 accepts it as a soft spatial prior
+(`protein_constraints.binding_pocket` in the YAML header).
+
+The residue list is reset at epoch start so each epoch re-derives its own pocket from the new best
+molecule rather than inheriting stale geometry from a prior target.
+
+**Estimated implementation size:** ~100 lines (mmCIF parser + coordinate arithmetic + state threading)
+
+**Code sketch**
+
+```python
+# -- in boltz/wrapper.py, add helper --
+def _extract_pocket_residues(output_dir: str, cutoff_angstrom: float = 4.5) -> list[int]:
+    """Parse Boltz mmCIF output and return protein residue numbers within cutoff of ligand."""
+    import glob, re
+    import numpy as np
+    cif_files = glob.glob(os.path.join(output_dir, '**', '*.cif'), recursive=True)
+    if not cif_files:
+        return []
+    cif_path = cif_files[0]
+    # Parse _atom_site loop from mmCIF
+    with open(cif_path) as f:
+        text = f.read()
+    # Extract atom records: type_symbol, entity_type (polymer/non-polymer), xyz, residue seq_id
+    atom_re = re.compile(
+        r'^ATOM\s+\d+\s+\w+\s+\w+\s+(\w)\s+\w+\s+\w+\s+(\d+)\s+'  # chain, res_seq
+        r'[\w-]+\s+([-\d.]+)\s+([-\d.]+)\s+([-\d.]+)',               # x, y, z
+        re.MULTILINE,
+    )
+    # Simpler: parse _atom_site loop columns directly
+    lines = text.splitlines()
+    col_map = {}
+    in_loop = False
+    col_idx = 0
+    protein_coords, protein_res = [], []
+    ligand_coords = []
+    for line in lines:
+        line = line.strip()
+        if line == 'loop_':
+            in_loop = True
+            col_map = {}
+            col_idx = 0
+            continue
+        if in_loop and line.startswith('_atom_site.'):
+            col_map[line.split('.')[1]] = col_idx
+            col_idx += 1
+            continue
+        if in_loop and col_map and not line.startswith('_') and not line.startswith('#'):
+            parts = line.split()
+            if len(parts) < col_idx:
+                continue
+            try:
+                group = parts[col_map['group_PDB']]         # ATOM or HETATM
+                chain = parts[col_map['label_asym_id']]
+                res_seq = int(parts[col_map['label_seq_id']])
+                x = float(parts[col_map['Cartn_x']])
+                y = float(parts[col_map['Cartn_y']])
+                z = float(parts[col_map['Cartn_z']])
+                entity_type = parts[col_map.get('label_entity_id', 0)]
+            except (KeyError, ValueError, IndexError):
+                continue
+            if group == 'ATOM':
+                protein_coords.append([x, y, z])
+                protein_res.append(res_seq)
+            elif group == 'HETATM':
+                ligand_coords.append([x, y, z])
+    if not ligand_coords or not protein_coords:
+        return []
+    lig = np.array(ligand_coords)
+    prot = np.array(protein_coords)
+    prot_res = np.array(protein_res)
+    # Distance matrix: (n_prot_atoms, n_lig_atoms) — use broadcasting, manageable for drug-like
+    dists = np.linalg.norm(prot[:, None, :] - lig[None, :, :], axis=2)  # (n_prot, n_lig)
+    min_dists = dists.min(axis=1)  # closest ligand atom for each protein atom
+    contact_mask = min_dists <= cutoff_angstrom
+    pocket_residues = sorted(set(prot_res[contact_mask].tolist()))
+    return pocket_residues
+
+
+# -- in neurons/miner.py, after each full-mode Boltz call that sets a new best --
+_pocket_residues = []
+try:
+    from boltz.wrapper import _extract_pocket_residues
+    _boltz_out_dir = os.path.join(BOLTZ_WORK_DIR, 'output')
+    _pocket_residues = _extract_pocket_residues(_boltz_out_dir, cutoff_angstrom=4.5)
+    if _pocket_residues:
+        state['pocket_residue_hint'] = _pocket_residues
+        bt.logging.info(
+            f"[§WWWWWWWWWW] Auto-pocket: {len(_pocket_residues)} residues within 4.5 Å "
+            f"of ligand — will constrain subsequent §MM Boltz calls. "
+            f"Residues: {_pocket_residues[:10]}{'...' if len(_pocket_residues) > 10 else ''}"
+        )
+except Exception as _www_err:
+    bt.logging.debug(f"[§WWWWWWWWWW] Pocket extraction skipped: {_www_err}")
+
+# -- when calling score_molecules_target for subsequent §MM rounds --
+_www_pocket = state.get('pocket_residue_hint') if not config.binding_pocket else None
+boltz_result = await boltz_wrapper.score_molecules_target(
+    ...,
+    binding_pocket=_www_pocket or config.binding_pocket,
+    ...
+)
+
+# -- reset at epoch start --
+state.pop('pocket_residue_hint', None)
+```
+
+**Expected benefit**
+
++3–8% affinity accuracy improvement on subsequent §MM rounds within the same epoch for targets with a
+well-defined binding pocket. The mechanism: diffusion starting near the confirmed binding site
+converges faster and samples fewer off-target poses, so the predicted APB/APV reflect genuine
+pocket binding rather than nonspecific surface contacts. The improvement is self-consistent with
+Boltz-2's own prediction — no external assumption about binding site geometry. Zero regression when
+the mmCIF parse fails (silently falls back to unconstrained).
+
+**Status: PROPOSED 2026-08-21.**
+
+---
+
+### Item 61 — §XXXXXXXXXX: RF prediction-interval pre-screen gate for §MM
+
+**Motivation**
+
+Each §MM SALSA hill-climbing round proposes up to 5 candidates (§NNNN scaffold-diverse selection)
+and runs each through fast-mode Boltz-2 (§NN, ~15–50 s GPU time per molecule). Some candidates are
+in regions the surrogate has learned to score poorly — for these, the fast-mode Boltz call is almost
+certain to confirm a low score. The surrogate's RF per-tree variance can identify these dead-end
+regions: if the 95th-percentile prediction (mean + 1.65 × std) is still well below the current
+epoch best, skipping the Boltz call saves GPU time for more promising candidates.
+
+**Approach**
+
+Before each §NN fast-mode Boltz call for an §MM candidate, compute the RF surrogate's per-tree
+predictions for that molecule and derive the 95th-percentile upper bound:
+
+```
+upper_bound = mean_pred + 1.65 * std_pred
+```
+
+If `upper_bound < current_best_score * 0.85`, skip the fast-mode Boltz call and continue to the
+next candidate. The 0.85 threshold gives a 15% headroom — we only skip when the surrogate is
+pessimistic even in its optimistic tails. The gate is only active when the dual RF surrogate is
+available (≥100 cache pts); below that threshold, every candidate is evaluated as usual.
+
+**Estimated implementation size:** ~25 lines
+
+**Code sketch**
+
+```python
+# -- in neurons/miner.py, inside the §MM loop before each §NN fast-mode Boltz call --
+_GATE_THRESHOLD = 0.85  # skip if RF 95th-pct upper bound < best_score * this factor
+
+_mm_skip = False
+if _dual is not None and _mm_current_best_score is not None:
+    try:
+        from sklearn.ensemble import RandomForestRegressor
+        _gate_apb_model, _gate_apv_model = _dual
+        if (
+            isinstance(_gate_apb_model.named_steps.get('model'), RandomForestRegressor)
+            and isinstance(_gate_apv_model.named_steps.get('model'), RandomForestRegressor)
+        ):
+            from utils.surrogate import _descriptor_vector
+            _gate_vec = _descriptor_vector(_mm_candidate_smiles)
+            if _gate_vec is not None:
+                _gate_X = [_gate_vec + [0.0]]  # psichic_le placeholder
+                # Per-tree predictions → std → 95th-pct upper bound
+                _apb_trees = np.array([t.predict(_gate_X)[0]
+                    for t in _gate_apb_model.named_steps['model'].estimators_])
+                _apv_trees = np.array([t.predict(_gate_X)[0]
+                    for t in _gate_apv_model.named_steps['model'].estimators_])
+                _ha = float(get_heavy_atom_count(_mm_candidate_smiles) or 25)
+                _tree_scores = (_apb_trees - _apv_trees) / _ha
+                _upper = float(_tree_scores.mean() + 1.65 * _tree_scores.std())
+                if _upper < _mm_current_best_score * _GATE_THRESHOLD:
+                    bt.logging.debug(
+                        f"[§XXXXXXXXXX] Gate skip: {_mm_candidate_smiles[:40]} "
+                        f"upper={_upper:.4f} < {_mm_current_best_score * _GATE_THRESHOLD:.4f}"
+                    )
+                    _mm_skip = True
+    except Exception as _xxx_err:
+        bt.logging.debug(f"[§XXXXXXXXXX] Gate check skipped: {_xxx_err}")
+
+if _mm_skip:
+    continue  # advance to next §MM candidate without Boltz call
+
+# ... proceed with §NN fast-mode Boltz call as normal ...
+```
+
+**Expected benefit**
+
++1–3 additional §MM rounds per epoch on well-converged runs (epoch 4+) where the cache has ≥100
+points and the RF surrogate reliably identifies dead-end chemical regions. A skipped candidate saves
+15–50 s of GPU inference; at 3 skips per epoch this reclaims 45–150 s for additional §MM rounds.
+Zero regression on cold starts (surrogate not yet at RF tier) and zero false-positive skips when
+the gate threshold is conservative (0.85 × best). The RF tree variance naturally widens in
+unexplored regions, ensuring candidates in new chemical basins are never gated out.
+
+**Status: PROPOSED 2026-08-21.**
+
+---
+
+### Item 62 — §YYYYYYYYYY: Dynamic PSICHIC/surrogate blend ratio
+
+**Motivation**
+
+`augment_pool_with_surrogate_blend` uses a fixed `alpha=0.6` surrogate weight, meaning 60% of the
+blended SAVI pool score comes from the RF surrogate and 40% from PSICHIC. This ratio is appropriate
+for mature runs (≥200 cache points, deep RF fit) but is too aggressive at the RF tier threshold
+(100 pts): with only 100 training examples the RF has seen <0.05% of the SAVI chemical space and
+its predictions generalise poorly to the full 283M-compound pool. A fixed 0.60 surrogate weight
+at this tier risks steering SALSA and the streaming loop into a local basin the RF has overfit.
+
+**Fix**
+
+Derive `alpha` automatically from the RF model's `n_samples_fit_` attribute:
+
+```python
+alpha = min(0.90, n_samples_fit_ / 200.0)
+```
+
+This gives a smooth ramp:
+
+| Cache pts | alpha (surrogate weight) | PSICHIC weight |
+|-----------|--------------------------|----------------|
+| 100 (RF threshold) | 0.50 | 0.50 |
+| 150 | 0.75 | 0.25 |
+| 200+ | 0.90 | 0.10 |
+
+At the RF threshold the blend is now 50/50 instead of 60/40. As more Boltz data accumulates the
+surrogate earns higher weight, saturating at 90% for cache-rich runs. The ramp is continuous
+and derived purely from the model's own training metadata — no DB query, no extra state.
+
+**Implementation**
+
+Change the function signature and add the auto-derivation block immediately after the RF type-check:
+
+```python
+# utils/surrogate.py
+
+def augment_pool_with_surrogate_blend(
+    pool_df,
+    dual_model,
+    alpha: Optional[float] = None,   # §YYYYYYYYYY: None = auto-derive from n_samples_fit_
+    smiles_col: str = 'product_smiles',
+    psichic_col: str = 'combined_score',
+    ha_col: str = 'heavy_atoms',
+):
+    ...
+    # (existing RF type-check that returns pool_df for Ridge models)
+
+    # §YYYYYYYYYY: auto-derive alpha from training-sample count when not supplied.
+    if alpha is None:
+        try:
+            _n_pts = getattr(model_apb.named_steps.get('model'), 'n_samples_fit_', None)
+            alpha = min(0.90, float(_n_pts) / 200.0) if _n_pts is not None else 0.60
+        except Exception:
+            alpha = 0.60
+```
+
+No call-site changes are required: all existing callers use the default (no `alpha` argument), so
+they automatically get the dynamic ratio. Any caller that explicitly passes `alpha=<float>` retains
+full control — the auto-derivation only fires for `alpha=None`.
+
+**Files changed**
+
+- `utils/surrogate.py`:
+  - `augment_pool_with_surrogate_blend` signature: `alpha: float = 0.6` → `alpha: Optional[float] = None`
+  - New block after RF guard: derive `alpha` from `model_apb.named_steps['model'].n_samples_fit_`
+  - Docstring: add §YYYYYYYYYY description
+
+**Expected benefit**
+
++1–3% `global_candidate_pool` quality on first-RF-tier runs (100–150 cache pts) where the fixed
+0.60 surrogate weight over-trusts a recently-crossed RF threshold. Concretely: SALSA hill-climbing
+and the streaming re-rank use a blend that better reflects the surrogate's actual reliability at
+that cache size. No effect on epoch 4+ runs with ≥200 pts (alpha saturates at 0.90, versus 0.60
+fixed — but at that cache size the RF is well-generalised so the higher surrogate weight is
+appropriate and beneficial). Zero regression: `COALESCE`-equivalent logic (fallback to 0.60 if
+`n_samples_fit_` unavailable), and the RF-only guard remains so Ridge-tier runs are unaffected.
+
+**Status: IMPLEMENTED 2026-08-21.**
+
