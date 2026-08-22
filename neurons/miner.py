@@ -1558,32 +1558,56 @@ async def submit_response(state: Dict[str, Any]) -> None:
 # 6. BOLTZ-2 PRE-SCORING
 # ----------------------------------------------------------------------------
 
-def _salsa_operator_weights(seed_smiles: str) -> dict | None:
+def _salsa_operator_weights(seed_smiles: str, bandit_wins: dict | None = None) -> dict | None:
     """
     §ZZZZZ: Return SALSA operator weights biased by the seed molecule's HA count.
+    §OOOO:  Blends in bandit weights from historical §MM operator improvement tracking.
 
     The Boltz scoring formula divides by heavy_atom_count, so shrinking the
     seed molecule directly improves the score floor.  When the seed is large
     (>25 HA) we favour terminal_remove; when it is small (<15 HA) we favour
     fg_add to grow toward the sweet-spot ligand-efficiency range.  The middle
-    range gets equal weights (None → generate_perturbations default).
+    range gets equal weights.
+
+    §OOOO adds a multiplicative bandit bonus on top of §ZZZZZ HA-adaptive weights.
+    Each operator's weight is multiplied by (1 + win_fraction) where win_fraction
+    is how many §MM improvements that operator contributed / total §MM improvements.
+    A dominant operator gets up to 2× its base weight; others keep their base.
+    When no §MM improvements have been recorded yet (bandit_wins all zero or None),
+    behaviour is identical to the pre-§OOOO baseline.
     """
     try:
         from rdkit import Chem
         mol = Chem.MolFromSmiles(seed_smiles)
         if mol is None:
-            return None
-        ha = mol.GetNumHeavyAtoms()
+            ha = None
+        else:
+            ha = mol.GetNumHeavyAtoms()
     except Exception:
-        return None
+        ha = None
 
-    if ha > 25:
-        # Seed is large — bias toward shrinking (terminal_remove 50% budget)
-        return {'bioisostere': 1.0, 'fg_add': 0.5, 'terminal_remove': 2.5, 'ring_walk': 0.5}
-    if ha < 15:
-        # Seed is small — bias toward growing (fg_add 44% budget)
-        return {'bioisostere': 1.0, 'fg_add': 2.0, 'terminal_remove': 0.5, 'ring_walk': 1.0}
-    return None  # 15 ≤ ha ≤ 25: equal weights
+    # §ZZZZZ: HA-adaptive base weights
+    if ha is not None and ha > 25:
+        w: dict | None = {'bioisostere': 1.0, 'fg_add': 0.5, 'terminal_remove': 2.5, 'ring_walk': 0.5}
+    elif ha is not None and ha < 15:
+        w = {'bioisostere': 1.0, 'fg_add': 2.0, 'terminal_remove': 0.5, 'ring_walk': 1.0}
+    else:
+        w = None  # 15 ≤ ha ≤ 25: equal weights (generate_perturbations default)
+
+    # §OOOO: blend bandit weights when any operator has recorded §MM improvements
+    if bandit_wins:
+        _total = sum(bandit_wins.values())
+        if _total > 0:
+            if w is None:
+                w = {'bioisostere': 1.0, 'fg_add': 1.0, 'terminal_remove': 1.0, 'ring_walk': 1.0}
+            for _op in w:
+                _frac = bandit_wins.get(_op, 0) / _total
+                w[_op] *= 1.0 + _frac  # range: 1× (0 wins) → 2× (all wins)
+            bt.logging.debug(
+                f"[§OOOO] Bandit-blended operator weights: {w} (wins={bandit_wins})"
+            )
+
+    return w
 
 
 def _scaffold_diverse_candidates(
@@ -2670,6 +2694,7 @@ async def run_boltz_prescoring(state: Dict[str, Any], max_candidates: int = 5) -
                 break
 
             # SALSA from current best Boltz seed
+            _mm_op_tags: dict = {}  # §OOOO: {product_name: operator} populated by run_salsa_search
             try:
                 _mm_salsa_hits = await asyncio.to_thread(
                     run_salsa_search,
@@ -2681,7 +2706,8 @@ async def run_boltz_prescoring(state: Dict[str, Any], max_candidates: int = 5) -
                     _hhhhhh_score_col,  # §HHHHHH: surrogate-blended or 'combined_score' fallback
                     'product_smiles',
                     'product_name',
-                    _salsa_operator_weights(_mm_seed_smiles),  # §ZZZZZ
+                    _salsa_operator_weights(_mm_seed_smiles, state.get('salsa_operator_wins')),  # §ZZZZZ + §OOOO
+                    _mm_op_tags,  # §OOOO: out_operator_tags
                 )
                 # §NNNN: scaffold-diverse selection — each §MM fast-screen slot tests
                 # a different chemical family, maximising coverage per GPU budget.
@@ -2874,6 +2900,16 @@ async def run_boltz_prescoring(state: Dict[str, Any], max_candidates: int = 5) -
                             f"§MM §NN: new best: {_mm_pname} "
                             f"(boltz={_mm_score:.4f} > prev={_mm_best_score:.4f})"
                         )
+                        # §OOOO: credit the operator that discovered the winning SALSA hit.
+                        _oooo_wins = state.get('salsa_operator_wins')
+                        if _oooo_wins is not None:
+                            _oooo_op = _mm_op_tags.get(_mm_pname)
+                            if _oooo_op in _oooo_wins:
+                                _oooo_wins[_oooo_op] += 1
+                                bt.logging.debug(
+                                    f"[§OOOO] Operator '{_oooo_op}' credited "
+                                    f"(wins={_oooo_wins})"
+                                )
                     _mm_improved = True
 
             # Expose §MM scores to §CC so the warm-start guard sees the full epoch best
@@ -4039,6 +4075,7 @@ async def run_miner(config: argparse.Namespace) -> None:
         'ga_run_this_epoch': False,      # prevent duplicate GradientGA runs per epoch
         'bbb_run_this_epoch': False,     # §BBB: prevent duplicate post-GA SALSA runs per epoch
         'jj_probe_done': False,          # §JJJJJJJJJJ: cold-start probe flag
+        'salsa_operator_wins': {'bioisostere': 0, 'fg_add': 0, 'terminal_remove': 0, 'ring_walk': 0},  # §OOOO
         'best_ga_smiles': None,          # §BBB: best SMILES found by GradientGA this epoch
         'chembl_seeds': [],              # §SS: ChEMBL known actives, fetched at startup
         'startup_dual_surrogate': None,  # §YYYYYY: dual RF surrogate fitted at startup from GitHub cache
@@ -4491,6 +4528,7 @@ async def run_miner(config: argparse.Namespace) -> None:
                 state['ga_run_this_epoch'] = False
                 state['bbb_run_this_epoch'] = False
                 state['jj_probe_done'] = False          # §JJJJJJJJJJ
+                state['salsa_operator_wins'] = {'bioisostere': 0, 'fg_add': 0, 'terminal_remove': 0, 'ring_walk': 0}  # §OOOO
                 state['stream_saturated'] = False       # §TTTTTTTTTT
                 state['best_ga_smiles'] = None
                 state['best_score'] = float('-inf')

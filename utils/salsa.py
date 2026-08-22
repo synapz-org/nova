@@ -135,7 +135,8 @@ def generate_perturbations(
     smiles: str,
     n_max: int = 100,
     operator_weights: Optional[dict] = None,
-) -> List[str]:
+    return_tags: bool = False,
+) -> List:
     """
     Generate up to n_max unique canonical SMILES variants of *smiles* via
     four complementary operators:
@@ -169,7 +170,12 @@ def generate_perturbations(
         molecules with more pharmacophore features).  When None, the budget
         is divided equally across operators — identical to previous behaviour.
 
-    Returns a list of valid canonical SMILES strings (excluding the input).
+    return_tags: if True, return List[Tuple[str, str]] of (operator_tag, smiles)
+        instead of List[str].  operator_tag is one of 'bioisostere', 'fg_add',
+        'terminal_remove', 'ring_walk'.  Used by §OOOO bandit operator tracking.
+
+    Returns a list of valid canonical SMILES strings (excluding the input),
+    or (when return_tags=True) a list of (operator_tag, smiles) tuples.
     """
     mol = Chem.MolFromSmiles(smiles)
     if mol is None:
@@ -334,6 +340,14 @@ def generate_perturbations(
             except Exception:
                 pass
 
+    # §OOOO: tagged output for bandit operator tracking in §MM.
+    if return_tags:
+        return (
+            [('bioisostere', s) for s in bio_res]
+            + [('fg_add', s) for s in fga_res]
+            + [('terminal_remove', s) for s in ter_res]
+            + [('ring_walk', s) for s in rng_res]
+        )
     return bio_res + fga_res + ter_res + rng_res
 
 
@@ -403,6 +417,7 @@ def run_salsa_search(
     smiles_col: str = 'product_smiles',
     name_col: str = 'product_name',
     operator_weights: Optional[dict] = None,
+    out_operator_tags: Optional[dict] = None,
 ) -> pd.DataFrame:
     """
     SALSA: Stochastic Approximate Ligand Scoring and Optimisation.
@@ -437,6 +452,10 @@ def run_salsa_search(
             (bioisostere, fg_add, terminal_remove, ring_walk).  Passed through to
             generate_perturbations to allocate per-operator budgets.  None → equal
             weights (§ZZZZZ).
+        out_operator_tags: §OOOO — if not None, populated in-place with
+            {product_name: operator_tag} recording which operator first discovered
+            each returned hit.  Enables the §MM caller to credit bandit wins per
+            operator and bias subsequent rounds toward productive operators.
 
     Returns:
         DataFrame of up to *top_k* rows from *savi_pool_df*, sorted by
@@ -474,7 +493,19 @@ def run_salsa_search(
     _prev_best_smiles: Optional[str] = None
 
     for round_idx in range(rounds):
-        perturbations = generate_perturbations(best_smiles, n_max=n_perturb, operator_weights=operator_weights)
+        # §OOOO: use tagged output when caller wants operator tracking; plain list otherwise.
+        if out_operator_tags is not None:
+            _tagged = generate_perturbations(
+                best_smiles, n_max=n_perturb,
+                operator_weights=operator_weights, return_tags=True,
+            )
+            _probe_to_op: dict = {smi: op for op, smi in _tagged}
+            perturbations = [smi for _, smi in _tagged]
+        else:
+            _probe_to_op = {}
+            perturbations = generate_perturbations(
+                best_smiles, n_max=n_perturb, operator_weights=operator_weights,
+            )
         if not perturbations:
             logger.debug(f"SALSA round {round_idx + 1}: no perturbations generated from {best_smiles!r}")
             break
@@ -491,6 +522,9 @@ def run_salsa_search(
             if name and name not in seen_names:
                 seen_names.add(name)
                 round_hits.append(row)
+                # §OOOO: record which operator first discovered this hit
+                if out_operator_tags is not None and name not in out_operator_tags:
+                    out_operator_tags[name] = _probe_to_op.get(pert_smiles, 'unknown')
 
         if not round_hits:
             logger.debug(f"SALSA round {round_idx + 1}: no pool hits found")

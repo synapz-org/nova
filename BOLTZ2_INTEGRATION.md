@@ -1,8 +1,82 @@
 # Boltz-2 Miner Integration
 
-## Current Status (as of 2026-08-20)
+## Current Status (as of 2026-08-22)
 
-**59 roadmap items implemented.** §VVVVVVVVVV (`iptm` overall interface iPTM surrogate weight) added 2026-08-20.
+**60 roadmap items implemented.** §OOOO (learned perturbation operator weighting — SALSA bandit) added 2026-08-22.
+
+---
+
+## Implemented Optimisations (recent)
+
+### §OOOO — Learned Perturbation Operator Weighting (SALSA Bandit) — added 2026-08-22
+
+**Problem:** SALSA uses four perturbation operators (bioisosteric substitution, functional group
+addition, terminal atom removal, ring walk) weighted only by the seed molecule's heavy atom count
+(§ZZZZZ HA-adaptive bias).  However, within any given epoch, some operators consistently find SAVI-2020
+hits that score higher with Boltz-2 than others — e.g., on a small kinase pocket, terminal removal
+may repeatedly find higher-LE hits (fewer heavy atoms → better score floor) while bioisosteric
+substitution's hits plateau.  Currently all operators receive equal budget within each HA tier;
+the miner learns nothing about which operators actually contributed to §MM improvements.
+
+**Fix:** A lightweight bandit-style loop over the 4 operator types, blended with the existing
+§ZZZZZ HA-adaptive weights:
+
+1. **`utils/salsa.py` — `generate_perturbations`**: Added `return_tags: bool = False` parameter.
+   When `True`, returns `List[Tuple[str, str]]` of `(operator_tag, probe_smiles)` instead of
+   `List[str]`, so the caller can build a `{probe_smiles: operator_tag}` lookup.
+
+2. **`utils/salsa.py` — `run_salsa_search`**: Added `out_operator_tags: Optional[dict] = None`
+   parameter.  When provided, the function calls `generate_perturbations(..., return_tags=True)`,
+   builds the probe→operator lookup, and populates `out_operator_tags[product_name] = operator_tag`
+   for each SAVI-2020 hit the first time it is discovered.  Only the operator that first mapped a
+   Tanimoto probe to a given pool molecule is credited — later probes from other operators hitting
+   the same neighbour are ignored (first-discovery attribution).  Zero overhead when
+   `out_operator_tags=None` (all existing callers unchanged).
+
+3. **`neurons/miner.py` — `_salsa_operator_weights`**: Added `bandit_wins: dict | None = None`
+   parameter.  When `bandit_wins` has total wins > 0, multiplies each operator's §ZZZZZ base
+   weight by `(1 + win_fraction)` where `win_fraction = wins[op] / total_wins`.  The operator with
+   all wins gets 2× its base weight; an operator with no wins keeps its base weight.  Blends
+   additively on top of the §ZZZZZ HA-adaptive base so neither system cancels the other.
+
+4. **`neurons/miner.py` — state init + epoch reset**: Added
+   `'salsa_operator_wins': {'bioisostere': 0, 'fg_add': 0, 'terminal_remove': 0, 'ring_walk': 0}`
+   to both the initial state dict and the epoch-boundary reset block.  Wins reset each epoch so
+   the bandit adapts to the weekly target's chemistry rather than accumulating cross-epoch bias.
+
+5. **`neurons/miner.py` — §MM SALSA call**: Declares `_mm_op_tags: dict = {}` before each
+   round's `run_salsa_search` call and passes it as `out_operator_tags`.  After a §MM full-score
+   improvement (`_mm_score > _mm_round_best_score`), credits `state['salsa_operator_wins'][op]`
+   for the operator that discovered the winning product name.  Passes
+   `state.get('salsa_operator_wins')` to `_salsa_operator_weights` so subsequent rounds use
+   bandit-blended weights.
+
+**Regression guards:**
+- `out_operator_tags=None` (all callers except §MM): zero code-path change.
+- `bandit_wins=None` or all-zero: `_salsa_operator_weights` returns `None` (middle HA) or pure
+  §ZZZZZ weights (large/small HA) — identical to pre-§OOOO behaviour.
+- Epoch reset clears wins → epoch 1 always starts with equal bandit prior.
+- `_oooo_op not in _oooo_wins` guard: unknown operator tag (e.g. 'unknown') never mutates state.
+
+**Expected benefit:**
+
+| Scenario | Before §OOOO | After §OOOO |
+|----------|--------------|-------------|
+| One operator dominates §MM (e.g. terminal_remove 3/3 wins) | All ops equal budget | 2× budget to terminal_remove from round 4 |
+| No clear dominant operator (1/1/1/1 wins) | All ops equal | Slight boost proportional to each op's single win |
+| Epoch 1 / zero wins | All ops equal | All ops equal (no regression) |
+| Cross-epoch chemistry shift | Stale bias persists | Wins reset per epoch → adapts cleanly |
+
+Expected gain: +2–5% Boltz LE on warm-cache epochs (§MM active, ≥2 rounds) when one operator
+consistently outperforms.  Zero regression on cold-start epochs.
+
+**Files changed:**
+- `utils/salsa.py`: `generate_perturbations` (+`return_tags` param + tagged return branch);
+  `run_salsa_search` (+`out_operator_tags` param + 12 lines inside rounds loop).
+- `neurons/miner.py`: `_salsa_operator_weights` (+`bandit_wins` param + blend block);
+  state init (+`salsa_operator_wins`); epoch reset (+`salsa_operator_wins`); §MM SALSA call
+  (+`_mm_op_tags` decl + `out_operator_tags` kwarg + bandit pass); §MM improvement block
+  (+operator credit tracking, 8 lines).
 
 ---
 
@@ -4011,26 +4085,11 @@ if write_full_pae:
 Estimated effort: ~100 lines.  Priority: low (requires parsing PDB structure output to identify
 interface residues; adds I/O overhead per inference call).
 
-### §OOOO — Learned Perturbation Operator Weighting
+### §OOOO — Learned Perturbation Operator Weighting ✅ Implemented (2026-08-22)
 
-**Observation:** SALSA uses four operators: bioisosteric substitution, FG addition, terminal
-removal, and ring walk.  In any given epoch, some operators consistently produce SAVI-2020
-hits that score higher with Boltz-2 than others (e.g., terminal removal may yield high-efficiency
-small molecules while ring walk discovers better-fitting scaffolds).  Currently all operators
-are weighted equally in `generate_perturbations`.
-
-**Proposal:** Track, within the §MM loop, which operator TYPE generated the SALSA hit that
-led to each Boltz improvement.  After the first improvement, bias subsequent rounds toward
-that operator (e.g., 2× weight via `n_max` partitioning).  This is a lightweight bandit-style
-learning loop over the 4 operator types.
-
-**Implementation sketch:** `generate_perturbations` would accept an optional `operator_weights`
-dict (e.g., `{'bioisostere': 2.0, 'fg_add': 1.0, 'terminal_remove': 1.5, 'ring_walk': 1.0}`)
-and split `n_max` proportionally.  The §MM improvement tracking would update weights after
-each confirmed improvement.  On the first epoch (no prior data) all weights default to 1.0.
-
-Estimated effort: ~60 lines in `utils/salsa.py` + 30 lines in `neurons/miner.py`.
-Priority: medium.
+See "Implemented Optimisations (recent)" at top of doc for full description.
+~70 lines: `utils/salsa.py` (tagged output + `out_operator_tags`) +
+`neurons/miner.py` (`_salsa_operator_weights` bandit blend + §MM tracking + state init/reset).
 
 ### §PPPP — SALSA Elite Pool Pre-seeding at Epoch Start ✅ Implemented
 
