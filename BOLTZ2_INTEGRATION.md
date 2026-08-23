@@ -1,8 +1,96 @@
 # Boltz-2 Miner Integration
 
-## Current Status (as of 2026-08-22)
+## Current Status (as of 2026-08-23)
 
-**60 roadmap items implemented.** §OOOO (learned perturbation operator weighting — SALSA bandit) added 2026-08-22.
+**61 roadmap items implemented.** §QQQQQQQQQQQQ (Morgan FP 64→256 bits for surrogate) added 2026-08-23.
+
+---
+
+## Implemented Optimisations (recent)
+
+### §QQQQQQQQQQQQ — Surrogate Morgan FP Extended from 64→256 Bits — added 2026-08-23
+
+**Problem:** The surrogate model's molecular fingerprint used only 64 Morgan bits (`_N_MORGAN_BITS = 64`).
+At 64 bits the ECFP4 fingerprint has a high hash-collision rate — many structurally distinct scaffolds
+(e.g., different halogenation patterns, ring substitutions, and heteroatom placements) produce identical
+bit vectors because multiple structural features are folded onto the same bit positions.
+
+This collision noise limits the RandomForestRegressor's ability to learn fine-grained
+structure-activity relationships at the RF tier (≥100 training points, active from epoch 2+).
+For example, two scaffolds differing only in a fluorine vs. chlorine substitution on a phenyl ring
+(a meaningful distinction for binding affinity) could have identical 64-bit fingerprints, making the
+surrogate blind to the SAR difference.
+
+**Fix:** Increase `_N_MORGAN_BITS` from 64 to 256 in `utils/surrogate.py`.  `_N_FEATURES`
+updates automatically from 84→276, and all 7 placeholder arrays derived from it are resized
+correctly with no further changes needed.
+
+**Design rationale:**
+
+| Tier | Training points | Model | Before §QQQQQQQQQQQQ | After §QQQQQQQQQQQQ |
+|------|----------------|-------|----------------------|---------------------|
+| Ridge | 40–99 | Ridge(alpha=1.0) | 64 bits, 84D total | 256 bits, 276D total; extra bits shrunk to ~0 by L2 |
+| RF | 100–499 | RF(n_estimators=100) | 64 bits, 84D | 256 bits, 276D; sqrt(276)≈17 features/split — fine |
+| RF + embeddings | 100–499 | RF(n_estimators=100) | 64+32(PCA)+1=117D | 256+32+1=289D |
+
+Ridge at the low-data tier is unaffected in practice: L2 regularisation shrinks the 192 extra bits'
+coefficients toward zero, so the effective model complexity stays similar.  The only risk is a
+slight increase in Ridge fit time (276 features vs 84), which is negligible compared to database
+I/O and Boltz inference.
+
+At the RF tier where the surrogate guidance is most valuable (SALSA basin-hopping from epoch 2+,
+§AAAAAA dual UCB, §HHHHHH SALSA pool blend), the higher FP resolution improves scaffold
+discrimination — enabling the surrogate to correctly rank structurally similar molecules that
+previously hashed to identical bit vectors.
+
+**Expected benefit:**
+
++2–4% surrogate NDCG on epoch 2+ (RF tier) for targets with structurally diverse active series.
+The gain is proportional to how many scaffold-pair collisions existed at 64 bits — largest when
+the training set spans multiple ring systems with similar physicochemical properties but distinct
+Boltz-2 affinities.
+
+Cascades to all surrogate-dependent systems:
+- §AAAAAA dual UCB: more accurate APB/APV UCB scores → better exploratory candidate selection
+- §HHHHHH SALSA pool blend: more accurate surrogate guidance → SALSA converges faster
+- §YYYYYY startup surrogate: better warm-start from GitHub cache → improved epoch-1 streaming
+
+**Files changed:**
+- `utils/surrogate.py`: `_N_MORGAN_BITS = 64` → `_N_MORGAN_BITS = 256`; updated comment.
+
+---
+
+## Proposed Next Optimisations
+
+### §RRRRRRRRRRRR — Surrogate-Guided SAVI Reaction-Class Chunk Selection
+
+**Problem:** SAVI chunks are currently selected with reaction-class bias (§YY/§EEEEEE) weighted
+by the reaction class of the best Boltz-2 winner.  This exploits historical winners but does not
+directly optimise for surrogate-predicted quality across the full streaming pool.  With a warm
+surrogate (≥100 cache points, RF tier), the dual APB/APV models can estimate Boltz LE for any
+SMILES — including SAVI molecules before they are scored by Boltz-2.  Applying this to chunk
+pre-selection could concentrate streaming budget on reaction classes with the highest surrogate-
+predicted LE, rather than relying solely on the reaction class of a potentially lucky single winner.
+
+**Algorithm:**
+
+```python
+# At streaming start (after surrogate is loaded, epoch 3+):
+# 1. Sample 50 molecules from each of the top-10 SAVI reaction classes
+# 2. Score with surrogate (dual_surrogate_rank_pool, <1s per class)
+# 3. Rank reaction classes by their mean surrogate-predicted LE
+# 4. Weight chunk selection: top-3 classes get 3×, next 3 get 2×, rest get 1×
+```
+
+The bias is applied multiplicatively on top of §YY so both signals contribute.  Falls back to
+pure §YY when the surrogate is not active (epoch 1).
+
+**Expected benefit:** +3–6% Boltz LE on epoch 3+ runs where the SAR landscape has clear
+reaction-class clustering (common for kinase targets and GPCRs).  Zero regression on epoch 1
+(surrogate not available, standard §YY applies).
+
+**Estimated effort:** ~70 lines in `neurons/miner.py` + a `rank_savi_reaction_classes` helper
+function that reuses `dual_surrogate_ucb_rank_pool`.
 
 ---
 

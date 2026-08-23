@@ -30,9 +30,18 @@ from typing import Optional
 from rdkit import Chem
 from rdkit.Chem import AllChem, Descriptors
 
-_N_MORGAN_BITS = 64   # §DDD: folded FP; low count keeps feature/sample ratio sane
+# §QQQQQQQQQQQQ: Upgraded from 64→256 bits.  At 64 bits the Morgan FP has a high
+# hash-collision rate — many structurally distinct scaffolds produce identical bit
+# vectors, blinding the RF surrogate to real structure-activity differences.
+# 256 bits reduces collisions ~4× while keeping the feature:sample ratio well
+# within safe bounds for RandomForestRegressor at ≥100 training points (sqrt(276)≈17
+# features per split).  Ridge at 40–99 points is unaffected: L2 regularisation
+# shrinks the extra bits' coefficients to near-zero, so the effective model
+# complexity stays low.  All placeholder arrays derive from _N_FEATURES and are
+# automatically sized correctly.
+_N_MORGAN_BITS = 256  # §DDD / §QQQQQQQQQQQQ: extended from 64; reduces FP collisions
 _N_PHYSCHEM    = 20
-_N_FEATURES    = _N_PHYSCHEM + _N_MORGAN_BITS  # 84 total
+_N_FEATURES    = _N_PHYSCHEM + _N_MORGAN_BITS  # 276 total
 
 
 def _descriptor_vector(smiles: str) -> Optional[list]:

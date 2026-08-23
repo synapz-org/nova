@@ -358,7 +358,7 @@ Even a partial result (1 of 5 molecules scored) improves on the PSICHIC-only bas
 
 ## Implementation Roadmap (priority order)
 
-Items 1–59 are **implemented** (§VVVVVVVVVV added 2026-08-20). Item 5 remains as a conditional direction (binding-pocket docking filter, only relevant when `binding_pocket` is set in config). §UUUUUUUUUU (interface PDE surrogate weight) added 2026-08-19. §VVVVVVVVVV (overall interface iPTM surrogate weight) added 2026-08-20.
+Items 1–61 are **implemented** (§QQQQQQQQQQQQ added 2026-08-23: Morgan FP 64→256 bits for better surrogate scaffold discrimination). §OOOO (SALSA bandit operator weighting) added 2026-08-22. Item 5 remains as a conditional direction (binding-pocket docking filter, only relevant when `binding_pocket` is set in config).
 
 | Priority | Approach | Effort | Status | Expected gain |
 |----------|----------|--------|--------|---------------|
