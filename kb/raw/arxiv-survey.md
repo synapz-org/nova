@@ -358,7 +358,7 @@ Even a partial result (1 of 5 molecules scored) improves on the PSICHIC-only bas
 
 ## Implementation Roadmap (priority order)
 
-Items 1–61 are **implemented** (§QQQQQQQQQQQQ added 2026-08-23: Morgan FP 64→256 bits for better surrogate scaffold discrimination). §OOOO (SALSA bandit operator weighting) added 2026-08-22. Item 5 remains as a conditional direction (binding-pocket docking filter, only relevant when `binding_pocket` is set in config).
+Items 1–62 are **implemented** (§RRRRRRRRRRRR added 2026-08-24: surrogate-guided SAVI reaction-class chunk selection — dual RF surrogate ranks stream-pool reaction classes and blends the top-3/next-3 weights (3×/2×/1×) into `rxn_class_weights` via max-merge with §EEEEEE history). §QQQQQQQQQQQQ (Morgan FP 64→256 bits) added 2026-08-23. §OOOO (SALSA bandit operator weighting) added 2026-08-22. Item 5 remains as a conditional direction (binding-pocket docking filter, only relevant when `binding_pocket` is set in config).
 
 | Priority | Approach | Effort | Status | Expected gain |
 |----------|----------|--------|--------|---------------|
@@ -421,6 +421,9 @@ Items 1–61 are **implemented** (§QQQQQQQQQQQQ added 2026-08-23: Morgan FP 64�
 | 57 | §TTTTTTTTTT: Streaming saturation redirect — when surrogate (≥40 pts) detects no improvement in top predicted score for 3 consecutive chunks, yield streaming thread to §MM and reduce batch rate to 1 chunk/5 min | ~40 lines | ✅ Done (2026-08-18) | +1–3 §MM rounds on warm-cache epochs where the PSICHIC pool has converged; zero regression on epoch 1 |
 | 58 | §UUUUUUUUUU: `complex_ipde` surrogate weight — store Boltz-2 interface predicted distance error (Å) in SQLite cache; add `/ (1 + 0.3 × ipde)` down-weight to all 3 surrogate training functions so uncertain-geometry runs contribute less to RF/Ridge training | ~50 lines | ✅ Done (2026-08-19) | +1–3% surrogate NDCG by filtering noise from geometrically uncertain Boltz runs; stacks with §MMMMMMMMMM (iplddt) and §FFFFFFFFFF (confidence_score) |
 | 59 | §VVVVVVVVVV: `iptm` surrogate weight — store Boltz-2 overall interface iPTM (cross-chain A-B confidence for protein+ligand) in SQLite cache; add `* max(0.1, iptm)` to all 3 surrogate training weight formulas; filters false-positive training examples where ligand structure is confident but binding orientation is uncertain | ~40 lines | ✅ Done (2026-08-20) | +1–2% surrogate NDCG by filtering ligand_iptm-high but iptm-low outliers; orthogonal to all existing confidence signals |
+| 60 | §OOOO: SALSA bandit operator weighting — track per-operator wins in §MM hill-climbing (bioisostere/fg_add/terminal_remove/ring_walk) and blend `(1+win_fraction)` multiplier with §ZZZZZ HA-adaptive base | ~100 lines | ✅ Done (2026-08-22) | +2–5% Boltz LE on warm-cache epochs when one operator consistently outperforms |
+| 61 | §QQQQQQQQQQQQ: Surrogate Morgan FP 64→256 bits — reduces hash collisions in ECFP4 fingerprint so RF surrogate can discriminate close scaffold variants (halogenation, ring substitutions) | 1 line | ✅ Done (2026-08-23) | +2–4% NDCG at RF tier; cascades to §AAAAAA UCB, §HHHHHH SALSA blend, §YYYYYY startup surrogate |
+| 62 | §RRRRRRRRRRRR: Surrogate-guided SAVI reaction-class chunk selection — group `savi_stream_pool` by `rxn*` prefix, score with dual RF surrogate blend, apply top-3/next-3 weights (3×/2×/1×) merged with §EEEEEE history via max-per-class | ~100 lines | ✅ Done (2026-08-24) | +3–6% Boltz LE on epoch 3+ warm-cache targets with reaction-class SAR clustering; zero regression on epoch 1 / Ridge tier / small pool |
 
 All approaches share the same submission constraint: molecules must map to valid SAVI-2020
 product names. SALSA and GradientGA both solve this via nearest-neighbour SAVI-2020 lookup.

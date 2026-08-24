@@ -1,12 +1,78 @@
 # Boltz-2 Miner Integration
 
-## Current Status (as of 2026-08-23)
+## Current Status (as of 2026-08-24)
 
-**61 roadmap items implemented.** §QQQQQQQQQQQQ (Morgan FP 64→256 bits for surrogate) added 2026-08-23.
+**62 roadmap items implemented.** §RRRRRRRRRRRR (surrogate-guided SAVI reaction-class chunk selection) added 2026-08-24.
 
 ---
 
 ## Implemented Optimisations (recent)
+
+### §RRRRRRRRRRRR — Surrogate-Guided SAVI Reaction-Class Chunk Selection — added 2026-08-24
+
+**Problem:** SAVI chunk selection is currently biased by the reaction class of the last Boltz-2
+winner (§YY) and by a per-class running mean of past winner scores (§EEEEEE, top-3 → 4×/2×/1.5×).
+Both signals only see the reaction class of molecules that already reached the Boltz oracle —
+typically 3–20 molecules per epoch out of the 10,000-molecule stream pool.  With a warm RF
+surrogate (≥100 cache points, `startup_dual_surrogate` fitted at §YYYYYY from GitHub cache),
+the dual APB/APV model can estimate a Boltz-calibrated ligand-efficiency for any SMILES in the
+stream pool — including molecules from reaction classes that have never been sent to Boltz.
+Applying this to chunk selection concentrates streaming budget on reaction classes with the
+highest surrogate-predicted LE, rather than relying solely on a small handful of historical
+winners.
+
+**Fix:**
+
+1. **`neurons/miner.py` — `_rank_rxn_classes_by_surrogate` helper**: Groups `savi_stream_pool`
+   by reaction class (`rxn5/…` prefix of `product_name`), runs `augment_pool_with_surrogate_blend`
+   (the §HHHHHH SALSA blend function, which itself gates on RF tier), computes per-class mean
+   `surrogate_salsa_score`, requires ≥10 molecules per class to smooth noise, and returns rank-based
+   weights: top-3 classes → 3×, next 3 → 2×, all others → 1×.  Returns `{}` on any failure
+   (Ridge tier, empty pool, insufficient descriptor coverage, exception) — the caller falls through
+   silently to pure §EEEEEE / §YY bias.
+
+2. **`neurons/miner.py` — trigger inside `run_psichic_model_loop`**: Fires once per epoch when
+   `savi_stream_pool ≥ 1000` molecules **and** `startup_dual_surrogate is not None`.  The 1000-
+   molecule floor ensures enough per-class samples to hit the 10-molecule per-class minimum and
+   guarantees the surrogate sees a representative slice of chemical space.  Merges the surrogate
+   weights into `state['rxn_class_weights']` by taking `max(existing, new)` per class — surrogate
+   evidence amplifies §EEEEEE historical bias but never cancels a class the historical mean already
+   prefers.  `stream_random_chunk_from_dataset` reads `rxn_class_weights` unchanged, so all
+   downstream SAVI weighting logic keeps working with zero code-path change.
+
+3. **State plumbing**: Added `'rrrrrrrrrrrr_done_this_epoch': False` to the initial state dict and
+   to the epoch-boundary reset block so the trigger fires exactly once per epoch and re-fires on
+   protein rotation.
+
+**Regression guards:**
+- `startup_dual_surrogate is None` (epoch 1 cold start, or Ridge tier <100 pts): trigger no-op,
+  falls back to pure §EEEEEE / §YY.
+- Pool `< 1000` molecules: waits for streaming to catch up; no partial-data surrogate scoring.
+- `augment_pool_with_surrogate_blend` internally returns pool unchanged when either dual model
+  is Ridge — the helper's `'surrogate_salsa_score' not in columns` check catches this cleanly.
+- Merge takes max per class so an existing §EEEEEE 4× winner is never demoted to 3×.
+- Wrapped in `try/except` — any failure logs at debug level and the epoch continues.
+
+**Expected benefit:**
+
+| Scenario | Before §RRRRRRRRRRRR | After §RRRRRRRRRRRR |
+|----------|----------------------|---------------------|
+| Epoch 3+ warm cache, kinase-like target with strong class clustering | §EEEEEE top-3 (4×/2×/1.5×) | §EEEEEE ∪ surrogate top-3 (max weights) — richer bias |
+| Epoch 3+ warm cache, class-agnostic target (e.g. GPCR promiscuous binder) | §EEEEEE from small history | Surrogate identifies previously-unseen good classes |
+| Epoch 1 cold start | §EEEEEE = ∅, uniform | Same (surrogate unavailable) — no regression |
+| Ridge tier (40–99 pts) | Uniform / §YY only | Same (RF gate in surrogate blend) — no regression |
+| Pool < 1000 molecules | §EEEEEE from history | Same (floor check) — no regression |
+
+Expected gain: **+3–6% Boltz LE** on epoch 3+ runs where the SAR landscape has clear reaction-
+class clustering (kinase targets, GPCRs).  Zero regression on cold-start epochs, low-data tiers,
+and small-pool startup windows.
+
+**Files changed:**
+- `neurons/miner.py`: `_rank_rxn_classes_by_surrogate` (+58 lines helper); trigger block inside
+  `run_psichic_model_loop` (+36 lines); state init (+1 line); epoch reset (+1 line).
+- `BOLTZ2_INTEGRATION.md`: entry moved from "Proposed" to "Implemented".
+
+---
 
 ### §QQQQQQQQQQQQ — Surrogate Morgan FP Extended from 64→256 Bits — added 2026-08-23
 
@@ -62,35 +128,7 @@ Cascades to all surrogate-dependent systems:
 
 ## Proposed Next Optimisations
 
-### §RRRRRRRRRRRR — Surrogate-Guided SAVI Reaction-Class Chunk Selection
-
-**Problem:** SAVI chunks are currently selected with reaction-class bias (§YY/§EEEEEE) weighted
-by the reaction class of the best Boltz-2 winner.  This exploits historical winners but does not
-directly optimise for surrogate-predicted quality across the full streaming pool.  With a warm
-surrogate (≥100 cache points, RF tier), the dual APB/APV models can estimate Boltz LE for any
-SMILES — including SAVI molecules before they are scored by Boltz-2.  Applying this to chunk
-pre-selection could concentrate streaming budget on reaction classes with the highest surrogate-
-predicted LE, rather than relying solely on the reaction class of a potentially lucky single winner.
-
-**Algorithm:**
-
-```python
-# At streaming start (after surrogate is loaded, epoch 3+):
-# 1. Sample 50 molecules from each of the top-10 SAVI reaction classes
-# 2. Score with surrogate (dual_surrogate_rank_pool, <1s per class)
-# 3. Rank reaction classes by their mean surrogate-predicted LE
-# 4. Weight chunk selection: top-3 classes get 3×, next 3 get 2×, rest get 1×
-```
-
-The bias is applied multiplicatively on top of §YY so both signals contribute.  Falls back to
-pure §YY when the surrogate is not active (epoch 1).
-
-**Expected benefit:** +3–6% Boltz LE on epoch 3+ runs where the SAR landscape has clear
-reaction-class clustering (common for kinase targets and GPCRs).  Zero regression on epoch 1
-(surrogate not available, standard §YY applies).
-
-**Estimated effort:** ~70 lines in `neurons/miner.py` + a `rank_savi_reaction_classes` helper
-function that reuses `dual_surrogate_ucb_rank_pool`.
+_None currently queued — §RRRRRRRRRRRR was the last item in this section and shipped 2026-08-24._
 
 ---
 

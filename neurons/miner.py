@@ -756,6 +756,63 @@ def stream_random_chunk_from_dataset(dataset_repo: str, chunk_size: int, rxn_bia
 # 5. INFERENCE AND SUBMISSION LOGIC
 # ----------------------------------------------------------------------------
 
+def _rank_rxn_classes_by_surrogate(pool_df, dual_surrogate) -> Dict[str, float]:
+    """
+    §RRRRRRRRRRRR: Rank SAVI reaction classes by mean dual-surrogate LE score.
+
+    Extracts reaction class from product_name (prefix before '/', e.g. 'rxn5'),
+    uses augment_pool_with_surrogate_blend to compute per-molecule surrogate LE,
+    averages by class (min 10 molecules per class), and assigns rank-based weights:
+    top-3 classes → 3×, next 3 → 2×, all others → 1×.
+
+    Returns an empty dict on any failure so the caller silently falls through.
+    Only activates at RF tier (≥100 cache points) — augment_pool_with_surrogate_blend
+    returns pool_df unchanged (no surrogate_salsa_score) for Ridge models.
+    """
+    if pool_df is None or pool_df.empty or dual_surrogate is None:
+        return {}
+    try:
+        pool = pool_df.copy()
+        pool['_rxn_cls'] = pool['product_name'].apply(
+            lambda pn: (
+                pn.split('/')[0]
+                if isinstance(pn, str) and '/' in pn and pn.split('/')[0].startswith('rxn')
+                else None
+            )
+        )
+        pool = pool[pool['_rxn_cls'].notna()].reset_index(drop=True)
+        if pool.empty:
+            return {}
+
+        augmented = augment_pool_with_surrogate_blend(pool, dual_surrogate)
+        if 'surrogate_salsa_score' not in augmented.columns:
+            return {}
+
+        augmented = augmented.copy()
+        augmented['_rxn_cls'] = pool['_rxn_cls']
+        class_stats = (
+            augmented.groupby('_rxn_cls')['surrogate_salsa_score']
+            .agg(mean='mean', count='count')
+            .query('count >= 10')
+            .sort_values('mean', ascending=False)
+        )
+        if class_stats.empty:
+            return {}
+
+        classes = list(class_stats.index)
+        weights: Dict[str, float] = {}
+        for i, cls in enumerate(classes):
+            if i < 3:
+                weights[cls] = 3.0
+            elif i < 6:
+                weights[cls] = 2.0
+            else:
+                weights[cls] = 1.0
+        return weights
+    except Exception:
+        return {}
+
+
 async def run_psichic_model_loop(state: Dict[str, Any]) -> None:
     """
     Continuously runs the PSICHIC model on batches of molecules from Hugging Face dataset.
@@ -979,6 +1036,42 @@ async def run_psichic_model_loop(state: Dict[str, Any]) -> None:
                         _pool_capped.drop_duplicates(subset=['product_name'], inplace=True)
                         _pool_capped.sort_values('combined_score', ascending=False, inplace=True)
                         state['savi_stream_pool'] = _pool_capped.head(10000).reset_index(drop=True)
+
+                # §RRRRRRRRRRRR: Surrogate-guided SAVI reaction-class chunk weighting.
+                # When the RF surrogate is available (startup_dual_surrogate fitted at
+                # §YYYYYY from GitHub cache, ≥100 cache points) and the stream pool has
+                # ≥1000 molecules, group the pool by reaction class, score with the
+                # dual surrogate, and apply rank-based weights to rxn_class_weights:
+                # top-3 classes → 3×, next 3 → 2×, rest keep 1×.  Merged additively with
+                # §EEEEEE historical weights (take max of the two signals per class) so
+                # surrogate evidence amplifies — never cancels — historical bias.
+                # One-shot per epoch; falls back silently at Ridge tier or empty pool.
+                _rrr_pool = state.get('savi_stream_pool')
+                _rrr_surr = state.get('startup_dual_surrogate')
+                if (
+                    not state.get('rrrrrrrrrrrr_done_this_epoch', False)
+                    and _rrr_pool is not None
+                    and len(_rrr_pool) >= 1000
+                    and _rrr_surr is not None
+                ):
+                    state['rrrrrrrrrrrr_done_this_epoch'] = True
+                    try:
+                        _rrr_weights = _rank_rxn_classes_by_surrogate(_rrr_pool, _rrr_surr)
+                        if _rrr_weights:
+                            _existing_w = state.get('rxn_class_weights') or {}
+                            _merged_w = dict(_existing_w)
+                            for _rrr_cls, _rrr_w in _rrr_weights.items():
+                                if _rrr_cls not in _merged_w or _rrr_w > _merged_w[_rrr_cls]:
+                                    _merged_w[_rrr_cls] = _rrr_w
+                            state['rxn_class_weights'] = _merged_w
+                            _rrr_top3 = sorted(_rrr_weights, key=_rrr_weights.get, reverse=True)[:3]
+                            bt.logging.info(
+                                f"[§RRRRRRRRRRRR] Surrogate rxn-class weights applied "
+                                f"({len(_rrr_weights)} classes, pool={len(_rrr_pool)}). "
+                                f"Top-3: {_rrr_top3}"
+                            )
+                    except Exception as _rrr_err:
+                        bt.logging.debug(f"[§RRRRRRRRRRRR] Failed (non-fatal): {_rrr_err}")
 
                 if not top_molecules.empty:
                     entropy = compute_maccs_entropy(top_molecules['product_smiles'].tolist())
@@ -4071,10 +4164,11 @@ async def run_miner(config: argparse.Namespace) -> None:
         'candidate_molecules': None,
         'global_candidate_pool': None,   # top-20 molecules across all chunks, by ligand efficiency
         'savi_stream_pool': None,        # all PSICHIC-scored molecules this epoch (capped at 10000)
-        'salsa_run_this_epoch': False,   # prevent duplicate SALSA runs per epoch
-        'ga_run_this_epoch': False,      # prevent duplicate GradientGA runs per epoch
-        'bbb_run_this_epoch': False,     # §BBB: prevent duplicate post-GA SALSA runs per epoch
-        'jj_probe_done': False,          # §JJJJJJJJJJ: cold-start probe flag
+        'salsa_run_this_epoch': False,         # prevent duplicate SALSA runs per epoch
+        'ga_run_this_epoch': False,            # prevent duplicate GradientGA runs per epoch
+        'bbb_run_this_epoch': False,           # §BBB: prevent duplicate post-GA SALSA runs per epoch
+        'jj_probe_done': False,                # §JJJJJJJJJJ: cold-start probe flag
+        'rrrrrrrrrrrr_done_this_epoch': False, # §RRRRRRRRRRRR: surrogate rxn-class weighting
         'salsa_operator_wins': {'bioisostere': 0, 'fg_add': 0, 'terminal_remove': 0, 'ring_walk': 0},  # §OOOO
         'best_ga_smiles': None,          # §BBB: best SMILES found by GradientGA this epoch
         'chembl_seeds': [],              # §SS: ChEMBL known actives, fetched at startup
@@ -4528,6 +4622,7 @@ async def run_miner(config: argparse.Namespace) -> None:
                 state['ga_run_this_epoch'] = False
                 state['bbb_run_this_epoch'] = False
                 state['jj_probe_done'] = False          # §JJJJJJJJJJ
+                state['rrrrrrrrrrrr_done_this_epoch'] = False  # §RRRRRRRRRRRR
                 state['salsa_operator_wins'] = {'bioisostere': 0, 'fg_add': 0, 'terminal_remove': 0, 'ring_walk': 0}  # §OOOO
                 state['stream_saturated'] = False       # §TTTTTTTTTT
                 state['best_ga_smiles'] = None
