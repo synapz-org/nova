@@ -3003,6 +3003,16 @@ async def run_boltz_prescoring(state: Dict[str, Any], max_candidates: int = 5) -
                                     f"[§OOOO] Operator '{_oooo_op}' credited "
                                     f"(wins={_oooo_wins})"
                                 )
+                                # §SSSSSSSSSSSS: persist operator wins to SQLite
+                                # so cross-epoch and cross-restart learning works.
+                                try:
+                                    _save_miner_state_text(
+                                        state['boltz_cache_db'],
+                                        'salsa_operator_wins_json',
+                                        json.dumps(_oooo_wins),
+                                    )
+                                except Exception:
+                                    pass
                     _mm_improved = True
 
             # Expose §MM scores to §CC so the warm-start guard sees the full epoch best
@@ -4264,7 +4274,8 @@ async def run_miner(config: argparse.Namespace) -> None:
                 for _pk in ('boltz_time_per_mol', 'boltz_trigger_blocks'):
                     if _pk in _pppppp_state and _load_miner_state(state['boltz_cache_db'], _pk) is None:
                         _save_miner_state(state['boltz_cache_db'], _pk, float(_pppppp_state[_pk]))
-                for _pk in ('best_boltz_rxn_class', 'rxn_class_scores_json'):
+                for _pk in ('best_boltz_rxn_class', 'rxn_class_scores_json',
+                            'salsa_operator_wins_json'):  # §SSSSSSSSSSSS
                     if _pk in _pppppp_state and _load_miner_state_text(state['boltz_cache_db'], _pk) is None:
                         _save_miner_state_text(state['boltz_cache_db'], _pk, str(_pppppp_state[_pk]))
                 bt.logging.info(
@@ -4385,6 +4396,37 @@ async def run_miner(config: argparse.Namespace) -> None:
             f"top-3: {_eeeeee_top} "
             f"(weights {[_eeeeee_weights[c] for c in _eeeeee_top]})"
         )
+
+    # §SSSSSSSSSSSS: Restore SALSA operator win history from SQLite.
+    # §OOOO tracks which perturbation operators (bioisostere / fg_add /
+    # terminal_remove / ring_walk) discover winning §MM SALSA hits; this
+    # credit is normally lost on container restart or between epochs.
+    # Here we warm-start operator_wins from the persisted JSON so §OOOO's
+    # bandit blending is active from round 1 rather than after several wins
+    # accumulate in the current session.
+    # Normalization: cap loaded totals at 40 virtual trials so existing priors
+    # don't dominate new evidence (win fractions are preserved; absolute counts
+    # scale to at most 40 total, e.g. {bioisostere:15, fg_add:10, …}).
+    _s12_raw = _load_miner_state_text(state['boltz_cache_db'], 'salsa_operator_wins_json')
+    if _s12_raw:
+        try:
+            _s12_loaded = json.loads(_s12_raw)
+            _s12_keys = ('bioisostere', 'fg_add', 'terminal_remove', 'ring_walk')
+            _s12_wins = {k: max(0, int(_s12_loaded.get(k, 0))) for k in _s12_keys}
+            _s12_total = sum(_s12_wins.values())
+            if _s12_total > 0:
+                _s12_scale = min(1.0, 40.0 / _s12_total)
+                state['salsa_operator_wins'] = {
+                    k: max(0, int(round(v * _s12_scale)))
+                    for k, v in _s12_wins.items()
+                }
+                bt.logging.info(
+                    f"[§SSSSSSSSSSSS] Restored SALSA operator wins from disk "
+                    f"(scaled {_s12_total}→{sum(state['salsa_operator_wins'].values())} trials): "
+                    f"{state['salsa_operator_wins']}"
+                )
+        except Exception:
+            pass  # fall back to zero-initialised wins; non-fatal
 
     # §OOOOOO: Adapt §TTTT fragment-slot quota using Boltz cache evidence.
     # Default: 1000/10000 slots for ≤18-HA molecules (§TTTT).
@@ -4623,7 +4665,25 @@ async def run_miner(config: argparse.Namespace) -> None:
                 state['bbb_run_this_epoch'] = False
                 state['jj_probe_done'] = False          # §JJJJJJJJJJ
                 state['rrrrrrrrrrrr_done_this_epoch'] = False  # §RRRRRRRRRRRR
-                state['salsa_operator_wins'] = {'bioisostere': 0, 'fg_add': 0, 'terminal_remove': 0, 'ring_walk': 0}  # §OOOO
+                # §SSSSSSSSSSSS: decay operator wins ÷2 (floor 0) at epoch boundary
+                # instead of resetting to zero.  Preserves the directional SAR
+                # signal from previous epochs for the same protein target while
+                # still allowing new evidence to dominate within a few §MM rounds.
+                _s12_prev_wins = state.get(
+                    'salsa_operator_wins',
+                    {'bioisostere': 0, 'fg_add': 0, 'terminal_remove': 0, 'ring_walk': 0}
+                )
+                state['salsa_operator_wins'] = {
+                    k: max(0, v // 2)
+                    for k, v in _s12_prev_wins.items()
+                }
+                try:
+                    _save_miner_state_text(
+                        state['boltz_cache_db'], 'salsa_operator_wins_json',
+                        json.dumps(state['salsa_operator_wins']),
+                    )
+                except Exception:
+                    pass
                 state['stream_saturated'] = False       # §TTTTTTTTTT
                 state['best_ga_smiles'] = None
                 state['best_score'] = float('-inf')

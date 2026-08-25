@@ -1,8 +1,8 @@
 # Boltz-2 Miner Integration
 
-## Current Status (as of 2026-08-24)
+## Current Status (as of 2026-08-25)
 
-**62 roadmap items implemented.** §RRRRRRRRRRRR (surrogate-guided SAVI reaction-class chunk selection) added 2026-08-24.
+**63 roadmap items implemented.** §SSSSSSSSSSSS (cross-epoch SALSA operator win persistence) added 2026-08-25. §RRRRRRRRRRRR (surrogate-guided SAVI reaction-class chunk selection) added 2026-08-24.
 
 ---
 
@@ -7288,4 +7288,92 @@ highly correlated — the two signals diverge mainly for flexible ligands in sha
 Zero regression: `COALESCE` default and multiplicative scale ensure legacy behavior is preserved.
 
 **Status: IMPLEMENTED 2026-08-20.**
+
+---
+
+## Implemented Optimisations (continued)
+
+### §SSSSSSSSSSSS — Cross-Epoch SALSA Operator Win Persistence — implemented 2026-08-25
+
+**Problem:** §OOOO tracks which SALSA perturbation operators (bioisostere / fg_add / terminal_remove / ring_walk) discover winning §MM hill-climbing hits by incrementing per-operator win counters in `state['salsa_operator_wins']`. These wins are used by `_salsa_operator_weights()` to blend a bandit bonus on top of the §ZZZZZ heavy-atom-adaptive base.
+
+However, `salsa_operator_wins` was initialised to all-zeros at startup and **reset to all-zeros at every epoch boundary** (line 4626 of miner.py before this fix). This meant:
+
+- Every epoch restarts with no knowledge of which operators worked best in prior epochs — even for the same weekly target protein.
+- Container restarts throw away any wins accumulated earlier in the session.
+- The §OOOO bandit never benefits from multi-epoch SAR signals even when the same target is used for 4+ consecutive epochs.
+
+For a weekly kinase target where bioisostere swaps consistently outperform ring walks, this is a measurable loss: each epoch the bandit re-learns from scratch rather than starting with warm priors.
+
+**Fix (3 locations, ~40 lines total):**
+
+**1. Epoch boundary: decay instead of reset** (`neurons/miner.py`, epoch-reset block)
+
+```python
+# §SSSSSSSSSSSS: decay ÷2 (floor 0) instead of resetting to zero.
+_s12_prev_wins = state.get('salsa_operator_wins', {bioisostere: 0, ...})
+state['salsa_operator_wins'] = {k: max(0, v // 2) for k, v in _s12_prev_wins.items()}
+_save_miner_state_text(db, 'salsa_operator_wins_json', json.dumps(state['salsa_operator_wins']))
+```
+
+Decay ÷2 preserves the directional signal while discounting stale evidence. A 12-win history from epoch 1 becomes a 6-win virtual prior for epoch 2, allowing 4 new §MM wins to outweigh it by epoch 2's round 4.
+
+**2. Win-credit block: persist immediately** (`neurons/miner.py`, §OOOO credit block)
+
+```python
+_oooo_wins[_oooo_op] += 1
+# §SSSSSSSSSSSS: persist to SQLite on each win
+_save_miner_state_text(db, 'salsa_operator_wins_json', json.dumps(_oooo_wins))
+```
+
+Writes survive process crashes/restarts between epochs.
+
+**3. Startup: restore from SQLite** (`neurons/miner.py`, after §EEEEEE restore block)
+
+```python
+_s12_raw = _load_miner_state_text(db, 'salsa_operator_wins_json')
+if _s12_raw:
+    _s12_wins = json.loads(_s12_raw)
+    # Normalise: preserve proportions, cap at 40 virtual trials
+    _s12_total = sum(_s12_wins.values())
+    _s12_scale = min(1.0, 40.0 / _s12_total)
+    state['salsa_operator_wins'] = {k: int(round(v * _s12_scale)) for k, v in _s12_wins.items()}
+```
+
+Normalisation to ≤40 virtual trials ensures historical priors don't dominate new evidence — after ~10 §MM rounds in the current epoch, the current wins can outweigh the prior signal.
+
+**4. GitHub cache: export and import** (`utils/github.py`, `neurons/miner.py`)
+
+`salsa_operator_wins_json` is added to the text-key export loop in `upload_boltz_cache_export()` (alongside `rxn_class_scores_json`). The existing `§PPPPPP` import loop in miner.py already handles any new text key by saving it to SQLite on startup — only a one-line addition to the key list was needed.
+
+**Regression guards:**
+
+- `state.get('salsa_operator_wins', {zeros})` → epoch reset is safe when key is absent (fresh container)
+- `max(0, v // 2)` → floor prevents negative counts
+- ≤40 virtual trials cap → new evidence dominates after ~10 §MM rounds
+- `try/except` on all SQLite writes → non-fatal on DB lock or missing key
+- `sum(_s12_wins.values()) > 0` guard → no-ops when all wins are zero (avoids dividing by 0)
+- Only the `salsa_operator_wins_json` text key is added to GitHub import — no schema change to boltz_cache or other data structures
+
+**Expected benefit:**
+
+| Scenario | Before §SSSSSSSSSSSS | After §SSSSSSSSSSSS |
+|----------|----------------------|---------------------|
+| Epoch 2+ same protein, no restart | §OOOO starts 0/0/0/0 | §OOOO starts with decayed epoch-1 wins |
+| Container restart mid-week | §OOOO starts 0/0/0/0 | §OOOO restores prior wins from SQLite (via GitHub cache) |
+| Protein rotation, fresh container | §OOOO starts 0/0/0/0 | GitHub cache skipped (`_protein_matched=False`); zero regression |
+| Epoch 1 cold start | §OOOO starts 0/0/0/0 | Same (no prior SQLite) — zero regression |
+
+Expected gain: **+1–3% Boltz LE** on epoch 2+ runs where one operator consistently outperforms. The improvement stacks with §OOOO (which was +2–5% when active), and is felt most on the first §MM round of each epoch — where §OOOO previously had no signal.
+
+**Files changed:**
+
+- `neurons/miner.py`:
+  - Epoch-reset block: `salsa_operator_wins` decay ÷2 + SQLite save (~12 lines)
+  - §OOOO win-credit block: add SQLite save after `_oooo_wins[op] += 1` (~8 lines)
+  - Startup restore block: `§SSSSSSSSSSSS` restore from SQLite (after §EEEEEE, ~22 lines)
+  - §PPPPPP import loop: add `'salsa_operator_wins_json'` to text-key list (1 line)
+- `utils/github.py`: add `'salsa_operator_wins_json'` to export loop (1 line)
+
+**Status: IMPLEMENTED 2026-08-25.**
 

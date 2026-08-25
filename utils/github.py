@@ -108,7 +108,8 @@ def upload_boltz_cache_export(db_path: str, protein: str) -> bool:
                     state_out[key] = float(row[0])
                 except Exception:
                     pass
-        for key in ("best_boltz_rxn_class", "rxn_class_scores_json"):
+        for key in ("best_boltz_rxn_class", "rxn_class_scores_json",
+                     "salsa_operator_wins_json"):  # §SSSSSSSSSSSS
             row = c.execute(
                 "SELECT value_text FROM miner_state WHERE key=?", (key,)
             ).fetchone()
