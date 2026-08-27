@@ -128,7 +128,112 @@ Cascades to all surrogate-dependent systems:
 
 ## Proposed Next Optimisations
 
-_None currently queued — §RRRRRRRRRRRR was the last item in this section and shipped 2026-08-24._
+### §TTTTTTTTTTTT — Reaction-Class Dead-End De-Emphasis — implemented 2026-08-27
+
+**Problem:** `_load_rxn_class_weights` (§EEEEEE) raises good reaction-class weights to 4×/2×/1.5×
+but never lowers any class below 1×.  After several epochs of streaming, many reaction classes
+accumulate 10–50 Boltz-scored molecules with consistently low ligand efficiency — yet still
+receive a 1× budget share identical to a novel, untested class.  If 25% of active SAVI
+reaction-class slots are dead-ends, ~25% of streaming time is wasted on chemistry the
+surrogate and Boltz oracle have repeatedly rejected.
+
+**Fix:** In `_load_rxn_class_weights`, after computing the existing top-3 amplification, identify
+classes in the **bottom quartile** of mean Boltz LE that have ≥10 scored molecules in the
+persisted score history.  Set those classes' weight to 0.5× instead of 1×.
+
+- **Evidence gate of ≥10 entries** prevents penalising classes on insufficient data (cold start,
+  new protein rotation, small cache).
+- **Quarter-rank boundary** (`int(n_classes × 0.75)` start index) is proportional to the number
+  of known classes — scales cleanly whether 4 or 40 classes are active.
+- The top-3 amplification is applied first and is completely unaffected.
+- Bottom-quartile classes that have evidence are halved; untested classes stay at 1×.
+
+**Regression guards:**
+- `_n < 4`: no bottom-quartile penalisation — fewer than 4 classes means the quartile would
+  overlap with top-3 amplified classes; the guard keeps those at their amplified level.
+- `len(data.get(cls, [])) < 10`: class not penalised even if bottom-quartile — cold start safe.
+- Wrapped in the existing outer `try/except Exception: return {}` — any failure returns empty
+  dict, identical to existing behaviour.
+- §RRRRRRRRRRRR merge uses `max(existing, new)` — a surrogate-amplified weight always wins
+  over a de-emphasised weight, so §TTTTTTTTTTTT never cancels a class §RRRRRRRRRRRR promotes.
+
+**Expected benefit:**
+
+| Scenario | Before §TTTTTTTTTTTT | After §TTTTTTTTTTTT |
+|----------|-----------------------|----------------------|
+| Epoch 3+, 20 reaction classes, 5 are dead-ends with ≥10 Boltz evidence each | 5× 1× dead-end budget | 5× 0.5× → 20–30% more budget for promising classes |
+| Epoch 1 / cold start / <10 entries per class | 1× baseline | 1× (no penalisation) |
+| Fewer than 4 known classes | 1× non-top-3 | 1× (guard bypasses quartile logic) |
+| Class promoted by §EEEEEE top-3 or §RRRRRRRRRRRR | 4×/2×/1.5× | Unchanged (de-emphasis only touches non-top-3, §RRRRRRRRRRRR max-merge wins) |
+
+Expected gain: **+1–3% Boltz LE** on epoch 3+ warm-cache runs with ≥4 reaction classes and
+sufficient per-class evidence.  Gain is proportional to how many streaming epochs have elapsed
+and how many dead-end classes have accumulated ≥10 entries.  Zero regression on cold start.
+
+**Files changed:**
+- `neurons/miner.py`: `_load_rxn_class_weights` docstring update + 4-line §TTTTTTTTTTTT block
+  after existing top-3 weighting.
+
+---
+
+### §UUUUUUUUUUUU — Surrogate Pre-Filter for SALSA Perturbations — proposed 2026-08-27
+
+**Problem:** Each §MM SALSA round generates ~200 perturbation candidates and runs PSICHIC on
+ALL of them before selecting the best as the next seed.  With a warm RF surrogate (≥100 cache
+points), the dual APB/APV model can score all 200 perturbations in ~10–30 ms (CPU, no GPU).
+PSICHIC at batch size 200 takes ~2–5 s per round.  If the surrogate can correctly rank the
+top-25% of perturbations before PSICHIC, we can reduce PSICHIC calls from 200 to 50 per round
+(–75%), enabling 3–4× more §MM rounds within the same epoch time budget.
+
+**Algorithm:**
+
+```
+for each §MM round:
+    candidates ← generate_perturbations(seed, n=200)
+    if dual_surrogate is RF-tier and len(candidates) >= 10:
+        ranked ← surrogate.predict_le(candidates)  # ~20 ms, no GPU
+        candidates ← top_k(ranked, k=50)           # pre-filter to top-25%
+    psichic_scores ← psichic_score(candidates)     # 50 instead of 200 mols
+    seed ← argmax(psichic_scores)
+```
+
+**Implementation sketch (~40 lines in utils/salsa.py):**
+
+1. Add `dual_surrogate: Optional[Any] = None` parameter to `run_salsa_search()`.
+2. After generating perturbations (existing `generate_perturbations` call), if
+   `dual_surrogate is not None` and both models are RF (check `_is_rf_tier(dual_surrogate)`):
+   a. Build a temporary DataFrame from the perturbation SMILES (just `product_smiles` column).
+   b. Call `augment_pool_with_surrogate_blend(df, dual_surrogate)` — already exists in
+      `neurons/miner.py` as a standalone helper; move or re-import into salsa.py, or pass it
+      as a callable parameter to avoid circular imports.
+   c. Sort by `surrogate_salsa_score` descending; keep top-25% (floor 10, cap 50).
+   d. Pass the filtered SMILES list to the existing PSICHIC batch.
+3. Fall back to full PSICHIC scoring when `dual_surrogate is None` (Ridge tier, cold start,
+   epoch 1) — identical to current behaviour.
+
+**Regression guards:**
+- `dual_surrogate is None` (cold start / Ridge tier): no change to perturbation count or
+  PSICHIC calls.
+- Top-K floor of 10: never reduces below 10 candidates regardless of how few pass the filter.
+- Cap of 50: keeps per-round PSICHIC time bounded even on H100 with 200+ perturbations.
+- The existing `_fp_cache` (§MMMMMM) continues to cache FPs for the SAVI pool; the
+  perturbation filter operates on a separate temporary list that is already not in the pool.
+
+**Expected benefit:**
+
+| Hardware | Current §MM rounds/epoch | After §UUUUUUUUUUUU |
+|----------|--------------------------|----------------------|
+| A100 (10 rounds budget) | 10 | ~25–35 rounds (3–4× multiplier from reduced PSICHIC time) |
+| H100 (20 rounds budget) | 20 | ~50–70 rounds |
+| Ridge tier / cold start | 10 / 20 | Same (no change) |
+
+Expected Boltz LE gain: **+3–6%** on epoch 2+ when RF surrogate is active, from deeper
+hill-climbing per epoch at no additional GPU cost.  Gain accumulates as §MM explores more of
+the neighbourhood around each Boltz-confirmed seed.
+
+**Estimated implementation effort:** ~40 lines in `utils/salsa.py` + 1 parameter change in
+§MM SALSA call in `neurons/miner.py`.  Medium complexity — requires avoiding circular imports
+between `salsa.py` and `miner.py` for the `augment_pool_with_surrogate_blend` helper.
 
 ---
 

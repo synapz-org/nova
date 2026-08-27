@@ -416,7 +416,8 @@ def _save_rxn_class_scores(db_path: str, rxn_class: str, score: float) -> None:
 
 def _load_rxn_class_weights(db_path: str) -> Dict[str, float]:
     """
-    §EEEEEE: Compute per-class SAVI sampling weights from persisted score history.
+    §EEEEEE / §TTTTTTTTTTTT: Compute per-class SAVI sampling weights from
+    persisted score history.
 
     Reads the JSON history written by _save_rxn_class_scores, computes the mean
     Boltz score per class, then assigns rank-based sampling weights:
@@ -425,6 +426,12 @@ def _load_rxn_class_weights(db_path: str) -> Dict[str, float]:
         top-2 class → 2×
         top-3 class → 1.5×
         all others  → 1×   (unchanged from baseline uniform)
+
+    §TTTTTTTTTTTT additionally de-emphasises classes in the bottom quartile of
+    mean Boltz LE that have accumulated ≥10 Boltz-scored molecules.  These
+    receive a 0.5× weight instead of the baseline 1×, halving their share of
+    the SAVI streaming budget.  The gate of ≥10 entries prevents penalising
+    classes on insufficient evidence (cold start, small pool, new protein).
 
     Returns an empty dict when no history exists or on any error — callers fall
     back to the §YY single-class 2× bias or uniform sampling in that case.
@@ -441,6 +448,13 @@ def _load_rxn_class_weights(db_path: str) -> Dict[str, float]:
         weights: Dict[str, float] = {cls: 1.0 for cls in means}
         for i, cls in enumerate(ranked[:3]):
             weights[cls] = [4.0, 2.0, 1.5][i]
+        # §TTTTTTTTTTTT: de-emphasise bottom-quartile classes with ≥10 data points.
+        _n = len(ranked)
+        if _n >= 4:
+            _cutoff = max(3, int(_n * 0.75))  # bottom 25% start index
+            for _cls in ranked[_cutoff:]:
+                if len(data.get(_cls, [])) >= 10:
+                    weights[_cls] = 0.5
         return weights
     except Exception:
         return {}
