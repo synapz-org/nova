@@ -2535,6 +2535,8 @@ async def run_boltz_prescoring(state: Dict[str, Any], max_candidates: int = 5) -
                     'product_smiles',
                     'product_name',
                     _salsa_operator_weights(_ff_best_smiles),  # §ZZZZZ
+                    None,  # out_operator_tags — §FF doesn't track bandit wins
+                    _dual,  # §UUUUUUUUUUUU: surrogate pre-filter for perturbation probes
                 )
                 # §NNNN: scaffold-diverse selection — ensures §NN fast-screen tests
                 # different chemical hypotheses instead of scaffold-homogeneous top-3.
@@ -2815,6 +2817,7 @@ async def run_boltz_prescoring(state: Dict[str, Any], max_candidates: int = 5) -
                     'product_name',
                     _salsa_operator_weights(_mm_seed_smiles, state.get('salsa_operator_wins')),  # §ZZZZZ + §OOOO
                     _mm_op_tags,  # §OOOO: out_operator_tags
+                    _dual,  # §UUUUUUUUUUUU: surrogate pre-filter for perturbation probes
                 )
                 # §NNNN: scaffold-diverse selection — each §MM fast-screen slot tests
                 # a different chemical family, maximising coverage per GPU budget.

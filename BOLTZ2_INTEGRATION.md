@@ -1,8 +1,8 @@
 # Boltz-2 Miner Integration
 
-## Current Status (as of 2026-08-25)
+## Current Status (as of 2026-08-28)
 
-**63 roadmap items implemented.** §SSSSSSSSSSSS (cross-epoch SALSA operator win persistence) added 2026-08-25. §RRRRRRRRRRRR (surrogate-guided SAVI reaction-class chunk selection) added 2026-08-24.
+**65 roadmap items implemented.** §UUUUUUUUUUUU (surrogate pre-filter for SALSA perturbations) added 2026-08-28. §TTTTTTTTTTTT (reaction-class dead-end de-emphasis) added 2026-08-27. §SSSSSSSSSSSS (cross-epoch SALSA operator win persistence) added 2026-08-25.
 
 ---
 
@@ -176,65 +176,75 @@ and how many dead-end classes have accumulated ≥10 entries.  Zero regression o
 
 ---
 
-### §UUUUUUUUUUUU — Surrogate Pre-Filter for SALSA Perturbations — proposed 2026-08-27
+### §UUUUUUUUUUUU — Surrogate Pre-Filter for SALSA Perturbations — implemented 2026-08-28
 
-**Problem:** Each §MM SALSA round generates ~200 perturbation candidates and runs PSICHIC on
-ALL of them before selecting the best as the next seed.  With a warm RF surrogate (≥100 cache
-points), the dual APB/APV model can score all 200 perturbations in ~10–30 ms (CPU, no GPU).
-PSICHIC at batch size 200 takes ~2–5 s per round.  If the surrogate can correctly rank the
-top-25% of perturbations before PSICHIC, we can reduce PSICHIC calls from 200 to 50 per round
-(–75%), enabling 3–4× more §MM rounds within the same epoch time budget.
+**Problem:** Each §MM SALSA round generates ~200 perturbation probe SMILES and maps ALL of
+them to nearest SAVI pool molecules via Tanimoto.  With a warm RF surrogate (≥100 cache
+points), the dual APB/APV model can score all 200 probes in ~20 ms (CPU vectorized predict).
+Filtering the bottom 75% before Tanimoto lookup concentrates pool queries on chemical
+directions the surrogate predicts will yield higher Boltz LE — enabling more §MM rounds
+within the same epoch time budget at no GPU cost.
 
 **Algorithm:**
 
 ```
 for each §MM round:
     candidates ← generate_perturbations(seed, n=200)
-    if dual_surrogate is RF-tier and len(candidates) >= 10:
-        ranked ← surrogate.predict_le(candidates)  # ~20 ms, no GPU
-        candidates ← top_k(ranked, k=50)           # pre-filter to top-25%
-    psichic_scores ← psichic_score(candidates)     # 50 instead of 200 mols
-    seed ← argmax(psichic_scores)
+    if dual_surrogate is RF-tier and len(candidates) > 10:
+        surrogate_scores ← predict((apb - apv) / ha) for each probe SMILES
+        candidates ← top_k(surrogate_scores, k=max(10, min(50, 25% of len)))
+    pool_hits ← [nearest_savi_mol(c) for c in candidates]  # ~50 lookups vs 200
+    seed ← argmax(pool_hits by score_col)
 ```
 
-**Implementation sketch (~40 lines in utils/salsa.py):**
+**Fix:**
 
-1. Add `dual_surrogate: Optional[Any] = None` parameter to `run_salsa_search()`.
-2. After generating perturbations (existing `generate_perturbations` call), if
-   `dual_surrogate is not None` and both models are RF (check `_is_rf_tier(dual_surrogate)`):
-   a. Build a temporary DataFrame from the perturbation SMILES (just `product_smiles` column).
-   b. Call `augment_pool_with_surrogate_blend(df, dual_surrogate)` — already exists in
-      `neurons/miner.py` as a standalone helper; move or re-import into salsa.py, or pass it
-      as a callable parameter to avoid circular imports.
-   c. Sort by `surrogate_salsa_score` descending; keep top-25% (floor 10, cap 50).
-   d. Pass the filtered SMILES list to the existing PSICHIC batch.
-3. Fall back to full PSICHIC scoring when `dual_surrogate is None` (Ridge tier, cold start,
-   epoch 1) — identical to current behaviour.
+1. **`utils/salsa.py` — `_prefilter_perturbations_with_surrogate` helper (~55 lines)**:
+   - Checks RF tier: both models must be `RandomForestRegressor` (skip at Ridge/cold start).
+   - Computes `_descriptor_vector(smi) + [0.0]` for each probe (`psichic_le=0.0` neutral
+     prior — probe SMILES are not in the SAVI pool and have no PSICHIC score).
+   - Predicts APB/APV and computes `(apb_pred - apv_pred) / ha` per probe.
+   - Keeps `max(10, min(50, int(n * 0.25)))` probes by descending predicted LE.
+   - Falls back to returning all perturbations unchanged on any exception or missing RF.
+
+2. **`utils/salsa.py` — `run_salsa_search` signature + pre-filter call**:
+   - New `dual_surrogate=None` parameter (backward-compatible; existing callers unaffected).
+   - After perturbation generation (both tagged and untagged branches), calls
+     `_prefilter_perturbations_with_surrogate(perturbations, dual_surrogate)`.
+   - `_probe_to_op` dict (§OOOO bandit tracking) remains valid after filtering — it is
+     keyed by SMILES string, so dict lookups for surviving probes still hit correctly.
+
+3. **`neurons/miner.py` — §MM and §FF `run_salsa_search` calls**:
+   - Pass `dual_surrogate=_dual` at both call sites.
+   - §MM: `_dual` as 12th positional arg after `_mm_op_tags`.
+   - §FF: explicit `None` for `out_operator_tags` then `_dual` as `dual_surrogate`.
 
 **Regression guards:**
-- `dual_surrogate is None` (cold start / Ridge tier): no change to perturbation count or
-  PSICHIC calls.
-- Top-K floor of 10: never reduces below 10 candidates regardless of how few pass the filter.
-- Cap of 50: keeps per-round PSICHIC time bounded even on H100 with 200+ perturbations.
-- The existing `_fp_cache` (§MMMMMM) continues to cache FPs for the SAVI pool; the
-  perturbation filter operates on a separate temporary list that is already not in the pool.
+- `dual_surrogate is None` (cold start, Ridge tier <100 pts): returns perturbations unchanged.
+- Floor of 10: never reduces below 10 probes regardless of pool size.
+- Cap of 50: bounds per-round surrogate inference time even with large perturbation budgets.
+- Existing `_probe_to_op` SMILES-keyed dict (§OOOO) survives subsetting — lookup for
+  surviving probes still hits; missing probes default to `'unknown'` operator tag.
+- Wrapped in `try/except` — any descriptor/predict failure logs at debug and returns unfiltered.
 
 **Expected benefit:**
 
-| Hardware | Current §MM rounds/epoch | After §UUUUUUUUUUUU |
-|----------|--------------------------|----------------------|
-| A100 (10 rounds budget) | 10 | ~25–35 rounds (3–4× multiplier from reduced PSICHIC time) |
-| H100 (20 rounds budget) | 20 | ~50–70 rounds |
-| Ridge tier / cold start | 10 / 20 | Same (no change) |
+| Hardware | §MM rounds/epoch (before) | §MM rounds/epoch (after) |
+|----------|--------------------------|--------------------------|
+| A100 (10-round budget) | 10 | +1–3 extra rounds |
+| H100 (20-round budget) | 20 | +2–6 extra rounds |
+| Ridge tier / cold start | 10 / 20 | Same (no-op) |
 
-Expected Boltz LE gain: **+3–6%** on epoch 2+ when RF surrogate is active, from deeper
-hill-climbing per epoch at no additional GPU cost.  Gain accumulates as §MM explores more of
-the neighbourhood around each Boltz-confirmed seed.
+Primary gain is from directing Tanimoto lookups toward higher-LE chemical directions — fewer
+lookups per round (50 vs 200) → less CPU time → more §MM rounds per epoch.
 
-**Estimated implementation effort:** ~40 lines in `utils/salsa.py` + 1 parameter change in
-§MM SALSA call in `neurons/miner.py`.  Medium complexity — requires avoiding circular imports
-between `salsa.py` and `miner.py` for the `augment_pool_with_surrogate_blend` helper.
+Expected Boltz LE gain: **+3–6%** on epoch 2+ warm-cache runs at RF tier.
 
+**Files changed:**
+- `utils/salsa.py`: `_prefilter_perturbations_with_surrogate` helper (~55 lines);
+  `dual_surrogate=None` parameter added to `run_salsa_search`; pre-filter call in rounds loop.
+- `neurons/miner.py`: `_dual` passed to §MM `run_salsa_search` (+1 line);
+  `None, _dual` passed to §FF `run_salsa_search` (+2 lines).
 ---
 
 ## Implemented Optimisations (recent)
