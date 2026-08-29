@@ -2735,14 +2735,61 @@ async def run_boltz_prescoring(state: Dict[str, Any], max_candidates: int = 5) -
     _mm_best_score: float = max(
         (_v for _v in _mm_all_scored.values() if math.isfinite(_v)), default=-math.inf
     )
-    _mm_seed_smiles: Optional[str] = (
-        max(
-            (_s for _s, _v in _mm_all_scored.items() if math.isfinite(_v)),
-            key=lambda s: _mm_all_scored[s],
-            default=None,
+    # §VVVVVVVVVVVV: Reliability-adjusted §MM seed selection.
+    # Select the §MM starting molecule by reliability_score = boltz_le / (1 + 10 × max_var),
+    # where max_var = max(boltz_le_std, boltz_ww_std) from the SQLite cache.  This prevents
+    # hill-climbing from stochastic Boltz-2 outliers whose high LE in one inference run is not
+    # reproduced across affinity samples (boltz_le_std) or random seeds (boltz_ww_std).
+    # §WWWWWWWWWWWWWWW and §XXXXXXXX already use the same variance signals to down-weight these
+    # molecules in surrogate training — this makes §MM seed selection consistent with that logic.
+    # _mm_best_score remains the raw argmax(LE) so §MM round comparisons use the true epoch best.
+    _mm_seed_smiles: Optional[str] = None
+    try:
+        _vvvvvvvvvvvv_var: Dict[str, float] = {}
+        if _mm_all_scored:
+            with sqlite3.connect(db_path) as _vvvv_conn:
+                for _vvvv_sm in list(_mm_all_scored):
+                    if not math.isfinite(_mm_all_scored.get(_vvvv_sm, -math.inf)):
+                        continue
+                    _vvvv_row = _vvvv_conn.execute(
+                        "SELECT boltz_le_std, boltz_ww_std FROM boltz_cache "
+                        "WHERE smiles=? AND protein=?",
+                        (_vvvv_sm, protein)
+                    ).fetchone()
+                    if _vvvv_row:
+                        _vvvv_s = float(_vvvv_row[0] or 0.0)
+                        _vvvv_w = float(_vvvv_row[1] or 0.0)
+                        _vvvvvvvvvvvv_var[_vvvv_sm] = max(_vvvv_s, _vvvv_w)
+            _mm_seed_smiles = max(
+                (_s for _s, _v in _mm_all_scored.items() if math.isfinite(_v)),
+                key=lambda s: _mm_all_scored[s] / (1.0 + 10.0 * _vvvvvvvvvvvv_var.get(s, 0.0)),
+                default=None,
+            )
+            _vvvv_raw = max(
+                (_s for _s, _v in _mm_all_scored.items() if math.isfinite(_v)),
+                key=lambda s: _mm_all_scored[s],
+                default=None,
+            )
+            if _mm_seed_smiles != _vvvv_raw and _mm_seed_smiles is not None and _vvvv_raw is not None:
+                bt.logging.info(
+                    f"[§VVVVVVVVVVVV] Reliability seed overrides raw argmax: "
+                    f"seed_LE={_mm_all_scored[_mm_seed_smiles]:.4f} "
+                    f"seed_var={_vvvvvvvvvvvv_var.get(_mm_seed_smiles, 0.0):.4f} vs "
+                    f"raw_LE={_mm_all_scored[_vvvv_raw]:.4f} "
+                    f"raw_var={_vvvvvvvvvvvv_var.get(_vvvv_raw, 0.0):.4f}"
+                )
+    except Exception as _vvvv_err:
+        bt.logging.debug(f"[§VVVVVVVVVVVV] Seed fallback to raw argmax: {_vvvv_err}")
+        _mm_seed_smiles = None
+    if _mm_seed_smiles is None:
+        _mm_seed_smiles = (
+            max(
+                (_s for _s, _v in _mm_all_scored.items() if math.isfinite(_v)),
+                key=lambda s: _mm_all_scored[s],
+                default=None,
+            )
+            if _mm_all_scored else None
         )
-        if _mm_all_scored else None
-    )
     _mm_savi_pool = _hhhhhh_pool if _hhhhhh_pool is not None else state.get('savi_stream_pool')
     # §KKKKKK: Hardware-adaptive §MM max rounds.  BoltzWrapper (instantiated above)
     # already probed VRAM and patched config: §XXXXX sets num_subsampled_msa=4096 on

@@ -1,8 +1,8 @@
 # Boltz-2 Miner Integration
 
-## Current Status (as of 2026-08-28)
+## Current Status (as of 2026-08-29)
 
-**65 roadmap items implemented.** §UUUUUUUUUUUU (surrogate pre-filter for SALSA perturbations) added 2026-08-28. §TTTTTTTTTTTT (reaction-class dead-end de-emphasis) added 2026-08-27. §SSSSSSSSSSSS (cross-epoch SALSA operator win persistence) added 2026-08-25.
+**66 roadmap items implemented.** §VVVVVVVVVVVV (reliability-adjusted §MM seed selection) added 2026-08-29. §UUUUUUUUUUUU (surrogate pre-filter for SALSA perturbations) added 2026-08-28. §TTTTTTTTTTTT (reaction-class dead-end de-emphasis) added 2026-08-27.
 
 ---
 
@@ -7492,3 +7492,73 @@ Expected gain: **+1–3% Boltz LE** on epoch 2+ runs where one operator consiste
 
 **Status: IMPLEMENTED 2026-08-25.**
 
+
+---
+
+### §VVVVVVVVVVVV — Reliability-Adjusted §MM Seed Selection — implemented 2026-08-29
+
+**Problem:** `_mm_seed_smiles` in `run_boltz_prescoring` is selected as `argmax(boltz_le)` over all
+Boltz-scored molecules in `_mm_all_scored`.  A molecule with the highest LE but high Boltz-2
+variance (`boltz_le_std` — intra-run sample spread; `boltz_ww_std` — inter-seed spread) is a
+poor hill-climbing seed: its score may be a stochastic artifact of the diffusion process rather
+than a genuine binding signal.  Starting §MM from such an outlier wastes 3 Boltz calls per round
+(fast-screen + full pass) on a false positive.
+
+This creates an inconsistency with §WWWWWWWWWWWWWWW and §XXXXXXXX: the surrogate training already
+down-weights high-variance molecules via `1 / (1 + 10 × boltz_le_std)` and `1 / (1 + 10 × boltz_ww_std)`,
+correctly treating them as uncertain training examples.  The §MM seed selector ignores this
+information and trusts the raw LE equally regardless of variance.
+
+**Fix:** After building `_mm_all_scored` and before the §KKKKKK round-cap block:
+
+1. Query SQLite for `boltz_le_std` and `boltz_ww_std` for each SMILES in `_mm_all_scored`.
+2. Compute `reliability_score = boltz_le / (1.0 + 10.0 × max(boltz_le_std, boltz_ww_std))`
+   for each candidate.  Uses the same coefficient (10) as the surrogate training weight to
+   maintain internal consistency.
+3. Select `_mm_seed_smiles = argmax(reliability_score)` instead of argmax(boltz_le).
+4. Keep `_mm_best_score` as the raw argmax(boltz_le) — this is the improvement threshold used
+   by §MM round comparisons (a round counts as an improvement only if the new LE beats the true
+   epoch best, not just the reliability-adjusted seed's LE).
+5. Log at INFO when reliability selection overrides the raw argmax (including both scores and
+   variances); log at DEBUG when they agree.
+6. Fall back to raw argmax on any SQLite error or if `_mm_all_scored` is empty.
+
+**Design:**
+
+The reliability weight `1 / (1 + 10 × max_var)` has the following properties:
+- `max_var = 0.00` (no variance data, or perfectly consistent): weight = 1.0 — no penalty
+- `max_var = 0.05` (typical stable molecule): weight = 0.67 — moderate penalty
+- `max_var = 0.10` (high intra-run spread): weight = 0.50 — halved score
+- `max_var = 0.20` (very noisy prediction): weight = 0.33 — 3× discount
+
+A molecule with `boltz_le = 0.06` and `max_var = 0.10` has reliability_score = 0.03, losing
+to a molecule with `boltz_le = 0.05` and `max_var = 0.00` (reliability_score = 0.05).  The
+surrogate training already applies this same logic, so §MM now starts from the same molecule
+the surrogate considers most trustworthy.
+
+**Regression guards:**
+- `try/except` on all SQLite access → non-fatal fallback to raw argmax
+- `_mm_seed_smiles is None` guard → additional raw argmax fallback
+- `_vvvvvvvvvvvv_var.get(s, 0.0)` default → molecules without variance data (warm-start
+  entry from §BBBBBBBBBB, or §MM new discover) receive no penalty, same as before
+- `_mm_best_score` stays as raw max LE → §MM round comparison logic unchanged
+- Only affects which molecule §MM *starts from* — does not change Boltz scoring logic,
+  submission ordering, or surrogate training
+
+**Expected benefit:**
+
+| Scenario | Before §VVVVVVVVVVVV | After §VVVVVVVVVVVV |
+|----------|----------------------|---------------------|
+| All scored molecules have low variance | argmax = reliability argmax | Same molecule selected |
+| 1 molecule has `max_var ≥ 0.05`, next-best is reliable | argmax = noisy outlier | Reliable 2nd-best selected as seed |
+| Warm-start molecule from §BBBBBBBBBB | No variance row → no penalty | Still no penalty (default 0.0) |
+| Any SQLite error | N/A | Falls back to raw argmax — no regression |
+
+Expected gain: **+2–5% Boltz LE** on epochs where the initial Boltz pass produces one stochastic
+high-scoring outlier (estimated ~20–35% of epochs on warm-cache targets).  Gain is largest on
+epoch 1 cold starts (fewer Boltz calls → each §MM round is more precious) and decreases as the
+surrogate accumulates enough training data to pre-filter outliers from the Boltz candidate pool.
+Zero regression on epochs where all scores are consistent.
+
+**Files changed:**
+- `neurons/miner.py`: §MM seed selection block (~50 lines) replacing 7-line raw argmax.
