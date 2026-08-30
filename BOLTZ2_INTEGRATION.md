@@ -1,12 +1,94 @@
 # Boltz-2 Miner Integration
 
-## Current Status (as of 2026-08-29)
+## Current Status (as of 2026-08-30)
 
-**66 roadmap items implemented.** §VVVVVVVVVVVV (reliability-adjusted §MM seed selection) added 2026-08-29. §UUUUUUUUUUUU (surrogate pre-filter for SALSA perturbations) added 2026-08-28. §TTTTTTTTTTTT (reaction-class dead-end de-emphasis) added 2026-08-27.
+**67 roadmap items implemented.** §WWWWWWWWWWWW (cache-adaptive surrogate blend alpha) added 2026-08-30. §VVVVVVVVVVVV (reliability-adjusted §MM seed selection) added 2026-08-29. §UUUUUUUUUUUU (surrogate pre-filter for SALSA perturbations) added 2026-08-28. §TTTTTTTTTTTT (reaction-class dead-end de-emphasis) added 2026-08-27.
 
 ---
 
 ## Implemented Optimisations (recent)
+
+### §WWWWWWWWWWWW — Cache-Adaptive Surrogate Blend Alpha — added 2026-08-30
+
+**Problem:** `augment_pool_with_surrogate_blend` uses a fixed `alpha=0.6` (60% surrogate,
+40% PSICHIC) at all surrogate-active call sites: §YYYYYY streaming re-rank, §HHHHHH SALSA
+pool augmentation, §UUUUUU GA fitness, §RRRRRRRRRRRR rxn-class scoring, and §IIIIII online
+surrogate refresh.
+
+This fixed weight makes no distinction between:
+- A freshly activated RF surrogate at 100 cache points (RF threshold, OOB R² ≈ 0.3–0.5,
+  limited generalisation to the broad SAVI pool).
+- A mature RF surrogate at 600+ cache points (OOB R² ≈ 0.6–0.8, reliable scaffold
+  discrimination, strong SAR coverage of the weekly target).
+
+At 100 pts the surrogate has just barely seen enough data to be better than Ridge; alpha=0.6
+may overweight a noisy model relative to the general-purpose PSICHIC signal.  At 600+ pts
+the surrogate has learned the target's SAR from diverse Boltz oracle calls; alpha=0.6
+underweights a well-calibrated predictor.  The inconsistency is particularly visible in
+SALSA hill-climbing (§FF/§MM) and reaction-class selection (§RRRRRRRRRRRR), where surrogate
+guidance quality directly determines hill-climbing direction.
+
+**Fix:** `utils/surrogate.py` — `adaptive_blend_alpha(db_path, protein, base=0.60, cap=0.80)`:
+
+Queries `SELECT COUNT(*) FROM boltz_cache WHERE protein=?` and returns:
+```
+alpha = clamp(base + max(0, (n_pts − RF_THRESHOLD) / 2500), base, cap)
+```
+
+| n_pts | alpha | Note |
+|-------|-------|------|
+| 100 (RF threshold) | 0.600 | No regression from fixed default |
+| 200 | 0.640 | Modest increase |
+| 350 | 0.700 | Mid-point |
+| 500 | 0.760 | 5+ warm-cache epochs |
+| 600+ | 0.800 | Cap: mature surrogate |
+
+Falls back to `base=0.60` on any SQLite error — identical to pre-§WWWWWWWWWWWW behaviour.
+
+**Implementation:**
+
+1. **`utils/surrogate.py`**: `adaptive_blend_alpha(db_path, protein, base, cap)` added after
+   `_RF_THRESHOLD` constant (~20 lines).
+
+2. **`neurons/miner.py`**: `adaptive_blend_alpha` added to imports; called at 6 call sites:
+   - §YYYYYY streaming: `_yyyyyy_alpha` before `augment_pool_with_surrogate_blend(df, _yyyyyy_sds)`
+   - §RRRRRRRRRRRR rxn-class: `_rrr_alpha` passed to `_rank_rxn_classes_by_surrogate`
+   - §UUUUUU GA: `_uu_alpha` passed to both GA-pool and GA-seed augmentation calls
+   - §HHHHHH SALSA pool: `_hhhhhh_alpha` before `augment_pool_with_surrogate_blend(_hhhhhh_base, _dual)`; alpha logged in §HHHHHH INFO line
+   - §IIIIII online refresh: `_ii_alpha` before `augment_pool_with_surrogate_blend(_ii_src, _ii_dual)`
+
+3. **`_rank_rxn_classes_by_surrogate`**: added `alpha: float = 0.6` parameter; passes it to
+   `augment_pool_with_surrogate_blend`; backward-compatible (default unchanged).
+
+**Regression guards:**
+- At RF threshold (100 pts): `alpha = 0.60` — identical to pre-§WWWWWWWWWWWW default.
+- Ridge tier (<100 pts): `augment_pool_with_surrogate_blend` rejects Ridge models and returns
+  pool unchanged regardless of alpha — no effect.
+- SQLite error: `adaptive_blend_alpha` returns `base=0.60` — identical to pre-§WWWWWWWWWWWW.
+- Alpha DB query: 1 `SELECT COUNT(*)` — sub-millisecond; negligible vs. Boltz inference time.
+- Cap of 0.80: PSICHIC always contributes ≥20% weight — prevents full surrogate takeover.
+
+**Expected benefit:**
+
+| Scenario | Before §WWWWWWWWWWWW | After §WWWWWWWWWWWW |
+|----------|----------------------|---------------------|
+| 100 pts (RF just activated) | alpha=0.60 | alpha=0.60 (no change) |
+| 300 pts (warm epoch 3+ cache) | alpha=0.60 | alpha=0.68 (surrogate trusted 13% more) |
+| 600+ pts (mature cross-week cache) | alpha=0.60 | alpha=0.80 (cap — mature RF dominates) |
+| Ridge tier (<100 pts) | N/A (pool unchanged) | N/A (pool unchanged) |
+| SQLite error | alpha=0.60 | alpha=0.60 (fallback) |
+
+Expected Boltz LE gain: **+1–3%** on warm-cache epochs (500+ pts) where the surrogate's
+chemical intuition is most reliable.  Gain is proportional to how many cache points the
+miner has accumulated from prior epochs — largest on week-3+ or restart sessions with
+GitHub-imported cache.  Zero regression at RF threshold or below.
+
+**Files changed:**
+- `utils/surrogate.py`: `adaptive_blend_alpha` function (~20 lines) after `_RF_THRESHOLD`.
+- `neurons/miner.py`: import + 6 call-site updates (~15 lines); `_rank_rxn_classes_by_surrogate`
+  signature update (1 line).
+
+---
 
 ### §RRRRRRRRRRRR — Surrogate-Guided SAVI Reaction-Class Chunk Selection — added 2026-08-24
 

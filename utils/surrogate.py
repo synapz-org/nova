@@ -90,6 +90,41 @@ def _descriptor_vector(smiles: str) -> Optional[list]:
 _RF_THRESHOLD = 100  # §QQQQ: switch to RandomForest above this many training points
 
 
+def adaptive_blend_alpha(
+    db_path: str,
+    protein: str,
+    base: float = 0.60,
+    cap: float = 0.80,
+) -> float:
+    """
+    §WWWWWWWWWWWW: Return a surrogate blend alpha that scales with cache coverage.
+
+    At the RF activation threshold (100 pts) the surrogate has only just seen enough
+    data to generalize beyond the training set; alpha=0.60 matches the existing fixed
+    default to avoid regression.  As the cache grows, the RF surrogate becomes more
+    reliable, so alpha increases linearly toward cap=0.80 — giving the surrogate more
+    influence over SALSA/GA candidate selection relative to the general-purpose PSICHIC
+    signal.
+
+    Formula: alpha = clamp(base + max(0, (n_pts − RF_THRESHOLD) / 2500), base, cap)
+      100 pts  → 0.60  (no change from existing default)
+      350 pts  → 0.70  (moderate trust increase)
+      600 pts  → 0.80  (cap — well-trained surrogate)
+      600+ pts → 0.80  (capped)
+
+    Falls back to `base` on any SQLite error so the caller always gets a valid float.
+    """
+    try:
+        with sqlite3.connect(db_path, timeout=5) as conn:
+            row = conn.execute(
+                "SELECT COUNT(*) FROM boltz_cache WHERE protein=?", (protein,)
+            ).fetchone()
+        n_pts = int(row[0]) if row else 0
+        return min(cap, base + max(0.0, (n_pts - _RF_THRESHOLD) / 2500.0))
+    except Exception:
+        return base
+
+
 def fit_surrogate(db_path: str, protein: str, min_points: int = 40):
     """
     Fit a surrogate model on Boltz-2 scores from the disk cache.

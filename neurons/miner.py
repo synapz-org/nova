@@ -50,7 +50,7 @@ from utils.msa import ensure_msa
 from utils.salsa import run_salsa_search
 from utils.genetic import run_gradient_ga
 from utils.chembl import get_chembl_seeds
-from utils.surrogate import fit_surrogate, rank_pool_by_surrogate, ucb_rank_pool, fit_dual_surrogate, dual_surrogate_rank_pool, dual_surrogate_ucb_rank_pool, augment_pool_with_surrogate_blend, fit_dual_surrogate_with_embeddings, dual_surrogate_ucb_rank_pool_emb
+from utils.surrogate import fit_surrogate, rank_pool_by_surrogate, ucb_rank_pool, fit_dual_surrogate, dual_surrogate_rank_pool, dual_surrogate_ucb_rank_pool, augment_pool_with_surrogate_blend, fit_dual_surrogate_with_embeddings, dual_surrogate_ucb_rank_pool_emb, adaptive_blend_alpha
 from PSICHIC.wrapper import PsichicWrapper
 from boltz.wrapper import BoltzWrapper
 from btdr import QuicknetBittensorDrandTimelock
@@ -770,7 +770,7 @@ def stream_random_chunk_from_dataset(dataset_repo: str, chunk_size: int, rxn_bia
 # 5. INFERENCE AND SUBMISSION LOGIC
 # ----------------------------------------------------------------------------
 
-def _rank_rxn_classes_by_surrogate(pool_df, dual_surrogate) -> Dict[str, float]:
+def _rank_rxn_classes_by_surrogate(pool_df, dual_surrogate, alpha: float = 0.6) -> Dict[str, float]:
     """
     §RRRRRRRRRRRR: Rank SAVI reaction classes by mean dual-surrogate LE score.
 
@@ -782,6 +782,7 @@ def _rank_rxn_classes_by_surrogate(pool_df, dual_surrogate) -> Dict[str, float]:
     Returns an empty dict on any failure so the caller silently falls through.
     Only activates at RF tier (≥100 cache points) — augment_pool_with_surrogate_blend
     returns pool_df unchanged (no surrogate_salsa_score) for Ridge models.
+    alpha: §WWWWWWWWWWWW adaptive blend weight (default 0.6 matches pre-§WWWWWWWWWWWW).
     """
     if pool_df is None or pool_df.empty or dual_surrogate is None:
         return {}
@@ -798,7 +799,7 @@ def _rank_rxn_classes_by_surrogate(pool_df, dual_surrogate) -> Dict[str, float]:
         if pool.empty:
             return {}
 
-        augmented = augment_pool_with_surrogate_blend(pool, dual_surrogate)
+        augmented = augment_pool_with_surrogate_blend(pool, dual_surrogate, alpha=alpha)
         if 'surrogate_salsa_score' not in augmented.columns:
             return {}
 
@@ -975,7 +976,11 @@ async def run_psichic_model_loop(state: Dict[str, Any]) -> None:
                 # on cold starts or Ridge-only quality it returns df unchanged.
                 _yyyyyy_sds = state.get('startup_dual_surrogate')
                 if _yyyyyy_sds is not None:
-                    _yyyyyy_aug = augment_pool_with_surrogate_blend(df, _yyyyyy_sds)
+                    _yyyyyy_alpha = adaptive_blend_alpha(
+                        state.get('boltz_cache_db', BOLTZ_CACHE_DB),
+                        state['config'].weekly_target,
+                    )
+                    _yyyyyy_aug = augment_pool_with_surrogate_blend(df, _yyyyyy_sds, alpha=_yyyyyy_alpha)
                     if 'surrogate_salsa_score' in _yyyyyy_aug.columns:
                         df = _yyyyyy_aug.sort_values(
                             'surrogate_salsa_score', ascending=False
@@ -1070,7 +1075,11 @@ async def run_psichic_model_loop(state: Dict[str, Any]) -> None:
                 ):
                     state['rrrrrrrrrrrr_done_this_epoch'] = True
                     try:
-                        _rrr_weights = _rank_rxn_classes_by_surrogate(_rrr_pool, _rrr_surr)
+                        _rrr_alpha = adaptive_blend_alpha(
+                            state.get('boltz_cache_db', BOLTZ_CACHE_DB),
+                            state['config'].weekly_target,
+                        )
+                        _rrr_weights = _rank_rxn_classes_by_surrogate(_rrr_pool, _rrr_surr, alpha=_rrr_alpha)
                         if _rrr_weights:
                             _existing_w = state.get('rxn_class_weights') or {}
                             _merged_w = dict(_existing_w)
@@ -1392,8 +1401,12 @@ async def run_psichic_model_loop(state: Dict[str, Any]) -> None:
                                 state['config'].weekly_target
                             )
                             if _uu_dual is not None:
-                                _uu_ga_pool = augment_pool_with_surrogate_blend(_uu_ga_pool, _uu_dual)
-                                _uu_ga_seed = augment_pool_with_surrogate_blend(_uu_ga_seed, _uu_dual)
+                                _uu_alpha = adaptive_blend_alpha(
+                                    state.get('boltz_cache_db', BOLTZ_CACHE_DB),
+                                    state['config'].weekly_target,
+                                )
+                                _uu_ga_pool = augment_pool_with_surrogate_blend(_uu_ga_pool, _uu_dual, alpha=_uu_alpha)
+                                _uu_ga_seed = augment_pool_with_surrogate_blend(_uu_ga_seed, _uu_dual, alpha=_uu_alpha)
                                 if 'surrogate_salsa_score' in _uu_ga_pool.columns:
                                     _uu_ga_score_col = 'surrogate_salsa_score'
                                     bt.logging.info(
@@ -2488,13 +2501,14 @@ async def run_boltz_prescoring(state: Dict[str, Any], max_candidates: int = 5) -
     _hhhhhh_base = state.get('savi_stream_pool')
     if _dual is not None and _hhhhhh_base is not None and not _hhhhhh_base.empty:
         try:
-            _aug = augment_pool_with_surrogate_blend(_hhhhhh_base, _dual)
+            _hhhhhh_alpha = adaptive_blend_alpha(db_path, protein)
+            _aug = augment_pool_with_surrogate_blend(_hhhhhh_base, _dual, alpha=_hhhhhh_alpha)
             if 'surrogate_salsa_score' in _aug.columns:
                 _hhhhhh_pool = _aug
                 _hhhhhh_score_col = 'surrogate_salsa_score'
                 bt.logging.info(
                     f"[§HHHHHH] SAVI pool ({len(_aug)} mols) augmented with surrogate-blend "
-                    f"score -- §FF/§MM SALSA will hill-climb on blended Boltz signal."
+                    f"score (alpha={_hhhhhh_alpha:.2f}) -- §FF/§MM SALSA will hill-climb on blended Boltz signal."
                 )
         except Exception as _hhhhhh_err:
             bt.logging.debug(f"[§HHHHHH] Pool augmentation skipped: {_hhhhhh_err}")
@@ -3026,8 +3040,9 @@ async def run_boltz_prescoring(state: Dict[str, Any], max_candidates: int = 5) -
                                         else state.get('savi_stream_pool')
                                     )
                                     if _ii_src is not None and not _ii_src.empty:
+                                        _ii_alpha = adaptive_blend_alpha(db_path, protein)
                                         _ii_pool = augment_pool_with_surrogate_blend(
-                                            _ii_src, _ii_dual
+                                            _ii_src, _ii_dual, alpha=_ii_alpha
                                         )
                                         if 'surrogate_salsa_score' in _ii_pool.columns:
                                             _mm_savi_pool = _ii_pool
