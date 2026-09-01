@@ -125,6 +125,40 @@ def adaptive_blend_alpha(
         return base
 
 
+def adaptive_ucb_beta(
+    db_path: str,
+    protein: str,
+    base: float = 1.0,
+    floor: float = 0.5,
+) -> float:
+    """
+    §XXXXXXXXXXXX: Return a UCB exploration coefficient (beta) that scales down with
+    cache coverage — the dual of §WWWWWWWWWWWW's adaptive_blend_alpha.
+
+    At RF activation (100 pts) the surrogate's per-tree variance estimates are noisy;
+    high beta (1.0) ensures exploration into uncertain chemical space.  As the cache
+    grows the RF is better calibrated, so we can trust the mean prediction more and
+    reduce the exploration bonus — converging faster to the surrogate's predicted best.
+
+    Formula: beta = clamp(base - max(0, (n_pts − RF_THRESHOLD) / 1250), floor, base)
+      100 pts  → 1.00  (no change from existing default)
+      350 pts  → 0.80  (moderate exploitation increase)
+      600 pts  → 0.60  (mature cache: exploit more)
+      725+ pts → 0.50  (floor — always retain some exploration)
+
+    Falls back to `base` (1.0) on any SQLite error so the caller always gets a valid float.
+    """
+    try:
+        with sqlite3.connect(db_path, timeout=5) as conn:
+            row = conn.execute(
+                "SELECT COUNT(*) FROM boltz_cache WHERE protein=?", (protein,)
+            ).fetchone()
+        n_pts = int(row[0]) if row else 0
+        return max(floor, base - max(0.0, (n_pts - _RF_THRESHOLD) / 1250.0))
+    except Exception:
+        return base
+
+
 def fit_surrogate(db_path: str, protein: str, min_points: int = 40):
     """
     Fit a surrogate model on Boltz-2 scores from the disk cache.

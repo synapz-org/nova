@@ -50,7 +50,7 @@ from utils.msa import ensure_msa
 from utils.salsa import run_salsa_search
 from utils.genetic import run_gradient_ga
 from utils.chembl import get_chembl_seeds
-from utils.surrogate import fit_surrogate, rank_pool_by_surrogate, ucb_rank_pool, fit_dual_surrogate, dual_surrogate_rank_pool, dual_surrogate_ucb_rank_pool, augment_pool_with_surrogate_blend, fit_dual_surrogate_with_embeddings, dual_surrogate_ucb_rank_pool_emb, adaptive_blend_alpha
+from utils.surrogate import fit_surrogate, rank_pool_by_surrogate, ucb_rank_pool, fit_dual_surrogate, dual_surrogate_rank_pool, dual_surrogate_ucb_rank_pool, augment_pool_with_surrogate_blend, fit_dual_surrogate_with_embeddings, dual_surrogate_ucb_rank_pool_emb, adaptive_blend_alpha, adaptive_ucb_beta
 from PSICHIC.wrapper import PsichicWrapper
 from boltz.wrapper import BoltzWrapper
 from btdr import QuicknetBittensorDrandTimelock
@@ -1176,19 +1176,21 @@ async def run_psichic_model_loop(state: Dict[str, Any]) -> None:
                         try:
                             _db_path_s = state.get('boltz_cache_db', BOLTZ_CACHE_DB)
                             _prot_s = state['config'].weekly_target
+                            # §XXXXXXXXXXXX: cache-adaptive UCB beta (1.0→0.5 as cache grows).
+                            _xxxx_beta_s = adaptive_ucb_beta(_db_path_s, _prot_s)
                             _dual_s = fit_dual_surrogate(_db_path_s, _prot_s)
                             if _dual_s is not None and not state['global_candidate_pool'].empty:
                                 state['global_candidate_pool'] = dual_surrogate_ucb_rank_pool(
-                                    state['global_candidate_pool'], _dual_s
+                                    state['global_candidate_pool'], _dual_s, beta=_xxxx_beta_s
                                 )
-                                bt.logging.info("[§AAAAAA] SALSA seeds re-ranked by dual APB+APV UCB surrogate.")
+                                bt.logging.info(f"[§AAAAAA/§XXXXXXXXXXXX] SALSA seeds re-ranked by dual APB+APV UCB surrogate (β={_xxxx_beta_s:.2f}).")
                             else:
                                 _zz_seed_model = fit_surrogate(_db_path_s, _prot_s)
                                 if _zz_seed_model is not None and not state['global_candidate_pool'].empty:
                                     state['global_candidate_pool'] = ucb_rank_pool(
-                                        state['global_candidate_pool'], _zz_seed_model
+                                        state['global_candidate_pool'], _zz_seed_model, beta=_xxxx_beta_s
                                     )
-                                    bt.logging.info("[§RRRR/ZZ] SALSA seeds re-ranked by UCB surrogate.")
+                                    bt.logging.info(f"[§RRRR/ZZ/§XXXXXXXXXXXX] SALSA seeds re-ranked by UCB surrogate (β={_xxxx_beta_s:.2f}).")
                         except Exception as _zz_s_err:
                             bt.logging.debug(f"[ZZ/YYYYY] SALSA seed re-rank skipped: {_zz_s_err}")
 
@@ -2190,35 +2192,37 @@ async def run_boltz_prescoring(state: Dict[str, Any], max_candidates: int = 5) -
     # Falls back: §YYYYY dual UCB → §RRRR UCB (combined) → PSICHIC ordering.
     if not candidates.empty:
         try:
+            # §XXXXXXXXXXXX: cache-adaptive UCB beta (1.0→0.5 as cache grows).
+            _xxxx_beta = adaptive_ucb_beta(db_path, protein)
             _emb_dual = fit_dual_surrogate_with_embeddings(db_path, protein)
             if _emb_dual is not None:
                 _kkkk_gamma = getattr(state.get('config'), 'embedding_diversity_gamma', 0.0)
                 candidates = dual_surrogate_ucb_rank_pool_emb(
-                    candidates, _emb_dual, gamma=_kkkk_gamma
+                    candidates, _emb_dual, beta=_xxxx_beta, gamma=_kkkk_gamma
                 )
                 _emb_tag = "[emb+RF]" if _emb_dual[2] is not None else "[RF]"
                 _kkkk_tag = f"+diversity(γ={_kkkk_gamma})" if _kkkk_gamma > 0 else ""
                 bt.logging.info(
-                    f"[§HHHHHHHHHH/§AAAAAA/§KKKKKKKKKK] Pre-Boltz candidates re-ranked by "
+                    f"[§HHHHHHHHHH/§AAAAAA/§KKKKKKKKKK/§XXXXXXXXXXXX] Pre-Boltz candidates re-ranked by "
                     f"embedding-augmented dual UCB surrogate {_emb_tag}{_kkkk_tag} "
-                    f"({len(candidates)} entries, target={protein})."
+                    f"(β={_xxxx_beta:.2f}, {len(candidates)} entries, target={protein})."
                 )
             else:
                 _dual = fit_dual_surrogate(db_path, protein)
                 if _dual is not None:
-                    candidates = dual_surrogate_ucb_rank_pool(candidates, _dual)
+                    candidates = dual_surrogate_ucb_rank_pool(candidates, _dual, beta=_xxxx_beta)
                     bt.logging.info(
-                        f"[§AAAAAA] Pre-Boltz candidates re-ranked by dual APB+APV UCB surrogate "
-                        f"({len(candidates)} entries, target={protein})."
+                        f"[§AAAAAA/§XXXXXXXXXXXX] Pre-Boltz candidates re-ranked by dual APB+APV UCB surrogate "
+                        f"(β={_xxxx_beta:.2f}, {len(candidates)} entries, target={protein})."
                     )
                 else:
                     _zz_model = fit_surrogate(db_path, protein)
                     if _zz_model is not None:
                         # §RRRR: UCB ranking when surrogate is RF (≥100 pts).
-                        candidates = ucb_rank_pool(candidates, _zz_model)
+                        candidates = ucb_rank_pool(candidates, _zz_model, beta=_xxxx_beta)
                         bt.logging.info(
-                            f"[§RRRR/ZZ] Pre-Boltz candidates re-ranked by UCB surrogate "
-                            f"({len(candidates)} entries, target={protein})."
+                            f"[§RRRR/ZZ/§XXXXXXXXXXXX] Pre-Boltz candidates re-ranked by UCB surrogate "
+                            f"(β={_xxxx_beta:.2f}, {len(candidates)} entries, target={protein})."
                         )
         except Exception as _zz_err:
             bt.logging.debug(f"[ZZ/YYYYY/HHHHHHHHHH] Candidate surrogate re-rank skipped: {_zz_err}")

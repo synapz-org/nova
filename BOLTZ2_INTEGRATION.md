@@ -1,12 +1,106 @@
 # Boltz-2 Miner Integration
 
-## Current Status (as of 2026-08-30)
+## Current Status (as of 2026-09-01)
 
-**67 roadmap items implemented.** §WWWWWWWWWWWW (cache-adaptive surrogate blend alpha) added 2026-08-30. §VVVVVVVVVVVV (reliability-adjusted §MM seed selection) added 2026-08-29. §UUUUUUUUUUUU (surrogate pre-filter for SALSA perturbations) added 2026-08-28. §TTTTTTTTTTTT (reaction-class dead-end de-emphasis) added 2026-08-27.
+**68 roadmap items implemented.** §XXXXXXXXXXXX (cache-adaptive UCB beta) added 2026-09-01. §WWWWWWWWWWWW (cache-adaptive surrogate blend alpha) added 2026-08-30. §VVVVVVVVVVVV (reliability-adjusted §MM seed selection) added 2026-08-29. §UUUUUUUUUUUU (surrogate pre-filter for SALSA perturbations) added 2026-08-28.
 
 ---
 
 ## Implemented Optimisations (recent)
+
+### §XXXXXXXXXXXX — Cache-Adaptive UCB Beta — added 2026-09-01
+
+**Problem:** The UCB exploration coefficient `beta=1.0` is fixed across all RF surrogate
+ranking calls (§RRRR/§AAAAAA/§HHHHHHHHHH).  This coefficient controls the balance between
+exploitation (trust the surrogate's mean prediction) and exploration (favour molecules
+where the surrogate is uncertain):
+
+```
+UCB = surrogate_mean + beta × surrogate_std
+```
+
+A fixed `beta=1.0` makes no distinction between:
+- An RF surrogate just activated at 100 cache points: per-tree variance estimates are
+  noisy because the training set is small and structurally sparse.  High exploration is
+  correct — we genuinely don't know which chemical region scores best.
+- A mature RF surrogate at 600+ cache points: the model has seen diverse scaffolds, its
+  variance estimates are well-calibrated, and the mean predictions reliably rank candidates.
+  Continuing to explore at beta=1.0 dilutes the surrogate's exploitation signal and sends
+  candidates into chemical regions the model already knows are suboptimal.
+
+This is the inverse of §WWWWWWWWWWWW's insight: as cache grows, the surrogate's reliability
+increases — so `alpha` (blend weight) should rise AND `beta` (exploration coefficient) should
+fall, for fully consistent exploit-as-you-learn behaviour.
+
+**Fix:** `utils/surrogate.py` — `adaptive_ucb_beta(db_path, protein, base=1.0, floor=0.5)`:
+
+Queries `SELECT COUNT(*) FROM boltz_cache WHERE protein=?` and returns:
+```
+beta = clamp(base - max(0, (n_pts - RF_THRESHOLD) / 1250), floor, base)
+```
+
+| n_pts | beta | Note |
+|-------|------|------|
+| 100 (RF threshold) | 1.00 | No regression from fixed default |
+| 350 | 0.80 | Moderate exploitation increase |
+| 600 | 0.60 | Mature cache: exploit more |
+| 725+ | 0.50 | Floor: always retain some exploration |
+
+Falls back to `base=1.0` on any SQLite error — identical to pre-§XXXXXXXXXXXX behaviour.
+
+**Implementation:**
+
+1. **`utils/surrogate.py`**: `adaptive_ucb_beta(db_path, protein, base, floor)` added after
+   `adaptive_blend_alpha` (~25 lines).
+
+2. **`neurons/miner.py`**: `adaptive_ucb_beta` added to imports; called at 3 UCB call sites:
+   - SALSA seed re-ranking (§AAAAAA): `_xxxx_beta_s` before `dual_surrogate_ucb_rank_pool` + `ucb_rank_pool`
+   - Pre-Boltz candidate ranking (§HHHHHHHHHH/§AAAAAA/§RRRR): `_xxxx_beta` before all 3 surrogate paths
+   - Beta value logged at INFO level alongside existing surrogate log messages
+
+**Regression guards:**
+- At RF threshold (100 pts): `beta = 1.0` — identical to pre-§XXXXXXXXXXXX default.
+- Ridge tier (<100 pts): `ucb_rank_pool`/`dual_surrogate_ucb_rank_pool` fall back to mean-only
+  ranking when no RF variance is available — beta has no effect.
+- SQLite error: `adaptive_ucb_beta` returns `base=1.0` — identical to pre-§XXXXXXXXXXXX.
+- Floor of 0.50: always retains 50% exploration signal — prevents full greedy exploitation.
+- `adaptive_ucb_beta` DB query: 1 `SELECT COUNT(*)` — sub-millisecond vs Boltz inference.
+
+**Interaction with §WWWWWWWWWWWW:**
+
+The two adaptive parameters move in opposite directions as cache grows:
+
+| n_pts | alpha (§WWWWWWWWWWWW) | beta (§XXXXXXXXXXXX) | Net effect |
+|-------|----------------------|----------------------|------------|
+| 100 | 0.60 | 1.00 | Baseline — PSICHIC mix + full exploration |
+| 350 | 0.70 | 0.80 | Moderately more surrogate; moderately less exploration |
+| 600 | 0.76 | 0.60 | Strong surrogate trust; focused exploitation |
+| 725+ | 0.80 | 0.50 | Near-max surrogate; half exploration retained |
+
+Together they implement a principled annealing from "surrogate-assisted exploration" to
+"surrogate-guided exploitation" as the target's SAR becomes well-characterised.
+
+**Expected benefit:**
+
+| Scenario | Before §XXXXXXXXXXXX | After §XXXXXXXXXXXX |
+|----------|----------------------|---------------------|
+| 100 pts (RF just activated) | beta=1.0 | beta=1.00 (no change) |
+| 300 pts (warm epoch 3+ cache) | beta=1.0 | beta=0.84 (16% less exploration) |
+| 600+ pts (mature cross-week cache) | beta=1.0 | beta=0.60 (40% less exploration) |
+| Ridge tier (<100 pts) | N/A (mean-only) | N/A (mean-only, no change) |
+| SQLite error | beta=1.0 | beta=1.0 (fallback) |
+
+Expected Boltz LE gain: **+1–2%** on warm-cache epochs (500+ pts) where the surrogate's
+chemical intuition is most reliable and exploration of noisy chemical space is wasteful.
+Largest gain when combined with §WWWWWWWWWWWW on the same run: both effects compound to
+focus the full candidate selection pipeline on the most promising known chemical region.
+Zero regression at RF threshold or below.
+
+**Files changed:**
+- `utils/surrogate.py`: `adaptive_ucb_beta` function (~25 lines) after `adaptive_blend_alpha`.
+- `neurons/miner.py`: import + 3 call-site updates (~8 lines); beta logged in INFO messages.
+
+---
 
 ### §WWWWWWWWWWWW — Cache-Adaptive Surrogate Blend Alpha — added 2026-08-30
 
