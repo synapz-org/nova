@@ -1,8 +1,375 @@
 # Boltz-2 Miner Integration
 
-## Current Status (as of 2026-09-01)
+## Current Status (as of 2026-09-02)
 
-**68 roadmap items implemented.** §XXXXXXXXXXXX (cache-adaptive UCB beta) added 2026-09-01. §WWWWWWWWWWWW (cache-adaptive surrogate blend alpha) added 2026-08-30. §VVVVVVVVVVVV (reliability-adjusted §MM seed selection) added 2026-08-29. §UUUUUUUUUUUU (surrogate pre-filter for SALSA perturbations) added 2026-08-28.
+**68 roadmap items implemented; 3 proposed (items 69–71).** §XXXXXXXXXXXX (cache-adaptive UCB beta) added 2026-09-01. §WWWWWWWWWWWW (cache-adaptive surrogate blend alpha) added 2026-08-30. §VVVVVVVVVVVV (reliability-adjusted §MM seed selection) added 2026-08-29. §UUUUUUUUUUUU (surrogate pre-filter for SALSA perturbations) added 2026-08-28.
+
+Proposed items §YYYYYYYYYYYY (multi-start §MM SALSA from diversity seeds), §ZZZZZZZZZZZZ (Boltz-2 binding-pose cache for structure-guided §MM growth), and §AAAAAAAAAAAA (GA population diversity injection from cross-epoch SQLite elite) identified 2026-09-02.
+
+---
+
+## Proposed Optimisations (next priorities)
+
+### §YYYYYYYYYYYY — Multi-Start §MM SALSA from Diversity-Maximised Cache Seeds — PROPOSED
+
+**Problem:** §MM hill-climbing always starts from a single seed: the reliability-adjusted argmax
+of `_mm_all_scored` (§VVVVVVVVVVVV).  A single starting point cannot escape local optima in
+chemical space.  If the best-known molecule inhabits one scaffold basin, §MM will refine within
+that basin indefinitely — other potentially higher-scoring scaffolds remain unexplored.
+
+This is the single-start local search problem.  Classic solution: multi-start.  Each additional
+seed costs the same GPU budget as an extra §MM round but opens a new basin for exploration.
+
+**Fix:**
+
+After §VVVVVVVVVVVV selects `_mm_seed_smiles` (primary seed), build a diversity-augmented seed
+list using max-min Tanimoto on Morgan fingerprints of all `_mm_all_scored` molecules:
+
+```python
+def _select_diverse_mm_seeds(all_scored_smiles: list[str],
+                              primary: str,
+                              n_extra: int = 2) -> list[str]:
+    """Return primary + up to n_extra maximally diverse seeds."""
+    from rdkit.Chem import AllChem, DataStructs
+    from rdkit import Chem
+    fps = {s: AllChem.GetMorganFingerprintAsBitVect(Chem.MolFromSmiles(s), 2, 256)
+           for s in all_scored_smiles if Chem.MolFromSmiles(s) is not None}
+    selected = [primary]
+    candidates = [s for s in fps if s != primary]
+    for _ in range(n_extra):
+        if not candidates:
+            break
+        # pick candidate with max min-Tanimoto to already-selected set
+        best_c, best_d = None, -1.0
+        for c in candidates:
+            d = min(1.0 - DataStructs.TanimotoSimilarity(fps[c], fps[s])
+                    for s in selected if s in fps)
+            if d > best_d:
+                best_c, best_d = c, d
+        if best_c and best_d > 0.15:   # skip if effectively identical
+            selected.append(best_c)
+            candidates.remove(best_c)
+    return selected
+```
+
+1. Call `_select_diverse_mm_seeds(_mm_all_scored_smiles, _mm_seed_smiles)` after §VVVVVVVVVVVV
+   to produce `_mm_seed_list` (1–3 entries).
+2. Run §MM rounds for each seed sequentially.  The existing `_boltz_trigger_blocks` budget
+   and round-cap (§KKKKKK) govern how many rounds each seed gets — time-budget sharing is
+   automatic since each round check fires before starting a new round.
+3. Track `_mm_best_score` globally across all seeds.  Improvement condition unchanged: a round
+   counts as an improvement only if new LE > global `_mm_best_score`.
+4. Log at INFO which seed is active and whether it is primary or diversity-selected.
+5. At most 3 seeds total; skip 3rd if `_mm_all_scored` has ≤2 molecules or all Tanimoto
+   distances are ≤ 0.15 (identical scaffold family — no diversity gain).
+
+**Regression guards:**
+
+- `len(_mm_seed_list) == 1`: identical to pre-§YYYYYYYYYYYY behaviour — one seed, one run.
+- `Tanimoto distance ≤ 0.15`: seed is discarded — avoids wasting a §MM run on a near-duplicate.
+- `try/except` on FP computation → non-fatal fallback to single-seed.
+- §KKKKKK round cap applies *per seed* (not total) — prevents a single seed from consuming the
+  entire budget on a slow run.  Total rounds ≤ 3 × §KKKKKK cap (acceptable: each provides
+  new information about a different chemical basin).
+
+**Interaction with existing items:**
+
+- §VVVVVVVVVVVV: primary seed is still the reliability-adjusted argmax — §YYYYYYYYYYYY adds
+  diversity seeds *after* §VVVVVVVVVVVV, not instead of it.
+- §AAAAAAAAA: convergence-based early stopping applies within each seed's run — if seed 2
+  converges quickly, the budget rolls to seed 3 sooner.
+- §SSSSSS: diversity scoring for initial Boltz pass selects diverse molecules to *score*;
+  §YYYYYYYYYYYY uses those already-scored molecules as diverse *starting points* for §MM.
+- §UUUUUUUUUUUU: surrogate pre-filter still applies within each §MM SALSA round regardless
+  of which seed is active.
+
+**Expected benefit:**
+
+| Scenario | Before §YYYYYYYYYYYY | After §YYYYYYYYYYYY |
+|----------|----------------------|---------------------|
+| All cache molecules in same scaffold | 1 seed, 1 basin | Still 1 seed (Tanimoto < 0.15 guard) |
+| 2+ distinct scaffolds in cache | 1 seed, miss 2nd basin | 2–3 seeds, explore both basins |
+| Budget exhausted after seed 1 | Seed 1 only (current) | Seed 1 only (same — budget limited) |
+| Epoch 1 cold start (1 Boltz result) | 1 seed (only candidate) | 1 seed (only candidate) |
+
+Expected gain: **+3–8% Boltz LE** on epoch 3+ with ≥3 reliability-scored cache entries spanning
+≥2 distinct scaffold families.  Zero regression on cold-start epochs or single-scaffold caches.
+
+**Files changed (proposed):**
+
+- `neurons/miner.py`: `_select_diverse_mm_seeds()` helper (~20 lines) + §MM seed loop
+  rewrite (~30 lines replacing single-seed §MM entry).
+- No changes to `utils/salsa.py`, `utils/surrogate.py`, or `boltz/`.
+
+**Estimated effort: ~50 lines.**
+
+---
+
+### §ZZZZZZZZZZZZ — Boltz-2 Binding-Pose Cache for Structure-Guided §MM Growth Vectors — PROPOSED
+
+**Problem:** All Boltz-2 output structures are deleted after inference (`remove_files: true`
+in `boltz_config.yaml`).  The predicted binding pose — which protein residues contact the
+ligand, which ligand atoms are solvent-exposed, which directions have pocket space — is
+discarded after each Boltz call.
+
+SALSA hill-climbing (§MM) then perturbs atoms uniformly: every atom has equal probability of
+receiving a `bioisostere`, `fg_add`, or `ring_walk` operator, regardless of whether it is
+buried deep in the binding pocket (sterically constrained — growing into protein atoms) or
+pointing into solvent (free to grow without steric clash).
+
+This wastes Boltz oracle calls on perturbations that are geometrically invalid: the perturbed
+molecule generates a SAVI-2020 match, passes PSICHIC, passes the fast-screen, and only fails
+at full Boltz scoring — because the added group clashes with a protein residue that SALSA could
+not have known about.
+
+**Fix:**
+
+Extend `BoltzWrapper` to optionally cache the per-atom solvent exposure of the
+best-scoring ligand, then expose it to SALSA as an atom priority mask.
+
+Step 1 — Pose extraction in `BoltzWrapper.postprocess_data()`:
+
+```python
+def _extract_ligand_exposure(pdb_path: str,
+                              smiles: str) -> dict[int, float]:
+    """Return {rdkit_atom_idx: min_protein_distance_angstrom}."""
+    from rdkit import Chem
+    import numpy as np
+    mol = Chem.MolFromSmiles(smiles)
+    if mol is None:
+        return {}
+    # Parse PDB: separate HETATM (ligand) from ATOM (protein) records.
+    ligand_coords, protein_coords = [], []
+    with open(pdb_path) as f:
+        for line in f:
+            if line.startswith("HETATM"):
+                x, y, z = float(line[30:38]), float(line[38:46]), float(line[46:54])
+                ligand_coords.append([x, y, z])
+            elif line.startswith("ATOM"):
+                x, y, z = float(line[30:38]), float(line[38:46]), float(line[46:54])
+                protein_coords.append([x, y, z])
+    if not ligand_coords or not protein_coords:
+        return {}
+    L = np.array(ligand_coords)   # (n_ligand_heavy, 3)
+    P = np.array(protein_coords)  # (n_protein_heavy, 3)
+    # For each ligand atom, compute min distance to any protein atom.
+    dists = np.min(np.linalg.norm(L[:, None, :] - P[None, :, :], axis=2), axis=1)
+    # Map by position index (Boltz writes heavy atoms in SMILES order for small
+    # molecules in the single-ligand-single-protein case).
+    return {i: float(dists[i]) for i in range(min(len(dists), mol.GetNumHeavyAtoms()))}
+```
+
+Step 2 — Store in BoltzWrapper as `self._pose_exposure: dict[str, dict[int, float]]`
+(keyed by canonical SMILES), populated in `postprocess_data()` before file removal:
+
+- Set `remove_files: false` only in the temporary `BoltzConfig` used for pose extraction
+  (override in-memory, not in YAML) so the output directory is not deleted before reading.
+- After extraction, manually delete the output PDB files to keep disk usage low.
+
+Step 3 — Expose to SALSA via `run_salsa_search()` new optional parameter
+`atom_exposure: dict[int, float] | None = None`:
+
+When `atom_exposure` is provided, weight operator selection by:
+
+```python
+def _atom_perturbation_weight(atom_idx: int,
+                               exposure: dict[int, float],
+                               op: str) -> float:
+    """Scale operator probability by solvent accessibility."""
+    d = exposure.get(atom_idx, 5.0)   # unknown → assume exposed
+    if op in ("fg_add", "ring_walk"):
+        # Growth operators: strongly prefer exposed positions (d > 4Å)
+        return max(0.1, min(2.0, d / 3.0))
+    elif op == "bioisostere":
+        # Substitution: moderate preference for exposed; buried allowed at 0.5×
+        return max(0.5, min(1.5, d / 4.0))
+    else:   # terminal_remove: unchanged
+        return 1.0
+```
+
+In the SALSA perturbation loop, multiply the count of proposals for each (atom, operator)
+pair by `_atom_perturbation_weight` to bias toward solvent-exposed positions without fully
+excluding buried ones (pharmacophore-critical atoms that are buried may still benefit from
+bioisosteric replacement).
+
+Step 4 — Pass `atom_exposure` from §MM call site in miner.py when `_boltz_seed_smiles` is in
+`self._boltz_wrapper._pose_exposure`.
+
+**Regression guards:**
+
+- `atom_exposure is None` (default): `_atom_perturbation_weight` returns 1.0 for all atoms —
+  identical to pre-§ZZZZZZZZZZZZ behaviour.
+- `_extract_ligand_exposure()` failure: returns `{}` → all weights 1.0.
+- `remove_files` override is in-memory only — YAML config unchanged.
+- PDB file manual deletion: `try/finally` to ensure cleanup even on exception.
+- Boltz output directory layout may vary by model version: guard with `os.path.exists()` checks
+  before reading PDB; fall back to `atom_exposure=None` on any IO error.
+
+**Interaction with existing items:**
+
+- §OOOO (bandit operator weights): `_atom_perturbation_weight` multiplies with the bandit weight
+  for each operator — both signals are combined, not competing.
+- §UUUUUUUUUUUU (surrogate pre-filter): surrogate pre-filter still runs; exposure weighting
+  determines which atoms generate the 200 candidate perturbations BEFORE the surrogate thins them.
+- §ZZZZZ (HA-adaptive budget): HA-adaptive operator budget unchanged — exposure weighting is a
+  *within-operator* bias, not an operator-selection bias.
+
+**Expected benefit:**
+
+- Redirects growth operators (~50% of SALSA proposals) away from sterically blocked positions.
+- Estimated 20–30% reduction in fast-screen failures for `fg_add` and `ring_walk` perturbations.
+- Translates to 1–2 extra §MM rounds per epoch at the same Boltz budget.
+
+Expected gain: **+3–6% Boltz LE** on epoch 2+ when ≥1 full Boltz pose is available.
+Zero gain on epoch 1 cold start (no cached poses yet).
+
+**Files changed (proposed):**
+
+- `boltz/wrapper.py`: `_extract_ligand_exposure()` (~40 lines) + `_pose_exposure` cache +
+  `postprocess_data()` patch (~25 lines).
+- `utils/salsa.py`: `atom_exposure` parameter + `_atom_perturbation_weight()` (~30 lines).
+- `neurons/miner.py`: pass `atom_exposure` to §MM SALSA calls (~10 lines).
+
+**Estimated effort: ~150 lines.**
+
+---
+
+### §AAAAAAAAAAAA — GA Population Diversity Injection from Cross-Epoch SQLite Elite — PROPOSED
+
+**Problem:** The GradientGA population (§O) is initialised from the top PSICHIC molecules in
+`savi_stream_pool`.  On epoch 2+, the best-known Boltz-validated molecules (in the SQLite cache)
+are NOT injected into the initial population.  The GA therefore starts from a PSICHIC-biased
+population that may differ systematically from the Boltz-optimal region discovered in prior epochs.
+
+The GA often rediscovers the same PSICHIC-high scaffold family that §MM already exhausted last
+epoch, while Boltz-validated winners from cross-epoch cache — which are guaranteed to score well
+— receive no crossover participation until the surrogate (§UUUUUU) guides GA fitness toward them.
+At epoch 2 (30–100 cache points, Ridge surrogate tier), the surrogate cannot yet provide strong
+guidance, so the Boltz-validated molecules are effectively invisible to the GA.
+
+**Fix:**
+
+1. Before calling `run_gradient_ga()`, query SQLite for top-10 molecules by
+   `reliability_score = boltz_le / (1 + 10 × max(boltz_le_std, boltz_ww_std))` for the current
+   protein.  Select top-3 by max-min Tanimoto diversity (same helper as §YYYYYYYYYYYY above,
+   reusable).
+
+2. Add optional `elite_smiles: list[str] | None = None` parameter to `run_gradient_ga()`.  When
+   provided:
+   - Convert each SMILES to a pseudo-population row by looking up its `product_name` in the
+     SAVI-2020 pool (nearest Tanimoto match, same as §MM warm-start lookup) or using a cached
+     `product_name` from the SQLite `boltz_cache.product_name` column (already stored since §YYYYY).
+   - Inject these rows into the initial population *before* tournament selection, replacing the
+     worst-PSICHIC population members (maintain population size = 50).
+   - Mark injected rows with `is_elite=True`; the elitism step in round 1 preserves all
+     `is_elite` molecules regardless of PSICHIC tournament outcome.
+
+3. This ensures the GA's crossover and mutation operators operate in the neighbourhood of
+   prior Boltz winners from round 1 onward, rather than discovering them only when surrogate
+   guidance matures.
+
+**Implementation sketch (genetic.py):**
+
+```python
+def run_gradient_ga(
+    savi_pool_df: pd.DataFrame,
+    psichic_wrapper,
+    protein_sequence: str,
+    generations: int = 10,
+    population_size: int = 50,
+    elite_smiles: list[str] | None = None,   # §AAAAAAAAAAAA
+    surrogate_model=None,
+    ...
+) -> pd.DataFrame:
+
+    # Seed initial population from PSICHIC top-K
+    population = savi_pool_df.nlargest(population_size, 'combined_score').copy()
+    population['is_elite'] = False
+
+    # §AAAAAAAAAAAA: inject Boltz-validated elite molecules
+    if elite_smiles:
+        for smi in elite_smiles[:3]:
+            match = _nearest_savi_match(smi, savi_pool_df)   # Tanimoto lookup
+            if match is not None:
+                match = match.copy()
+                match['is_elite'] = True
+                # replace worst non-elite member
+                worst_idx = population[~population['is_elite']]['combined_score'].idxmin()
+                population.loc[worst_idx] = match
+    ...
+    for gen in range(generations):
+        ...
+        # Elitism: always preserve elite molecules in round 1
+        if gen == 0:
+            elite_mask = population['is_elite']
+            survivors = pd.concat([
+                population[elite_mask],
+                top_49_by_score[~top_49_by_score.index.isin(population[elite_mask].index)]
+            ]).head(population_size)
+        else:
+            survivors = top_49_by_score   # standard elitism from round 2+
+        ...
+```
+
+4. In `neurons/miner.py`, before calling `run_gradient_ga()`:
+
+```python
+# §AAAAAAAAAAAA: query top-3 diverse Boltz elites for GA injection
+_aaaaaaaaaaaa_elites = []
+try:
+    with sqlite3.connect(BOLTZ_CACHE_DB) as _conn:
+        _rows = _conn.execute(
+            """SELECT smiles, boltz_le / (1.0 + 10.0 * MAX(
+                   COALESCE(boltz_le_std, 0), COALESCE(boltz_ww_std, 0))) AS rel
+               FROM boltz_cache WHERE protein=? ORDER BY rel DESC LIMIT 10""",
+            (state['protein'],)
+        ).fetchall()
+    _aaaaaaaaaaaa_elites = _select_diverse_mm_seeds(
+        [r[0] for r in _rows], primary=_rows[0][0], n_extra=2
+    ) if _rows else []
+except Exception:
+    _aaaaaaaaaaaa_elites = []
+```
+
+**Regression guards:**
+
+- `elite_smiles=None` (or empty list): `run_gradient_ga()` unchanged — identical to
+  pre-§AAAAAAAAAAAA behaviour.
+- `_nearest_savi_match` failure (molecule not in pool): elite slot skipped, population size
+  unchanged.
+- `is_elite` flag only active in generation 0 elitism — from generation 1 onward the GA
+  runs purely on fitness, same as before.
+- SQLite error: `_aaaaaaaaaaaa_elites = []` fallback — no injection.
+
+**Interaction with existing items:**
+
+- §UUUUUU (surrogate-guided GA fitness, epoch 3+): injection is especially complementary at
+  epoch 2 (Ridge tier) where the surrogate cannot yet reliably identify Boltz-optimal regions.
+  At epoch 3+ the surrogate already guides tournament selection toward the cache elite anyway,
+  so injection is additive but less marginal.
+- §O (GradientGA): injection replaces worst-PSICHIC members, preserving the top-47 PSICHIC
+  molecules; total population size = 50 unchanged.
+
+**Expected benefit:**
+
+| Scenario | Before §AAAAAAAAAAAA | After §AAAAAAAAAAAA |
+|----------|----------------------|---------------------|
+| Epoch 1 (no cache) | PSICHIC-seeded GA | PSICHIC-seeded GA (no injection) |
+| Epoch 2 (3–30 cache pts, Ridge) | PSICHIC-seeded GA; cache invisible | 3 Boltz-winners injected; crossover explores their scaffold neighbourhood from round 1 |
+| Epoch 3+ (RF surrogate active) | Surrogate already guides GA | Injection + surrogate guidance — additive |
+| Injected SMILES not in SAVI pool | N/A | Slot skipped silently |
+
+Expected gain: **+2–5% GA-active epoch Boltz LE** on epoch 2+ by providing the GA with
+Boltz-validated starting material.  Especially impactful on epoch 2 where the surrogate
+is in Ridge tier and cannot yet strongly bias the population toward Boltz winners.
+
+**Files changed (proposed):**
+
+- `utils/genetic.py`: `elite_smiles` parameter + elitism guard for round 0 (~40 lines).
+- `neurons/miner.py`: SQLite query + `_select_diverse_mm_seeds` call + pass to `run_gradient_ga`
+  (~25 lines).
+
+**Estimated effort: ~65 lines.**
 
 ---
 
