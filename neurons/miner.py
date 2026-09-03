@@ -1800,6 +1800,50 @@ def _scaffold_diverse_candidates(
     return pd.DataFrame(selected_rows).reset_index(drop=True)
 
 
+def _select_diverse_mm_seeds(
+    all_scored_smiles: list,
+    primary: str,
+    n_extra: int = 2,
+) -> list:
+    """§YYYYYYYYYYYY: Return primary + up to n_extra maximally diverse MM seeds.
+
+    Uses max-min Tanimoto on Morgan fingerprints (radius=2, 256 bits) to select
+    seeds that are structurally distinct from each other.  Seeds with Tanimoto
+    ≤ 0.15 to every already-selected seed are skipped (same scaffold family).
+    Falls back to [primary] on any error so the single-seed §MM path is unchanged.
+    """
+    try:
+        from rdkit.Chem import AllChem, DataStructs
+        fps: dict = {}
+        for s in all_scored_smiles:
+            mol = Chem.MolFromSmiles(s)
+            if mol is not None:
+                fps[s] = AllChem.GetMorganFingerprintAsBitVect(mol, 2, 256)
+        selected = [primary]
+        candidates = [s for s in fps if s != primary]
+        for _ in range(n_extra):
+            if not candidates:
+                break
+            best_c, best_d = None, -1.0
+            for c in candidates:
+                if c not in fps:
+                    continue
+                d = min(
+                    1.0 - DataStructs.TanimotoSimilarity(fps[c], fps[s])
+                    for s in selected if s in fps
+                )
+                if d > best_d:
+                    best_c, best_d = c, d
+            if best_c is not None and best_d > 0.15:
+                selected.append(best_c)
+                candidates.remove(best_c)
+            else:
+                break  # remaining candidates are all too similar
+        return selected
+    except Exception:
+        return [primary]
+
+
 def _reorder_for_diversity(state: Dict[str, Any]) -> None:
     """
     Reorder positions 1+ of state['candidate_product'] to maximise MACCS fingerprint
@@ -2808,6 +2852,27 @@ async def run_boltz_prescoring(state: Dict[str, Any], max_candidates: int = 5) -
             )
             if _mm_all_scored else None
         )
+    # §YYYYYYYYYYYY: Build diversity-augmented seed list for multi-start §MM.
+    # After §VVVVVVVVVVVV selects the reliability-adjusted primary seed, extend
+    # with up to 2 more seeds via max-min Tanimoto on _mm_all_scored molecules.
+    # Seeds with Tanimoto distance ≤ 0.15 to all selected are skipped (same scaffold).
+    # Falls back silently to single-seed on any error — zero regression.
+    _mm_seed_list: list = [_mm_seed_smiles] if _mm_seed_smiles is not None else []
+    if _mm_seed_smiles is not None and len(_mm_all_scored) > 1:
+        try:
+            _mm_seed_list = _select_diverse_mm_seeds(
+                [s for s, v in _mm_all_scored.items() if math.isfinite(v)],
+                _mm_seed_smiles,
+                n_extra=2,
+            )
+            if len(_mm_seed_list) > 1:
+                bt.logging.info(
+                    f"[§YYYYYYYYYYYY] Multi-start §MM: {len(_mm_seed_list)} seeds "
+                    f"(primary + {len(_mm_seed_list) - 1} diversity seed(s))"
+                )
+        except Exception as _yyyy_err:
+            bt.logging.debug(f"[§YYYYYYYYYYYY] Seed diversity fallback: {_yyyy_err}")
+            _mm_seed_list = [_mm_seed_smiles]
     _mm_savi_pool = _hhhhhh_pool if _hhhhhh_pool is not None else state.get('savi_stream_pool')
     # §KKKKKK: Hardware-adaptive §MM max rounds.  BoltzWrapper (instantiated above)
     # already probed VRAM and patched config: §XXXXX sets num_subsampled_msa=4096 on
@@ -2843,370 +2908,384 @@ async def run_boltz_prescoring(state: Dict[str, Any], max_candidates: int = 5) -
             f"(seed_score={_mm_best_score:.4f}, max_rounds={_mm_max_rounds})"
         )
         _mm_rounds_run = 0
-        _mm_tried_seeds: set = set()  # prevent cycling when basin-hopping
-        for _mm_round_idx in range(_mm_max_rounds):
+        # §YYYYYYYYYYYY: outer loop over diversity-augmented seed list.
+        # Each global seed runs its own §MM round sequence (§KKKKKK cap per seed).
+        # _mm_best_score is global across seeds so improvement comparisons are consistent.
+        # _mm_tried_seeds resets per seed so §QQ/§VV basin-hopping is local to each start.
+        for _mm_global_seed_idx, _mm_global_seed in enumerate(_mm_seed_list):
             if _mm_stop:
                 break
-
-            # Mark current seed as tried so §QQ basin-hopping skips it next time.
-            _mm_tried_seeds.add(_mm_seed_smiles)
-
-            # Time check before each round — skip if < 2 mol-times + 2 min remain
-            try:
-                _mm_curr_blk = await state['subtensor'].get_current_block()
-                _mm_next_ep = ((_mm_curr_blk // state['epoch_length']) + 1) * state['epoch_length']
-                _mm_remaining_s = (_mm_next_ep - _mm_curr_blk) * 12
-            except Exception:
-                break
-
-            _mm_t_mol = state.get('boltz_time_per_mol', 150.0)
-            if _mm_remaining_s < _mm_t_mol * 2 + 120:
+            if _mm_global_seed_idx > 0:
                 bt.logging.info(
-                    f"§MM round {_mm_round_idx + 1}: "
-                    f"{_mm_remaining_s:.0f}s remaining < {_mm_t_mol * 2 + 120:.0f}s needed — stopping."
+                    f"[§YYYYYYYYYYYY] Diversity seed {_mm_global_seed_idx + 1}"
+                    f"/{len(_mm_seed_list)}: "
+                    f"LE={_mm_all_scored.get(_mm_global_seed, float('nan')):.4f}"
                 )
-                break
-
-            # SALSA from current best Boltz seed
-            _mm_op_tags: dict = {}  # §OOOO: {product_name: operator} populated by run_salsa_search
-            try:
-                _mm_salsa_hits = await asyncio.to_thread(
-                    run_salsa_search,
-                    _mm_seed_smiles,
-                    _mm_savi_pool,
-                    2,   # rounds — neighbourhood exploration
-                    200, # n_perturb — full operator coverage (ring walk + terminal removal)
-                    5,   # top_k — §NNNN: wider net for scaffold-diversity selection below
-                    _hhhhhh_score_col,  # §HHHHHH: surrogate-blended or 'combined_score' fallback
-                    'product_smiles',
-                    'product_name',
-                    _salsa_operator_weights(_mm_seed_smiles, state.get('salsa_operator_wins')),  # §ZZZZZ + §OOOO
-                    _mm_op_tags,  # §OOOO: out_operator_tags
-                    _dual,  # §UUUUUUUUUUUU: surrogate pre-filter for perturbation probes
-                )
-                # §NNNN: scaffold-diverse selection — each §MM fast-screen slot tests
-                # a different chemical family, maximising coverage per GPU budget.
-                if not _mm_salsa_hits.empty and len(_mm_salsa_hits) > 3:
-                    _mm_salsa_hits = _scaffold_diverse_candidates(_mm_salsa_hits, max_k=3)
-            except Exception as _mm_salsa_err:
-                bt.logging.warning(f"§MM SALSA error: {_mm_salsa_err}")
-                break
-
-            if _mm_salsa_hits.empty:
-                bt.logging.info(f"§MM round {_mm_round_idx + 1}: no SALSA hits — stopping.")
-                break
-
-            _mm_improved = False
-            _mm_round_best_score = _mm_best_score
-            _mm_round_best_smiles = _mm_seed_smiles
-
-            # §NN Phase 1: fast-screen each round's SALSA hits.
-            # Cache hits reuse the stored full score; misses run fast Boltz (no cache store).
-            # §FFFFFF: cache misses are batched into ONE score_molecules_target call so the
-            # expensive Boltz2 checkpoint load is paid once per round instead of N times.
-            _mm_screen: Dict[str, float] = {}  # smiles -> score
-            _mm_row_map: Dict[str, Any] = {}   # smiles -> row
-            _mm_misses: List[Tuple[str, Any]] = []  # (smiles, row) for cache-miss molecules
-            for _, _mm_row in _mm_salsa_hits.iterrows():
+            _mm_seed_smiles = _mm_global_seed
+            _mm_tried_seeds: set = set()  # prevent cycling when basin-hopping
+            for _mm_round_idx in range(_mm_max_rounds):
                 if _mm_stop:
                     break
-                _mm_smiles = _mm_row['product_smiles']
-                _mm_canon = get_canonical_smiles(_mm_smiles)
-                _mm_key = (_mm_canon, protein)
-                _mm_row_map[_mm_smiles] = _mm_row
-                if _mm_key in boltz_cache:
-                    _mm_screen[_mm_smiles] = boltz_cache[_mm_key]
-                    bt.logging.debug(f"§MM §NN cache hit: {boltz_cache[_mm_key]:.4f}")
-                elif _mm_canon in _epoch_fast_cache:
-                    # §GGGGGG: molecule was already fast-screened this epoch (in §FF or
-                    # an earlier §MM round) — reuse the cached fast score.
-                    _mm_screen[_mm_smiles] = _epoch_fast_cache[_mm_canon]
-                    bt.logging.debug(
-                        f"§MM §NN §GGGGGG fast-cache hit: {_epoch_fast_cache[_mm_canon]:.4f}"
-                    )
-                else:
-                    _mm_misses.append((_mm_smiles, _mm_row))
-            # §FFFFFF: batch all cache-miss fast-screens into ONE Boltz call.
-            if _mm_misses and not _mm_stop:
+
+                # Mark current seed as tried so §QQ basin-hopping skips it next time.
+                _mm_tried_seeds.add(_mm_seed_smiles)
+
+                # Time check before each round — skip if < 2 mol-times + 2 min remain
                 try:
-                    _mm_blk2 = await state['subtensor'].get_current_block()
-                    _mm_ep2 = ((_mm_blk2 // state['epoch_length']) + 1) * state['epoch_length']
-                    if _mm_ep2 - _mm_blk2 < 5:
-                        bt.logging.info("§MM §NN: epoch ends in <5 blocks — stopping.")
-                        _mm_stop = True
+                    _mm_curr_blk = await state['subtensor'].get_current_block()
+                    _mm_next_ep = ((_mm_curr_blk // state['epoch_length']) + 1) * state['epoch_length']
+                    _mm_remaining_s = (_mm_next_ep - _mm_curr_blk) * 12
+                except Exception:
+                    break
+
+                _mm_t_mol = state.get('boltz_time_per_mol', 150.0)
+                if _mm_remaining_s < _mm_t_mol * 2 + 120:
+                    bt.logging.info(
+                        f"§MM round {_mm_round_idx + 1}: "
+                        f"{_mm_remaining_s:.0f}s remaining < {_mm_t_mol * 2 + 120:.0f}s needed — stopping."
+                    )
+                    break
+
+                # SALSA from current best Boltz seed
+                _mm_op_tags: dict = {}  # §OOOO: {product_name: operator} populated by run_salsa_search
+                try:
+                    _mm_salsa_hits = await asyncio.to_thread(
+                        run_salsa_search,
+                        _mm_seed_smiles,
+                        _mm_savi_pool,
+                        2,   # rounds — neighbourhood exploration
+                        200, # n_perturb — full operator coverage (ring walk + terminal removal)
+                        5,   # top_k — §NNNN: wider net for scaffold-diversity selection below
+                        _hhhhhh_score_col,  # §HHHHHH: surrogate-blended or 'combined_score' fallback
+                        'product_smiles',
+                        'product_name',
+                        _salsa_operator_weights(_mm_seed_smiles, state.get('salsa_operator_wins')),  # §ZZZZZ + §OOOO
+                        _mm_op_tags,  # §OOOO: out_operator_tags
+                        _dual,  # §UUUUUUUUUUUU: surrogate pre-filter for perturbation probes
+                    )
+                    # §NNNN: scaffold-diverse selection — each §MM fast-screen slot tests
+                    # a different chemical family, maximising coverage per GPU budget.
+                    if not _mm_salsa_hits.empty and len(_mm_salsa_hits) > 3:
+                        _mm_salsa_hits = _scaffold_diverse_candidates(_mm_salsa_hits, max_k=3)
+                except Exception as _mm_salsa_err:
+                    bt.logging.warning(f"§MM SALSA error: {_mm_salsa_err}")
+                    break
+
+                if _mm_salsa_hits.empty:
+                    bt.logging.info(f"§MM round {_mm_round_idx + 1}: no SALSA hits — stopping.")
+                    break
+
+                _mm_improved = False
+                _mm_round_best_score = _mm_best_score
+                _mm_round_best_smiles = _mm_seed_smiles
+
+                # §NN Phase 1: fast-screen each round's SALSA hits.
+                # Cache hits reuse the stored full score; misses run fast Boltz (no cache store).
+                # §FFFFFF: cache misses are batched into ONE score_molecules_target call so the
+                # expensive Boltz2 checkpoint load is paid once per round instead of N times.
+                _mm_screen: Dict[str, float] = {}  # smiles -> score
+                _mm_row_map: Dict[str, Any] = {}   # smiles -> row
+                _mm_misses: List[Tuple[str, Any]] = []  # (smiles, row) for cache-miss molecules
+                for _, _mm_row in _mm_salsa_hits.iterrows():
+                    if _mm_stop:
+                        break
+                    _mm_smiles = _mm_row['product_smiles']
+                    _mm_canon = get_canonical_smiles(_mm_smiles)
+                    _mm_key = (_mm_canon, protein)
+                    _mm_row_map[_mm_smiles] = _mm_row
+                    if _mm_key in boltz_cache:
+                        _mm_screen[_mm_smiles] = boltz_cache[_mm_key]
+                        bt.logging.debug(f"§MM §NN cache hit: {boltz_cache[_mm_key]:.4f}")
+                    elif _mm_canon in _epoch_fast_cache:
+                        # §GGGGGG: molecule was already fast-screened this epoch (in §FF or
+                        # an earlier §MM round) — reuse the cached fast score.
+                        _mm_screen[_mm_smiles] = _epoch_fast_cache[_mm_canon]
+                        bt.logging.debug(
+                            f"§MM §NN §GGGGGG fast-cache hit: {_epoch_fast_cache[_mm_canon]:.4f}"
+                        )
                     else:
-                        _mm_batch_vmbu = {
-                            _uid: {"smiles": [_sm], "names": [_row.get('product_name', '')]}
-                            for _uid, (_sm, _row) in enumerate(_mm_misses)
-                        }
-                        _mm_batch_sd: Dict[str, Any] = {_uid: {} for _uid in _mm_batch_vmbu}
-                        await asyncio.to_thread(
-                            wrapper.score_molecules_target,
-                            _mm_batch_vmbu, _mm_batch_sd, subnet_config, '0x' + '0' * 64, True,
-                        )
-                        for _uid, (_sm, _row) in enumerate(_mm_misses):
-                            _mm_screen[_sm] = wrapper.per_molecule_metric.get(_uid, {}).get(_sm, -math.inf)
-                        bt.logging.info(
-                            f"§MM §NN §FFFFFF [{_mm_round_idx + 1}/{_mm_max_rounds}]: "
-                            f"batch fast-screened {len(_mm_misses)} cache-miss molecules in 1 Boltz call"
-                        )
-                        # §GGGGGG: populate fast-cache so later §MM rounds skip re-screening
-                        # molecules already evaluated in this pass.
-                        for _uid, (_sm, _row) in enumerate(_mm_misses):
-                            _fc = get_canonical_smiles(_sm)
-                            _epoch_fast_cache[_fc] = _mm_screen.get(_sm, -math.inf)
-                except Exception as _mm_es:
-                    bt.logging.error(f"§MM §NN batch fast-screen error: {_mm_es}")
-                    for _sm, _ in _mm_misses:
-                        _mm_screen.setdefault(_sm, -math.inf)
-
-            if _mm_stop:
-                break
-
-            # §NN Phase 2: full-score only the round's best fast-screened candidate.
-            _mm_round_winner = max(
-                (_s for _s, _v in _mm_screen.items() if math.isfinite(_v)),
-                key=lambda _s: _mm_screen[_s],
-                default=None,
-            )
-            if _mm_round_winner is not None:
-                _mm_w_row = _mm_row_map[_mm_round_winner]
-                _mm_w_canon = get_canonical_smiles(_mm_round_winner)
-                _mm_w_key = (_mm_w_canon, protein)
-                if _mm_w_key in boltz_cache:
-                    _mm_score = boltz_cache[_mm_w_key]
-                else:
+                        _mm_misses.append((_mm_smiles, _mm_row))
+                # §FFFFFF: batch all cache-miss fast-screens into ONE Boltz call.
+                if _mm_misses and not _mm_stop:
                     try:
-                        _mm_blk3 = await state['subtensor'].get_current_block()
-                        _mm_ep3 = ((_mm_blk3 // state['epoch_length']) + 1) * state['epoch_length']
-                        if _mm_ep3 - _mm_blk3 < 5:
+                        _mm_blk2 = await state['subtensor'].get_current_block()
+                        _mm_ep2 = ((_mm_blk2 // state['epoch_length']) + 1) * state['epoch_length']
+                        if _mm_ep2 - _mm_blk2 < 5:
                             bt.logging.info("§MM §NN: epoch ends in <5 blocks — stopping.")
                             _mm_stop = True
-                            _mm_score = -math.inf
                         else:
-                            _mm_uid_f = 0
-                            _mm_vmbu_f = {_mm_uid_f: {"smiles": [_mm_round_winner], "names": [_mm_w_row['product_name']]}}
-                            _mm_sd_f: Dict[str, Any] = {_mm_uid_f: {}}
+                            _mm_batch_vmbu = {
+                                _uid: {"smiles": [_sm], "names": [_row.get('product_name', '')]}
+                                for _uid, (_sm, _row) in enumerate(_mm_misses)
+                            }
+                            _mm_batch_sd: Dict[str, Any] = {_uid: {} for _uid in _mm_batch_vmbu}
                             await asyncio.to_thread(
                                 wrapper.score_molecules_target,
-                                _mm_vmbu_f, _mm_sd_f, subnet_config, '0x' + '0' * 64,
+                                _mm_batch_vmbu, _mm_batch_sd, subnet_config, '0x' + '0' * 64, True,
                             )
-                            _mm_score = wrapper.per_molecule_metric.get(_mm_uid_f, {}).get(_mm_round_winner, -math.inf)
-                            boltz_cache[_mm_w_key] = _mm_score
-                            _mm_comps = wrapper.per_molecule_components.get(_mm_uid_f, {}).get(_mm_round_winner, {})
-                            _mm_apb = _mm_comps.get('affinity_probability_binary')
-                            _mm_apv = _mm_comps.get('affinity_pred_value')
-                            _mm_li = _mm_comps.get('ligand_iptm')
-                            _mm_cs = _mm_comps.get('confidence_score')
-                            _mm_ci = _mm_comps.get('complex_iplddt')  # §MMMMMMMMMM
-                            _mm_ipde = _mm_comps.get('complex_ipde')   # §UUUUUUUUUU
-                            _mm_iptm = _mm_comps.get('iptm')           # §VVVVVVVVVV
-                            # §IIIIIIIIII: prefer map (PSICHIC candidates), fall back to row (SAVI pool).
-                            _mm_ple = _psichic_le_map.get(_mm_w_canon)
-                            if _mm_ple is None:
-                                _mm_raw = _mm_w_row.get('combined_score')
-                                if isinstance(_mm_raw, (int, float)) and math.isfinite(float(_mm_raw)):
-                                    _mm_ple = float(_mm_raw)
-                            _disk_cache_put(
-                                db_path, _mm_w_canon, protein, _mm_score,
-                                product_name=_mm_w_row.get('product_name'),
-                                apb=_mm_apb if isinstance(_mm_apb, (int, float)) else None,
-                                apv=_mm_apv if isinstance(_mm_apv, (int, float)) else None,
-                                ligand_iptm=_mm_li if isinstance(_mm_li, (int, float)) else None,
-                                boltz_le_std=_compute_le_std(_mm_comps),
-                                confidence_score=_mm_cs if isinstance(_mm_cs, (int, float)) else None,
-                                boltz_embedding=_emb_to_bytes(_mm_comps),
-                                psichic_le=_mm_ple,  # §IIIIIIIIII
-                                complex_iplddt=_mm_ci if isinstance(_mm_ci, (int, float)) else None,  # §MMMMMMMMMM
-                                complex_ipde=_mm_ipde if isinstance(_mm_ipde, (int, float)) else None,  # §UUUUUUUUUU
-                                iptm=_mm_iptm if isinstance(_mm_iptm, (int, float)) else None,  # §VVVVVVVVVV
-                            )
-                            if wrapper.last_inference_duration > 0:
-                                state['boltz_time_per_mol'] = wrapper.last_inference_duration
-                                _save_miner_state(db_path, 'boltz_time_per_mol',
-                                                  wrapper.last_inference_duration)
+                            for _uid, (_sm, _row) in enumerate(_mm_misses):
+                                _mm_screen[_sm] = wrapper.per_molecule_metric.get(_uid, {}).get(_sm, -math.inf)
                             bt.logging.info(
-                                f"§MM §NN [{_mm_round_idx + 1}/{_mm_max_rounds}] full-scored winner: "
-                                f"{_mm_w_row.get('product_name', '?')} boltz={_mm_score:.4f} "
-                                f"(screened {len(_mm_screen)} hits)"
+                                f"§MM §NN §FFFFFF [{_mm_round_idx + 1}/{_mm_max_rounds}]: "
+                                f"batch fast-screened {len(_mm_misses)} cache-miss molecules in 1 Boltz call"
                             )
-                            # §IIIIII: Online surrogate refresh — retrain the dual surrogate
-                            # immediately after each new §MM full-score so subsequent rounds
-                            # benefit from the freshest possible Boltz-calibrated signal.
-                            # Only updates _mm_savi_pool when the RF tier is active (≥100 cache
-                            # points); Ridge surrogates ignore additional points almost entirely.
-                            try:
-                                _ii_dual = fit_dual_surrogate(db_path, protein)
-                                if _ii_dual is not None:
-                                    _ii_src = (
-                                        _mm_savi_pool
-                                        if _mm_savi_pool is not None
-                                        else state.get('savi_stream_pool')
-                                    )
-                                    if _ii_src is not None and not _ii_src.empty:
-                                        _ii_alpha = adaptive_blend_alpha(db_path, protein)
-                                        _ii_pool = augment_pool_with_surrogate_blend(
-                                            _ii_src, _ii_dual, alpha=_ii_alpha
-                                        )
-                                        if 'surrogate_salsa_score' in _ii_pool.columns:
-                                            _mm_savi_pool = _ii_pool
-                                            _hhhhhh_score_col = 'surrogate_salsa_score'
-                                            bt.logging.debug(
-                                                f"[§IIIIII] Surrogate refreshed after §MM "
-                                                f"round {_mm_round_idx + 1} — pool re-blended."
-                                            )
-                            except Exception as _ii_exc:
-                                bt.logging.debug(
-                                    f"[§IIIIII] Surrogate refresh (non-fatal): {_ii_exc}"
-                                )
-                    except Exception as _mm_e:
-                        bt.logging.error(f"§MM §NN full-score error: {_mm_e}")
-                        _mm_score = -math.inf
+                            # §GGGGGG: populate fast-cache so later §MM rounds skip re-screening
+                            # molecules already evaluated in this pass.
+                            for _uid, (_sm, _row) in enumerate(_mm_misses):
+                                _fc = get_canonical_smiles(_sm)
+                                _epoch_fast_cache[_fc] = _mm_screen.get(_sm, -math.inf)
+                    except Exception as _mm_es:
+                        bt.logging.error(f"§MM §NN batch fast-screen error: {_mm_es}")
+                        for _sm, _ in _mm_misses:
+                            _mm_screen.setdefault(_sm, -math.inf)
 
-                if math.isfinite(_mm_score) and _mm_score > _mm_round_best_score:
-                    _mm_round_best_score = _mm_score
-                    _mm_round_best_smiles = _mm_round_winner
-                    _mm_pname = _mm_w_row.get('product_name', '')
-                    if _mm_pname:
-                        _mm_orig = state['candidate_product'].split(',')
-                        state['candidate_product'] = ','.join(
-                            [_mm_pname] + [n for n in _mm_orig if n != _mm_pname]
-                        )
-                        bt.logging.info(
-                            f"§MM §NN: new best: {_mm_pname} "
-                            f"(boltz={_mm_score:.4f} > prev={_mm_best_score:.4f})"
-                        )
-                        # §OOOO: credit the operator that discovered the winning SALSA hit.
-                        _oooo_wins = state.get('salsa_operator_wins')
-                        if _oooo_wins is not None:
-                            _oooo_op = _mm_op_tags.get(_mm_pname)
-                            if _oooo_op in _oooo_wins:
-                                _oooo_wins[_oooo_op] += 1
-                                bt.logging.debug(
-                                    f"[§OOOO] Operator '{_oooo_op}' credited "
-                                    f"(wins={_oooo_wins})"
-                                )
-                                # §SSSSSSSSSSSS: persist operator wins to SQLite
-                                # so cross-epoch and cross-restart learning works.
-                                try:
-                                    _save_miner_state_text(
-                                        state['boltz_cache_db'],
-                                        'salsa_operator_wins_json',
-                                        json.dumps(_oooo_wins),
-                                    )
-                                except Exception:
-                                    pass
-                    _mm_improved = True
+                if _mm_stop:
+                    break
 
-            # Expose §MM scores to §CC so the warm-start guard sees the full epoch best
-            for _mm_ck2, _mm_cv2 in boltz_cache.items():
-                if (
-                    isinstance(_mm_ck2, tuple)
-                    and _mm_ck2[1] == protein
-                    and _mm_ck2[0] not in all_scores
-                    and math.isfinite(_mm_cv2)
-                ):
-                    all_scores[_mm_ck2[0]] = _mm_cv2
-
-            _mm_rounds_run = _mm_round_idx + 1
-
-            if not _mm_improved:
-                # §QQ/§VV Basin-hopping: instead of stopping on the first no-improvement
-                # round, try the next-best scored molecule not yet used as a seed.
-                # §VV adds scaffold awareness: prefer candidates with a Murcko scaffold
-                # not yet explored by any §MM seed, so hops cross chemical space rather
-                # than revisiting the same structural region.
-                # Uses all_scores (updated above with §MM results) so molecules
-                # discovered during §MM itself can serve as alternative seeds.
-                from rdkit.Chem import MurckoScaffold as _Murcko
-
-                def _get_scaffold_smi(smi: str) -> str:
-                    m = Chem.MolFromSmiles(smi)
-                    if not m:
-                        return smi
-                    try:
-                        sc = _Murcko.GetScaffoldForMol(m)
-                        return Chem.MolToSmiles(sc) if sc else smi
-                    except Exception:
-                        return smi
-
-                _mm_tried_scaffolds: set = {_get_scaffold_smi(s) for s in _mm_tried_seeds}
-
-                # First pass: prefer a candidate with an unseen Murcko scaffold.
-                _mm_next_seed = max(
-                    (
-                        _s for _s, _v in all_scores.items()
-                        if _s not in _mm_tried_seeds
-                        and math.isfinite(_v)
-                        and _get_scaffold_smi(_s) not in _mm_tried_scaffolds
-                    ),
-                    key=lambda _s: all_scores[_s],
+                # §NN Phase 2: full-score only the round's best fast-screened candidate.
+                _mm_round_winner = max(
+                    (_s for _s, _v in _mm_screen.items() if math.isfinite(_v)),
+                    key=lambda _s: _mm_screen[_s],
                     default=None,
                 )
-                _mm_hop_novel = _mm_next_seed is not None
+                if _mm_round_winner is not None:
+                    _mm_w_row = _mm_row_map[_mm_round_winner]
+                    _mm_w_canon = get_canonical_smiles(_mm_round_winner)
+                    _mm_w_key = (_mm_w_canon, protein)
+                    if _mm_w_key in boltz_cache:
+                        _mm_score = boltz_cache[_mm_w_key]
+                    else:
+                        try:
+                            _mm_blk3 = await state['subtensor'].get_current_block()
+                            _mm_ep3 = ((_mm_blk3 // state['epoch_length']) + 1) * state['epoch_length']
+                            if _mm_ep3 - _mm_blk3 < 5:
+                                bt.logging.info("§MM §NN: epoch ends in <5 blocks — stopping.")
+                                _mm_stop = True
+                                _mm_score = -math.inf
+                            else:
+                                _mm_uid_f = 0
+                                _mm_vmbu_f = {_mm_uid_f: {"smiles": [_mm_round_winner], "names": [_mm_w_row['product_name']]}}
+                                _mm_sd_f: Dict[str, Any] = {_mm_uid_f: {}}
+                                await asyncio.to_thread(
+                                    wrapper.score_molecules_target,
+                                    _mm_vmbu_f, _mm_sd_f, subnet_config, '0x' + '0' * 64,
+                                )
+                                _mm_score = wrapper.per_molecule_metric.get(_mm_uid_f, {}).get(_mm_round_winner, -math.inf)
+                                boltz_cache[_mm_w_key] = _mm_score
+                                _mm_comps = wrapper.per_molecule_components.get(_mm_uid_f, {}).get(_mm_round_winner, {})
+                                _mm_apb = _mm_comps.get('affinity_probability_binary')
+                                _mm_apv = _mm_comps.get('affinity_pred_value')
+                                _mm_li = _mm_comps.get('ligand_iptm')
+                                _mm_cs = _mm_comps.get('confidence_score')
+                                _mm_ci = _mm_comps.get('complex_iplddt')  # §MMMMMMMMMM
+                                _mm_ipde = _mm_comps.get('complex_ipde')   # §UUUUUUUUUU
+                                _mm_iptm = _mm_comps.get('iptm')           # §VVVVVVVVVV
+                                # §IIIIIIIIII: prefer map (PSICHIC candidates), fall back to row (SAVI pool).
+                                _mm_ple = _psichic_le_map.get(_mm_w_canon)
+                                if _mm_ple is None:
+                                    _mm_raw = _mm_w_row.get('combined_score')
+                                    if isinstance(_mm_raw, (int, float)) and math.isfinite(float(_mm_raw)):
+                                        _mm_ple = float(_mm_raw)
+                                _disk_cache_put(
+                                    db_path, _mm_w_canon, protein, _mm_score,
+                                    product_name=_mm_w_row.get('product_name'),
+                                    apb=_mm_apb if isinstance(_mm_apb, (int, float)) else None,
+                                    apv=_mm_apv if isinstance(_mm_apv, (int, float)) else None,
+                                    ligand_iptm=_mm_li if isinstance(_mm_li, (int, float)) else None,
+                                    boltz_le_std=_compute_le_std(_mm_comps),
+                                    confidence_score=_mm_cs if isinstance(_mm_cs, (int, float)) else None,
+                                    boltz_embedding=_emb_to_bytes(_mm_comps),
+                                    psichic_le=_mm_ple,  # §IIIIIIIIII
+                                    complex_iplddt=_mm_ci if isinstance(_mm_ci, (int, float)) else None,  # §MMMMMMMMMM
+                                    complex_ipde=_mm_ipde if isinstance(_mm_ipde, (int, float)) else None,  # §UUUUUUUUUU
+                                    iptm=_mm_iptm if isinstance(_mm_iptm, (int, float)) else None,  # §VVVVVVVVVV
+                                )
+                                if wrapper.last_inference_duration > 0:
+                                    state['boltz_time_per_mol'] = wrapper.last_inference_duration
+                                    _save_miner_state(db_path, 'boltz_time_per_mol',
+                                                      wrapper.last_inference_duration)
+                                bt.logging.info(
+                                    f"§MM §NN [{_mm_round_idx + 1}/{_mm_max_rounds}] full-scored winner: "
+                                    f"{_mm_w_row.get('product_name', '?')} boltz={_mm_score:.4f} "
+                                    f"(screened {len(_mm_screen)} hits)"
+                                )
+                                # §IIIIII: Online surrogate refresh — retrain the dual surrogate
+                                # immediately after each new §MM full-score so subsequent rounds
+                                # benefit from the freshest possible Boltz-calibrated signal.
+                                # Only updates _mm_savi_pool when the RF tier is active (≥100 cache
+                                # points); Ridge surrogates ignore additional points almost entirely.
+                                try:
+                                    _ii_dual = fit_dual_surrogate(db_path, protein)
+                                    if _ii_dual is not None:
+                                        _ii_src = (
+                                            _mm_savi_pool
+                                            if _mm_savi_pool is not None
+                                            else state.get('savi_stream_pool')
+                                        )
+                                        if _ii_src is not None and not _ii_src.empty:
+                                            _ii_alpha = adaptive_blend_alpha(db_path, protein)
+                                            _ii_pool = augment_pool_with_surrogate_blend(
+                                                _ii_src, _ii_dual, alpha=_ii_alpha
+                                            )
+                                            if 'surrogate_salsa_score' in _ii_pool.columns:
+                                                _mm_savi_pool = _ii_pool
+                                                _hhhhhh_score_col = 'surrogate_salsa_score'
+                                                bt.logging.debug(
+                                                    f"[§IIIIII] Surrogate refreshed after §MM "
+                                                    f"round {_mm_round_idx + 1} — pool re-blended."
+                                                )
+                                except Exception as _ii_exc:
+                                    bt.logging.debug(
+                                        f"[§IIIIII] Surrogate refresh (non-fatal): {_ii_exc}"
+                                    )
+                        except Exception as _mm_e:
+                            bt.logging.error(f"§MM §NN full-score error: {_mm_e}")
+                            _mm_score = -math.inf
 
-                # Fallback: any untried seed (even from an already-explored scaffold).
-                if _mm_next_seed is None:
+                    if math.isfinite(_mm_score) and _mm_score > _mm_round_best_score:
+                        _mm_round_best_score = _mm_score
+                        _mm_round_best_smiles = _mm_round_winner
+                        _mm_pname = _mm_w_row.get('product_name', '')
+                        if _mm_pname:
+                            _mm_orig = state['candidate_product'].split(',')
+                            state['candidate_product'] = ','.join(
+                                [_mm_pname] + [n for n in _mm_orig if n != _mm_pname]
+                            )
+                            bt.logging.info(
+                                f"§MM §NN: new best: {_mm_pname} "
+                                f"(boltz={_mm_score:.4f} > prev={_mm_best_score:.4f})"
+                            )
+                            # §OOOO: credit the operator that discovered the winning SALSA hit.
+                            _oooo_wins = state.get('salsa_operator_wins')
+                            if _oooo_wins is not None:
+                                _oooo_op = _mm_op_tags.get(_mm_pname)
+                                if _oooo_op in _oooo_wins:
+                                    _oooo_wins[_oooo_op] += 1
+                                    bt.logging.debug(
+                                        f"[§OOOO] Operator '{_oooo_op}' credited "
+                                        f"(wins={_oooo_wins})"
+                                    )
+                                    # §SSSSSSSSSSSS: persist operator wins to SQLite
+                                    # so cross-epoch and cross-restart learning works.
+                                    try:
+                                        _save_miner_state_text(
+                                            state['boltz_cache_db'],
+                                            'salsa_operator_wins_json',
+                                            json.dumps(_oooo_wins),
+                                        )
+                                    except Exception:
+                                        pass
+                        _mm_improved = True
+
+                # Expose §MM scores to §CC so the warm-start guard sees the full epoch best
+                for _mm_ck2, _mm_cv2 in boltz_cache.items():
+                    if (
+                        isinstance(_mm_ck2, tuple)
+                        and _mm_ck2[1] == protein
+                        and _mm_ck2[0] not in all_scores
+                        and math.isfinite(_mm_cv2)
+                    ):
+                        all_scores[_mm_ck2[0]] = _mm_cv2
+
+                _mm_rounds_run += 1  # §YYYYYYYYYYYY: accumulate across all seeds
+
+                if not _mm_improved:
+                    # §QQ/§VV Basin-hopping: instead of stopping on the first no-improvement
+                    # round, try the next-best scored molecule not yet used as a seed.
+                    # §VV adds scaffold awareness: prefer candidates with a Murcko scaffold
+                    # not yet explored by any §MM seed, so hops cross chemical space rather
+                    # than revisiting the same structural region.
+                    # Uses all_scores (updated above with §MM results) so molecules
+                    # discovered during §MM itself can serve as alternative seeds.
+                    from rdkit.Chem import MurckoScaffold as _Murcko
+
+                    def _get_scaffold_smi(smi: str) -> str:
+                        m = Chem.MolFromSmiles(smi)
+                        if not m:
+                            return smi
+                        try:
+                            sc = _Murcko.GetScaffoldForMol(m)
+                            return Chem.MolToSmiles(sc) if sc else smi
+                        except Exception:
+                            return smi
+
+                    _mm_tried_scaffolds: set = {_get_scaffold_smi(s) for s in _mm_tried_seeds}
+
+                    # First pass: prefer a candidate with an unseen Murcko scaffold.
                     _mm_next_seed = max(
-                        (_s for _s, _v in all_scores.items()
-                         if _s not in _mm_tried_seeds and math.isfinite(_v)),
+                        (
+                            _s for _s, _v in all_scores.items()
+                            if _s not in _mm_tried_seeds
+                            and math.isfinite(_v)
+                            and _get_scaffold_smi(_s) not in _mm_tried_scaffolds
+                        ),
                         key=lambda _s: all_scores[_s],
                         default=None,
                     )
+                    _mm_hop_novel = _mm_next_seed is not None
 
-                if _mm_next_seed is None:
-                    # §CCCCCCCCCC: Before stopping, try the top surrogate-scored SAVI
-                    # molecule not yet used as an §MM seed.  When all Boltz-scored
-                    # candidates are exhausted, the surrogate-blended pool can nominate a
-                    # fresh chemical basin to explore without an extra Boltz call upfront.
-                    _cccccccccc_seed = None
-                    try:
-                        if _mm_savi_pool is not None and not _mm_savi_pool.empty:
-                            _cc_col = (
-                                _hhhhhh_score_col
-                                if _hhhhhh_score_col in _mm_savi_pool.columns
-                                else 'combined_score'
-                            )
-                            if _cc_col in _mm_savi_pool.columns:
-                                for _, _cc_row in _mm_savi_pool.nlargest(50, _cc_col).iterrows():
-                                    _cc_smi = _cc_row.get('product_smiles', '')
-                                    _cc_can = get_canonical_smiles(_cc_smi) or _cc_smi
-                                    if _cc_can and _cc_can not in _mm_tried_seeds:
-                                        _ok2, _ = is_boltz_safe_smiles(_cc_can)
-                                        if _ok2:
-                                            _cccccccccc_seed = _cc_can
-                                            bt.logging.info(
-                                                f"[§CCCCCCCCCC] Surrogate-pool basin-hop: "
-                                                f"{_cc_row.get('product_name', '?')} "
-                                                f"({_cc_col}="
-                                                f"{_cc_row.get(_cc_col, float('nan')):.4f}) "
-                                                f"— Boltz-seed pool exhausted, extending §MM."
-                                            )
-                                            break
-                    except Exception as _cc_err:
-                        bt.logging.debug(
-                            f"[§CCCCCCCCCC] Surrogate-pool fallback (non-fatal): {_cc_err}"
+                    # Fallback: any untried seed (even from an already-explored scaffold).
+                    if _mm_next_seed is None:
+                        _mm_next_seed = max(
+                            (_s for _s, _v in all_scores.items()
+                             if _s not in _mm_tried_seeds and math.isfinite(_v)),
+                            key=lambda _s: all_scores[_s],
+                            default=None,
                         )
-                    if _cccccccccc_seed is not None:
-                        _mm_seed_smiles = _cccccccccc_seed
-                        continue  # start next §MM round from surrogate-nominated basin
+
+                    if _mm_next_seed is None:
+                        # §CCCCCCCCCC: Before stopping, try the top surrogate-scored SAVI
+                        # molecule not yet used as an §MM seed.  When all Boltz-scored
+                        # candidates are exhausted, the surrogate-blended pool can nominate a
+                        # fresh chemical basin to explore without an extra Boltz call upfront.
+                        _cccccccccc_seed = None
+                        try:
+                            if _mm_savi_pool is not None and not _mm_savi_pool.empty:
+                                _cc_col = (
+                                    _hhhhhh_score_col
+                                    if _hhhhhh_score_col in _mm_savi_pool.columns
+                                    else 'combined_score'
+                                )
+                                if _cc_col in _mm_savi_pool.columns:
+                                    for _, _cc_row in _mm_savi_pool.nlargest(50, _cc_col).iterrows():
+                                        _cc_smi = _cc_row.get('product_smiles', '')
+                                        _cc_can = get_canonical_smiles(_cc_smi) or _cc_smi
+                                        if _cc_can and _cc_can not in _mm_tried_seeds:
+                                            _ok2, _ = is_boltz_safe_smiles(_cc_can)
+                                            if _ok2:
+                                                _cccccccccc_seed = _cc_can
+                                                bt.logging.info(
+                                                    f"[§CCCCCCCCCC] Surrogate-pool basin-hop: "
+                                                    f"{_cc_row.get('product_name', '?')} "
+                                                    f"({_cc_col}="
+                                                    f"{_cc_row.get(_cc_col, float('nan')):.4f}) "
+                                                    f"— Boltz-seed pool exhausted, extending §MM."
+                                                )
+                                                break
+                        except Exception as _cc_err:
+                            bt.logging.debug(
+                                f"[§CCCCCCCCCC] Surrogate-pool fallback (non-fatal): {_cc_err}"
+                            )
+                        if _cccccccccc_seed is not None:
+                            _mm_seed_smiles = _cccccccccc_seed
+                            continue  # start next §MM round from surrogate-nominated basin
+                        bt.logging.info(
+                            f"§MM round {_mm_round_idx + 1}: no improvement; "
+                            f"all {len(_mm_tried_seeds)} seed(s) exhausted — stopping."
+                        )
+                        break
+                    _hop_tag = "novel scaffold" if _mm_hop_novel else "same scaffold"
                     bt.logging.info(
-                        f"§MM round {_mm_round_idx + 1}: no improvement; "
-                        f"all {len(_mm_tried_seeds)} seed(s) exhausted — stopping."
+                        f"§MM round {_mm_round_idx + 1}: no improvement from current seed; "
+                        f"§QQ/§VV basin-hop ({_hop_tag}) "
+                        f"(score={all_scores[_mm_next_seed]:.4f})."
                     )
-                    break
-                _hop_tag = "novel scaffold" if _mm_hop_novel else "same scaffold"
-                bt.logging.info(
-                    f"§MM round {_mm_round_idx + 1}: no improvement from current seed; "
-                    f"§QQ/§VV basin-hop ({_hop_tag}) "
-                    f"(score={all_scores[_mm_next_seed]:.4f})."
-                )
-                _mm_seed_smiles = _mm_next_seed
-                # _mm_best_score unchanged — basin-hop doesn't claim an improvement
-            else:
-                # Advance seed to this round's best for the next iteration
-                _mm_best_score = _mm_round_best_score
-                _mm_seed_smiles = _mm_round_best_smiles
+                    _mm_seed_smiles = _mm_next_seed
+                    # _mm_best_score unchanged — basin-hop doesn't claim an improvement
+                else:
+                    # Advance seed to this round's best for the next iteration
+                    _mm_best_score = _mm_round_best_score
+                    _mm_seed_smiles = _mm_round_best_smiles
 
         bt.logging.info(
             f"§MM complete: {_mm_rounds_run} round(s) run, "

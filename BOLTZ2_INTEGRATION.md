@@ -1,12 +1,184 @@
 # Boltz-2 Miner Integration
 
-## Current Status (as of 2026-09-01)
+## Current Status (as of 2026-09-03)
 
-**68 roadmap items implemented.** §XXXXXXXXXXXX (cache-adaptive UCB beta) added 2026-09-01. §WWWWWWWWWWWW (cache-adaptive surrogate blend alpha) added 2026-08-30. §VVVVVVVVVVVV (reliability-adjusted §MM seed selection) added 2026-08-29. §UUUUUUUUUUUU (surrogate pre-filter for SALSA perturbations) added 2026-08-28.
+**69 roadmap items implemented; 2 proposed (items 70–71).** §YYYYYYYYYYYY (multi-start §MM SALSA from diversity-maximised cache seeds) added 2026-09-03. §XXXXXXXXXXXX (cache-adaptive UCB beta) added 2026-09-01. §WWWWWWWWWWWW (cache-adaptive surrogate blend alpha) added 2026-08-30. §VVVVVVVVVVVV (reliability-adjusted §MM seed selection) added 2026-08-29. §UUUUUUUUUUUU (surrogate pre-filter for SALSA perturbations) added 2026-08-28.
+
+Proposed items §ZZZZZZZZZZZZ (Boltz-2 binding-pose cache for structure-guided §MM growth vectors) and §AAAAAAAAAAAA (GA population diversity injection from cross-epoch SQLite elite) identified 2026-09-03.
+
+---
+
+## Proposed Optimisations (next priorities)
+
+### §ZZZZZZZZZZZZ — Boltz-2 Binding-Pose Cache for Structure-Guided §MM Growth Vectors — PROPOSED
+
+**Problem:** All Boltz-2 output structures are deleted after inference (`remove_files: true`
+in `boltz_config.yaml`).  The predicted binding pose — which protein residues contact the
+ligand, which ligand atoms are solvent-exposed, which directions have pocket space — is
+discarded after each Boltz call.
+
+SALSA hill-climbing (§MM) then perturbs atoms uniformly: every atom has equal probability of
+receiving a `bioisostere`, `fg_add`, or `ring_walk` operator, regardless of whether it is
+buried deep in the binding pocket (sterically constrained) or pointing into solvent (free to
+grow).  This wastes Boltz oracle calls on perturbations that are geometrically invalid.
+
+**Fix:**
+
+Extend `BoltzWrapper` to cache per-atom min-distance-to-protein from the output PDB before
+file removal.  Expose as `atom_exposure: dict[int, float] | None` to `run_salsa_search()`,
+weighting `fg_add`/`ring_walk` toward solvent-exposed positions and down-weighting buried ones.
+
+Step 1 — Pose extraction in `BoltzWrapper.postprocess_data()`:
+
+```python
+def _extract_ligand_exposure(pdb_path: str, smiles: str) -> dict[int, float]:
+    """Return {rdkit_atom_idx: min_protein_distance_angstrom}."""
+    from rdkit import Chem
+    import numpy as np
+    mol = Chem.MolFromSmiles(smiles)
+    if mol is None:
+        return {}
+    ligand_coords, protein_coords = [], []
+    with open(pdb_path) as f:
+        for line in f:
+            if line.startswith("HETATM"):
+                ligand_coords.append([float(line[30:38]), float(line[38:46]), float(line[46:54])])
+            elif line.startswith("ATOM"):
+                protein_coords.append([float(line[30:38]), float(line[38:46]), float(line[46:54])])
+    if not ligand_coords or not protein_coords:
+        return {}
+    L = np.array(ligand_coords)
+    P = np.array(protein_coords)
+    dists = np.min(np.linalg.norm(L[:, None, :] - P[None, :, :], axis=2), axis=1)
+    return {i: float(dists[i]) for i in range(min(len(dists), mol.GetNumHeavyAtoms()))}
+```
+
+Step 2 — Store in `BoltzWrapper._pose_exposure: dict[str, dict[int, float]]` (keyed by
+canonical SMILES) before file removal.  Override `remove_files` in-memory only for PDB reading,
+then manually delete PDB files.
+
+Step 3 — Add `atom_exposure` parameter to `run_salsa_search()`:
+
+```python
+def _atom_perturbation_weight(atom_idx, exposure, op):
+    d = exposure.get(atom_idx, 5.0)   # unknown → assume exposed
+    if op in ("fg_add", "ring_walk"):
+        return max(0.1, min(2.0, d / 3.0))
+    elif op == "bioisostere":
+        return max(0.5, min(1.5, d / 4.0))
+    return 1.0
+```
+
+Step 4 — Pass `atom_exposure` from §MM call site when `_mm_seed_smiles` is in
+`self._boltz_wrapper._pose_exposure`.
+
+**Regression guards:** `atom_exposure is None` → 1.0 weights → identical to pre-§ZZZZZZZZZZZZ.
+
+**Expected benefit:** +3–6% Boltz LE on epoch 2+ (when ≥1 full Boltz pose is available);
+~20–30% fewer fast-screen failures for `fg_add`/`ring_walk`.
+
+**Files changed (proposed):**
+- `boltz/wrapper.py`: `_extract_ligand_exposure()` (~40 lines) + `_pose_exposure` cache +
+  `postprocess_data()` patch (~25 lines).
+- `utils/salsa.py`: `atom_exposure` parameter + `_atom_perturbation_weight()` (~30 lines).
+- `neurons/miner.py`: pass `atom_exposure` to §MM SALSA calls (~10 lines).
+
+**Estimated effort: ~150 lines.**
+
+---
+
+### §AAAAAAAAAAAA — GA Population Diversity Injection from Cross-Epoch SQLite Elite — PROPOSED
+
+**Problem:** The GradientGA population (§O) is initialised from the top PSICHIC molecules in
+`savi_stream_pool`.  On epoch 2+, the best Boltz-validated molecules (in the SQLite cache) are
+NOT injected into the initial population.  The GA therefore starts from a PSICHIC-biased
+population and may not discover Boltz-optimal molecules until the surrogate matures (epoch 3+).
+
+**Fix:**
+
+1. Before calling `run_gradient_ga()`, query SQLite for top-10 molecules by
+   `reliability_score = boltz_le / (1 + 10 × max(boltz_le_std, boltz_ww_std))`.
+   Select top-3 by max-min Tanimoto diversity (reuses `_select_diverse_mm_seeds()`).
+
+2. Add `elite_smiles: list[str] | None = None` to `run_gradient_ga()`.  Inject these as
+   population rows (via Tanimoto-nearest SAVI-2020 lookup), replacing worst-PSICHIC members.
+   Mark with `is_elite=True`; elitism guard in generation 0 preserves them through crossover.
+
+```python
+# §AAAAAAAAAAAA: inject Boltz-validated elite molecules
+_aaaaaaaaaaaa_elites = []
+try:
+    with sqlite3.connect(BOLTZ_CACHE_DB) as _conn:
+        _rows = _conn.execute(
+            """SELECT smiles FROM boltz_cache WHERE protein=?
+               ORDER BY boltz_le / (1.0 + 10.0 * MAX(
+                   COALESCE(boltz_le_std, 0), COALESCE(boltz_ww_std, 0))) DESC LIMIT 10""",
+            (state['protein'],)
+        ).fetchall()
+    _aaaaaaaaaaaa_elites = _select_diverse_mm_seeds(
+        [r[0] for r in _rows], primary=_rows[0][0], n_extra=2
+    ) if _rows else []
+except Exception:
+    _aaaaaaaaaaaa_elites = []
+```
+
+**Regression guards:** `elite_smiles=None` (empty cache) → GA unchanged; `is_elite` only
+active in generation 0; SQLite error → empty list fallback.
+
+**Expected benefit:** +2–5% GA-active epoch Boltz LE on epoch 2+ by seeding crossover with
+Boltz-validated winners from round 1, before the surrogate can guide tournament selection.
+
+**Files changed (proposed):**
+- `utils/genetic.py`: `elite_smiles` parameter + generation-0 elitism guard (~40 lines).
+- `neurons/miner.py`: SQLite query + `_select_diverse_mm_seeds` call + pass to GA (~25 lines).
+
+**Estimated effort: ~65 lines.**
 
 ---
 
 ## Implemented Optimisations (recent)
+
+### §YYYYYYYYYYYY — Multi-Start §MM SALSA from Diversity-Maximised Cache Seeds — added 2026-09-03
+
+**Problem:** §MM hill-climbing always starts from a single seed: the reliability-adjusted argmax
+of `_mm_all_scored` (§VVVVVVVVVVVV).  A single starting point cannot escape local optima in
+chemical space — if the best-known molecule inhabits one scaffold basin, §MM refines within
+that basin indefinitely.
+
+**Fix:**
+
+Added `_select_diverse_mm_seeds()` helper (40 lines, `neurons/miner.py`) that uses max-min
+Tanimoto on Morgan fingerprints (radius=2, 256 bits) to select up to 2 additional seeds from
+`_mm_all_scored`.  Seeds with Tanimoto ≤ 0.15 to all selected are discarded.
+
+The §MM block now runs an outer `for _mm_global_seed_idx, _mm_global_seed in enumerate(_mm_seed_list):`
+loop.  Within each outer seed:
+- `_mm_tried_seeds` resets so §QQ/§VV basin-hopping is local to that start
+- `_mm_best_score` is global so improvement comparisons stay consistent across seeds
+- §KKKKKK round cap applies per seed (not total)
+
+**Regression guards:**
+- `len(_mm_seed_list) == 1`: identical to pre-§YYYYYYYYYYYY behaviour.
+- Tanimoto ≤ 0.15: seed discarded.
+- `try/except` on FP computation → non-fatal fallback to `[primary]`.
+- `_mm_stop` flag (epoch boundary / time guard) breaks outer loop immediately.
+
+**Expected benefit:**
+
+| Scenario | Before | After |
+|----------|--------|-------|
+| All cache molecules in same scaffold | 1 seed, 1 basin | Still 1 seed (Tanimoto < 0.15 guard) |
+| 2+ distinct scaffolds in cache | 1 seed, miss 2nd basin | 2–3 seeds, explore both |
+| Budget exhausted after seed 1 | Seed 1 only | Seed 1 only (budget-limited, same) |
+| Epoch 1 cold start (1 Boltz result) | 1 seed | 1 seed (only candidate) |
+
+Expected gain: **+3–8% Boltz LE** on epoch 3+ with ≥3 diverse cached scaffolds.
+
+**Files changed:**
+- `neurons/miner.py`: `_select_diverse_mm_seeds()` helper (~40 lines) + §MM outer seed loop
+  rewrite (~35 lines replacing inner `for` loop start block).
+
+---
 
 ### §XXXXXXXXXXXX — Cache-Adaptive UCB Beta — added 2026-09-01
 
