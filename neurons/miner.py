@@ -1396,7 +1396,68 @@ async def run_psichic_model_loop(state: Dict[str, Any]) -> None:
                         # the surrogate is unavailable (< 100 pts / Ridge tier / first epoch).
                         _uu_ga_score_col = 'combined_score'
                         _uu_ga_pool = ga_pool
-                        _uu_ga_seed = state['global_candidate_pool']
+                        _uu_ga_seed = state['global_candidate_pool'].copy()
+                        # §AAAAAAAAAAAA: GA population diversity injection from
+                        # cross-epoch SQLite elite.  Query top-10 Boltz-cached
+                        # molecules for the current protein; select up to 3 by
+                        # max-min Tanimoto diversity (reuses _select_diverse_mm_seeds);
+                        # inject into seed_df BEFORE surrogate augmentation so the
+                        # surrogate blend is also applied to the elite molecules.
+                        # Injected molecules participate in crossover from generation 1
+                        # and replace the worst-PSICHIC entries in the seed pool via
+                        # combined_score-based sort (boltz_le > PSICHIC-LE for proven binders).
+                        try:
+                            _aaa_cache_rows = _disk_cache_get_candidates(
+                                state.get('boltz_cache_db', BOLTZ_CACHE_DB),
+                                state['config'].weekly_target,
+                                limit=10,
+                            )
+                            if _aaa_cache_rows:
+                                _aaa_smiles_list = [
+                                    r['product_smiles'] for r in _aaa_cache_rows
+                                    if r.get('product_smiles') and r.get('product_name')
+                                ]
+                                if _aaa_smiles_list:
+                                    _aaa_primary = _aaa_smiles_list[0]  # best by score
+                                    _aaa_selected = _select_diverse_mm_seeds(
+                                        _aaa_smiles_list, _aaa_primary, n_extra=2
+                                    )
+                                    _aaa_smi_to_row = {
+                                        r['product_smiles']: r for r in _aaa_cache_rows
+                                    }
+                                    _aaa_elite_rows = [
+                                        {
+                                            'product_name': _aaa_smi_to_row[_s]['product_name'],
+                                            'product_smiles': _s,
+                                            'combined_score': _aaa_smi_to_row[_s]['combined_score'],
+                                        }
+                                        for _s in _aaa_selected
+                                        if _s in _aaa_smi_to_row
+                                           and _aaa_smi_to_row[_s].get('product_name')
+                                    ]
+                                    if _aaa_elite_rows:
+                                        _aaa_elite_df = pd.DataFrame(_aaa_elite_rows)
+                                        _uu_ga_seed = pd.concat(
+                                            [_aaa_elite_df, _uu_ga_seed],
+                                            ignore_index=True,
+                                        )
+                                        _uu_ga_seed.drop_duplicates(
+                                            subset=['product_name'], inplace=True
+                                        )
+                                        _uu_ga_seed.sort_values(
+                                            'combined_score', ascending=False, inplace=True
+                                        )
+                                        _uu_ga_seed = _uu_ga_seed.head(20).reset_index(drop=True)
+                                        bt.logging.info(
+                                            f"[§AAAAAAAAAAAA] Injected {len(_aaa_elite_rows)} "
+                                            f"SQLite-elite molecule(s) into GA seed pool "
+                                            f"(diversity-selected from {len(_aaa_cache_rows)} "
+                                            f"cache entries)."
+                                        )
+                        except Exception as _aaa_err:
+                            bt.logging.debug(
+                                f"[§AAAAAAAAAAAA] Elite injection skipped: {_aaa_err}"
+                            )
                         try:
                             _uu_dual = fit_dual_surrogate(
                                 state.get('boltz_cache_db', BOLTZ_CACHE_DB),
