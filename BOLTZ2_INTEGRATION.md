@@ -1,16 +1,16 @@
 # Boltz-2 Miner Integration
 
-## Current Status (as of 2026-09-03)
+## Current Status (as of 2026-09-05)
 
-**69 roadmap items implemented; 2 proposed (items 70–71).** §YYYYYYYYYYYY (multi-start §MM SALSA from diversity-maximised cache seeds) added 2026-09-03. §XXXXXXXXXXXX (cache-adaptive UCB beta) added 2026-09-01. §WWWWWWWWWWWW (cache-adaptive surrogate blend alpha) added 2026-08-30. §VVVVVVVVVVVV (reliability-adjusted §MM seed selection) added 2026-08-29. §UUUUUUUUUUUU (surrogate pre-filter for SALSA perturbations) added 2026-08-28.
+**71 roadmap items implemented; 0 proposed.** §ZZZZZZZZZZZZ (Boltz-2 binding-pose cache for structure-guided §MM growth vectors) added 2026-09-05. §AAAAAAAAAAAA (GA population diversity injection from cross-epoch SQLite elite) added 2026-09-04. §YYYYYYYYYYYY (multi-start §MM SALSA from diversity-maximised cache seeds) added 2026-09-03. §XXXXXXXXXXXX (cache-adaptive UCB beta) added 2026-09-01. §WWWWWWWWWWWW (cache-adaptive surrogate blend alpha) added 2026-08-30. §VVVVVVVVVVVV (reliability-adjusted §MM seed selection) added 2026-08-29. §UUUUUUUUUUUU (surrogate pre-filter for SALSA perturbations) added 2026-08-28.
 
-Proposed items §ZZZZZZZZZZZZ (Boltz-2 binding-pose cache for structure-guided §MM growth vectors) and §AAAAAAAAAAAA (GA population diversity injection from cross-epoch SQLite elite) identified 2026-09-03.
+All 71 roadmap items are now implemented.
 
 ---
 
 ## Proposed Optimisations (next priorities)
 
-### §ZZZZZZZZZZZZ — Boltz-2 Binding-Pose Cache for Structure-Guided §MM Growth Vectors — PROPOSED
+### §ZZZZZZZZZZZZ — Boltz-2 Binding-Pose Cache for Structure-Guided §MM Growth Vectors — added 2026-09-05
 
 **Problem:** All Boltz-2 output structures are deleted after inference (`remove_files: true`
 in `boltz_config.yaml`).  The predicted binding pose — which protein residues contact the

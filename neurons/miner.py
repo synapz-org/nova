@@ -3009,6 +3009,21 @@ async def run_boltz_prescoring(state: Dict[str, Any], max_candidates: int = 5) -
 
                 # SALSA from current best Boltz seed
                 _mm_op_tags: dict = {}  # §OOOO: {product_name: operator} populated by run_salsa_search
+                # §ZZZZZZZZZZZZ: look up per-atom exposure for the current §MM seed.
+                # wrapper._pose_exposure is keyed by canonical SMILES and populated
+                # in postprocess_data() before PDB file removal.  None when no full-quality
+                # Boltz run has been scored for this seed yet (epoch 1 / first round).
+                _zzz_exposure = None
+                try:
+                    _zzz_canon = get_canonical_smiles(_mm_seed_smiles)
+                    _zzz_exposure = wrapper._pose_exposure.get(_zzz_canon)
+                    if _zzz_exposure:
+                        bt.logging.debug(
+                            f"[§ZZZZZZZZZZZZ] Atom exposure loaded for §MM seed "
+                            f"({len(_zzz_exposure)} atoms)"
+                        )
+                except Exception:
+                    _zzz_exposure = None
                 try:
                     _mm_salsa_hits = await asyncio.to_thread(
                         run_salsa_search,
@@ -3023,6 +3038,7 @@ async def run_boltz_prescoring(state: Dict[str, Any], max_candidates: int = 5) -
                         _salsa_operator_weights(_mm_seed_smiles, state.get('salsa_operator_wins')),  # §ZZZZZ + §OOOO
                         _mm_op_tags,  # §OOOO: out_operator_tags
                         _dual,  # §UUUUUUUUUUUU: surrogate pre-filter for perturbation probes
+                        _zzz_exposure,  # §ZZZZZZZZZZZZ: per-atom binding-pose exposure
                     )
                     # §NNNN: scaffold-diverse selection — each §MM fast-screen slot tests
                     # a different chemical family, maximising coverage per GPU budget.

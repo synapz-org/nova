@@ -131,11 +131,34 @@ def get_cached_pool_fps(
 # ---------------------------------------------------------------------------
 # Perturbation operators
 # ---------------------------------------------------------------------------
+def _atom_perturbation_weight(atom_idx: int, exposure: Optional[dict], op: str) -> float:
+    """§ZZZZZZZZZZZZ: Return a relative sampling weight for atom *atom_idx*.
+
+    Atoms with large min-distance-to-protein (solvent-exposed) receive higher weight
+    for growth operators (fg_add, ring_walk) and moderate weight for bioisostere.
+    Buried atoms (small distance) are down-weighted to avoid perturbing sterically
+    constrained positions that Boltz-2 is unlikely to tolerate.
+
+    Default distance (when atom_idx is missing from *exposure*) is 5.0 Å, treated
+    as moderately exposed.  Returns 1.0 when *exposure* is None so callers degrade
+    transparently to pre-§ZZZZZZZZZZZZ uniform weighting.
+    """
+    if exposure is None:
+        return 1.0
+    d = exposure.get(atom_idx, 5.0)
+    if op in ("fg_add", "ring_walk"):
+        return max(0.1, min(2.0, d / 3.0))
+    elif op == "bioisostere":
+        return max(0.5, min(1.5, d / 4.0))
+    return 1.0
+
+
 def generate_perturbations(
     smiles: str,
     n_max: int = 100,
     operator_weights: Optional[dict] = None,
     return_tags: bool = False,
+    atom_exposure: Optional[dict] = None,
 ) -> List:
     """
     Generate up to n_max unique canonical SMILES variants of *smiles* via
@@ -174,6 +197,12 @@ def generate_perturbations(
         instead of List[str].  operator_tag is one of 'bioisostere', 'fg_add',
         'terminal_remove', 'ring_walk'.  Used by §OOOO bandit operator tracking.
 
+    atom_exposure: §ZZZZZZZZZZZZ — optional {rdkit_atom_idx: min_protein_dist_Å} dict
+        from BoltzWrapper._pose_exposure.  When provided, atoms are sampled in
+        decreasing weight order for fg_add and ring_walk (exposed atoms first),
+        and in moderate decreasing weight order for bioisostere.  None → uniform
+        order identical to pre-§ZZZZZZZZZZZZ behaviour (zero regression).
+
     Returns a list of valid canonical SMILES strings (excluding the input),
     or (when return_tags=True) a list of (operator_tag, smiles) tuples.
     """
@@ -203,7 +232,13 @@ def generate_perturbations(
     rng_res: List[str] = []
 
     # --- 1. Bioisosteric substitution ---
-    for atom in mol.GetAtoms():
+    # §ZZZZZZZZZZZZ: when atom_exposure is provided, prefer exposed atoms (higher weight).
+    _bio_atoms = sorted(
+        mol.GetAtoms(),
+        key=lambda a: _atom_perturbation_weight(a.GetIdx(), atom_exposure, 'bioisostere'),
+        reverse=True,
+    ) if atom_exposure else list(mol.GetAtoms())
+    for atom in _bio_atoms:
         if len(bio_res) >= _n_bio:
             break
         an = atom.GetAtomicNum()
@@ -224,7 +259,13 @@ def generate_perturbations(
     # --- 2. Functional group addition ---
     # Append one heavy atom at each position with available implicit hydrogens.
     # SanitizeMol discards valence violations silently via the try/except.
-    for atom in mol.GetAtoms():
+    # §ZZZZZZZZZZZZ: prefer solvent-exposed atoms for fg_add (high weight = exposed).
+    _fga_atoms = sorted(
+        mol.GetAtoms(),
+        key=lambda a: _atom_perturbation_weight(a.GetIdx(), atom_exposure, 'fg_add'),
+        reverse=True,
+    ) if atom_exposure else list(mol.GetAtoms())
+    for atom in _fga_atoms:
         if len(fga_res) >= _n_fga:
             break
         if atom.GetTotalNumHs() == 0:
@@ -307,13 +348,20 @@ def generate_perturbations(
         except Exception:
             pass
 
-    # 4b — contraction: remove degree-2 ring carbons from 5–7 membered rings
+    # 4b — contraction: remove degree-2 ring carbons from 5–7 membered rings.
+    # §ZZZZZZZZZZZZ: within each ring, try exposed atoms first.
     for _ring in _ring_info.AtomRings():
         if len(rng_res) >= _n_rng:
             break
         if not (5 <= len(_ring) <= 7):
             continue
-        for _rpos, _ai in enumerate(_ring):
+        _ring_sorted = sorted(
+            range(len(_ring)),
+            key=lambda p: _atom_perturbation_weight(_ring[p], atom_exposure, 'ring_walk'),
+            reverse=True,
+        ) if atom_exposure else range(len(_ring))
+        for _rpos in _ring_sorted:
+            _ai = _ring[_rpos]
             if len(rng_res) >= _n_rng:
                 break
             _atom = mol.GetAtomWithIdx(_ai)
@@ -491,6 +539,7 @@ def run_salsa_search(
     operator_weights: Optional[dict] = None,
     out_operator_tags: Optional[dict] = None,
     dual_surrogate=None,
+    atom_exposure: Optional[dict] = None,
 ) -> pd.DataFrame:
     """
     SALSA: Stochastic Approximate Ligand Scoring and Optimisation.
@@ -535,6 +584,11 @@ def run_salsa_search(
             pool lookup, concentrating Tanimoto queries on the most Boltz-promising
             chemical directions.  None or Ridge → no-op.
 
+        atom_exposure: §ZZZZZZZZZZZZ — optional {rdkit_atom_idx: min_protein_dist_Å}
+            from BoltzWrapper._pose_exposure[seed_smiles].  When provided, generate_perturbations
+            sorts atoms by exposure weight so fg_add and ring_walk probe solvent-exposed
+            positions first.  None → identical to pre-§ZZZZZZZZZZZZ behaviour.
+
     Returns:
         DataFrame of up to *top_k* rows from *savi_pool_df*, sorted by
         *score_col* descending.  May be empty if no perturbations could be
@@ -576,6 +630,7 @@ def run_salsa_search(
             _tagged = generate_perturbations(
                 best_smiles, n_max=n_perturb,
                 operator_weights=operator_weights, return_tags=True,
+                atom_exposure=atom_exposure,  # §ZZZZZZZZZZZZ
             )
             _probe_to_op: dict = {smi: op for op, smi in _tagged}
             perturbations = [smi for _, smi in _tagged]
@@ -583,6 +638,7 @@ def run_salsa_search(
             _probe_to_op = {}
             perturbations = generate_perturbations(
                 best_smiles, n_max=n_perturb, operator_weights=operator_weights,
+                atom_exposure=atom_exposure,  # §ZZZZZZZZZZZZ
             )
         if not perturbations:
             logger.debug(f"SALSA round {round_idx + 1}: no perturbations generated from {best_smiles!r}")

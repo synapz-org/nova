@@ -151,11 +151,65 @@ class BoltzWrapper:
         self.per_molecule_components = {}
         # Populated after each successful inference; used for adaptive trigger timing.
         self.last_inference_duration: float = 0.0
+        # §ZZZZZZZZZZZZ: per-atom min-distance-to-protein extracted from output PDB.
+        # Keyed by canonical SMILES.  Populated in postprocess_data() before file removal.
+        # Exposed to run_salsa_search() via atom_exposure to bias fg_add/ring_walk toward
+        # solvent-exposed atoms and away from buried (sterically constrained) positions.
+        self._pose_exposure: dict = {}
         
         self.base_seed = 68
         random.seed(self.base_seed)
         np.random.seed(self.base_seed)
         torch.manual_seed(self.base_seed)
+
+    @staticmethod
+    def _extract_ligand_exposure(pdb_path: str, smiles: str) -> dict:
+        """§ZZZZZZZZZZZZ: Return {rdkit_atom_idx: min_protein_distance_angstrom}.
+
+        Reads the output PDB and computes for each ligand heavy atom (HETATM)
+        the minimum Euclidean distance to any protein atom (ATOM).  Atoms with
+        small distances are buried in the binding pocket; large distances are
+        solvent-exposed and suitable for fg_add / ring_walk growth operators.
+        Returns {} on any parse failure so callers degrade gracefully.
+        """
+        try:
+            from rdkit import Chem
+            import numpy as np
+            mol = Chem.MolFromSmiles(smiles)
+            if mol is None:
+                return {}
+            ligand_coords = []
+            protein_coords = []
+            with open(pdb_path) as _f:
+                for line in _f:
+                    if line.startswith("HETATM"):
+                        try:
+                            ligand_coords.append([
+                                float(line[30:38]),
+                                float(line[38:46]),
+                                float(line[46:54]),
+                            ])
+                        except ValueError:
+                            pass
+                    elif line.startswith("ATOM"):
+                        try:
+                            protein_coords.append([
+                                float(line[30:38]),
+                                float(line[38:46]),
+                                float(line[46:54]),
+                            ])
+                        except ValueError:
+                            pass
+            if not ligand_coords or not protein_coords:
+                return {}
+            L = np.array(ligand_coords, dtype=np.float32)
+            P = np.array(protein_coords, dtype=np.float32)
+            # Compute pairwise distances efficiently; result shape (n_lig, n_prot)
+            dists = np.linalg.norm(L[:, None, :] - P[None, :, :], axis=2).min(axis=1)
+            n_heavy = mol.GetNumHeavyAtoms()
+            return {i: float(dists[i]) for i in range(min(len(dists), n_heavy))}
+        except Exception:
+            return {}
 
     def preprocess_data_for_boltz(self, valid_molecules_by_uid: dict, score_dict: dict, final_block_hash: str) -> None:
         # Get protein sequence
@@ -377,12 +431,40 @@ properties:
                             scores[mol_idx]['_s_arr'] = _emb_npz['s']
                         except Exception:
                             pass
+                    elif filepath.endswith('.pdb') and '_model_0' in filepath:
+                        # §ZZZZZZZZZZZZ: extract per-atom ligand exposure from rank-0 structure
+                        # before files are removed.  Keyed by canonical SMILES so §MM SALSA
+                        # can retrieve the exposure dict for any seed molecule it scored.
+                        scores[mol_idx]['_pdb_path'] = os.path.join(results_path, filepath)
             except (FileNotFoundError, OSError) as e:
                 bt.logging.warning(
                     f"Boltz results missing for mol_idx={mol_idx} "
                     f"(smiles={smiles[:60]}): {e} — score set to -inf"
                 )
         #bt.logging.debug(f"Collected scores: {scores}")
+
+        # §ZZZZZZZZZZZZ: extract per-atom ligand exposure from PDB outputs before removal.
+        # Only runs when remove_files=True (production path); skipped in debug mode.
+        # Results stored in self._pose_exposure keyed by canonical SMILES.
+        if self.config.get('remove_files', True):
+            try:
+                from rdkit import Chem as _Chem
+                for smiles, id_list in self.unique_molecules.items():
+                    mol_idx = id_list[0][1]
+                    _pdb = scores.get(mol_idx, {}).get('_pdb_path')
+                    if _pdb and os.path.exists(_pdb):
+                        _canon = _Chem.MolToSmiles(_Chem.MolFromSmiles(smiles)) if _Chem.MolFromSmiles(smiles) else smiles
+                        if _canon not in self._pose_exposure:
+                            _exp = self._extract_ligand_exposure(_pdb, smiles)
+                            if _exp:
+                                self._pose_exposure[_canon] = _exp
+                                bt.logging.debug(
+                                    f"[§ZZZZZZZZZZZZ] Exposure cached for {_canon[:40]}… "
+                                    f"({len(_exp)} atoms, range "
+                                    f"{min(_exp.values()):.1f}–{max(_exp.values()):.1f} Å)"
+                                )
+            except Exception as _zzz_err:
+                bt.logging.debug(f"[§ZZZZZZZZZZZZ] Exposure extraction skipped: {_zzz_err}")
 
         if self.config['remove_files']:
             bt.logging.info("Removing files")
