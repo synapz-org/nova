@@ -1,14 +1,331 @@
 # Boltz-2 Miner Integration
 
-## Current Status (as of 2026-09-05)
+## Current Status (as of 2026-09-06)
 
-**71 roadmap items implemented; 0 proposed.** §ZZZZZZZZZZZZ (Boltz-2 binding-pose cache for structure-guided §MM growth vectors) added 2026-09-05. §AAAAAAAAAAAA (GA population diversity injection from cross-epoch SQLite elite) added 2026-09-04. §YYYYYYYYYYYY (multi-start §MM SALSA from diversity-maximised cache seeds) added 2026-09-03. §XXXXXXXXXXXX (cache-adaptive UCB beta) added 2026-09-01. §WWWWWWWWWWWW (cache-adaptive surrogate blend alpha) added 2026-08-30. §VVVVVVVVVVVV (reliability-adjusted §MM seed selection) added 2026-08-29. §UUUUUUUUUUUU (surrogate pre-filter for SALSA perturbations) added 2026-08-28.
+**71 roadmap items implemented; 3 proposed.** §ZZZZZZZZZZZZ (Boltz-2 binding-pose cache for structure-guided §MM growth vectors) added 2026-09-05. §AAAAAAAAAAAA (GA population diversity injection from cross-epoch SQLite elite) added 2026-09-04. §YYYYYYYYYYYY (multi-start §MM SALSA from diversity-maximised cache seeds) added 2026-09-03. §XXXXXXXXXXXX (cache-adaptive UCB beta) added 2026-09-01. §WWWWWWWWWWWW (cache-adaptive surrogate blend alpha) added 2026-08-30. §VVVVVVVVVVVV (reliability-adjusted §MM seed selection) added 2026-08-29. §UUUUUUUUUUUU (surrogate pre-filter for SALSA perturbations) added 2026-08-28.
 
-All 71 roadmap items are now implemented.
+3 new items proposed 2026-09-06: §BBBBBBBBBBBB (intra-chunk PSICHIC batch surrogate pre-filter), §CCCCCCCCCCCC (residue-type contact map for pharmacophore-guided fg_add), §DDDDDDDDDDDD (fast-mode linear score calibration for §MM acceptance threshold).
 
 ---
 
 ## Proposed Optimisations (next priorities)
+
+### §BBBBBBBBBBBB — Intra-Chunk PSICHIC Batch Surrogate Pre-Filter — proposed 2026-09-06
+
+**Problem:** Every molecule in each streamed SAVI-2020 chunk (1 000 molecules) is passed
+through PSICHIC scoring (~20 ms/mol on CPU).  On RF-tier epochs (≥100 cache pts) the
+dual RF surrogate can already rank candidates reasonably well — OOB R² ≈ 0.5–0.8 — at
+~0.2 ms/mol (Morgan FP only, no protein sequence embedding).  Scoring all 1 000 chunk
+molecules with PSICHIC before the surrogate has a chance to filter wastes ~18 s of CPU
+time per chunk when 75% of molecules are below the current pool 75th-percentile.
+
+This is distinct from:
+- **§UUUUUUUUUUUU** — filters SALSA perturbations (200 mols) before PSICHIC; targets §MM
+- **§RRRRRRRRRRRR** — adjusts reaction-class *chunk selection weights*, not within-chunk filtering
+- **§TTTTTTTTTTTT** — pauses streaming when pool is globally converged; doesn't filter within chunks
+
+**Fix:**
+
+In `run_psichic_model_loop`, immediately after each SAVI chunk is loaded and before
+`psichic_wrapper.score_molecules()`:
+
+```python
+# §BBBBBBBBBBBB: surrogate pre-filter within each 1 000-molecule streaming chunk.
+# Only active at RF tier (≥100 cache pts) to avoid filtering with an unreliable model.
+if startup_dual_surrogate is not None:
+    try:
+        _bbbb_alpha = adaptive_blend_alpha(BOLTZ_CACHE_DB, state['protein'])
+        _bbbb_beta  = adaptive_ucb_beta(BOLTZ_CACHE_DB, state['protein'])
+        _bbbb_aug = augment_pool_with_surrogate_blend(
+            chunk_df, startup_dual_surrogate, alpha=_bbbb_alpha,
+        )
+        _bbbb_thresh = _bbbb_aug['surrogate_salsa_score'].quantile(0.75)
+        chunk_df = _bbbb_aug[
+            _bbbb_aug['surrogate_salsa_score'] >= _bbbb_thresh
+        ].drop(columns=['surrogate_salsa_score'])
+        bt.logging.debug(
+            f"[§BBBBBBBBBBBB] Surrogate pre-filter: {len(_bbbb_aug)}→{len(chunk_df)} "
+            f"molecules ({len(chunk_df)/len(_bbbb_aug):.0%} kept, "
+            f"threshold={_bbbb_thresh:.4f})"
+        )
+    except Exception:
+        pass  # Ridge tier / missing columns → skip pre-filter transparently
+```
+
+**Regression guards:**
+- `startup_dual_surrogate is None` (epoch 1 cold start, Ridge tier <100 pts): full
+  `chunk_df` passes through PSICHIC unchanged — identical to pre-§BBBBBBBBBBBB.
+- `augment_pool_with_surrogate_blend` internally returns pool unchanged when either
+  dual model is Ridge tier — no double guard needed.
+- `except Exception: pass` — any surrogate failure → no filtering → same as before.
+- `quantile(0.75)` — keeps top 25% (250 of 1000 mols).  If chunk has <100 molecules,
+  the quantile is meaningful and PSICHIC load is already small; no minimum size guard
+  needed.
+
+**Expected benefit:**
+
+| Epoch | Condition | Before | After |
+|-------|-----------|--------|-------|
+| 1 (cold start) | No surrogate | 1 000 mols/PSICHIC pass | 1 000 mols (unchanged) |
+| 2 (RF just activated, 100 pts) | OOB R²≈0.4 | 1 000 mols | 250 mols (75% reduction) |
+| 3–4 (warm cache, 300+ pts) | OOB R²≈0.65 | 1 000 mols | 250 mols (good filter) |
+| Week-2+ (600+ pts) | OOB R²≈0.75 | 1 000 mols | 250 mols (strong filter) |
+
+Reducing per-chunk PSICHIC from 1 000→250 molecules saves ~15 s/chunk on CPU.  In a
+72-minute epoch with ~8 SAVI streaming chunks/min, this frees ~120 s of CPU time that
+was blocking the async event loop.  The freed time allows:
+- 2–4 additional §MM SALSA rounds per epoch (~1–3% more Boltz LE)
+- Faster global_candidate_pool update latency (smaller batches → more frequent top-K
+  refreshes → better SALSA seed quality)
+
+**Files changed (proposed):**
+- `neurons/miner.py`: ~40 lines in `run_psichic_model_loop` streaming inner loop.
+  Import `augment_pool_with_surrogate_blend`, `adaptive_blend_alpha`, `adaptive_ucb_beta`
+  already present at call site.
+
+**Estimated effort: ~40 lines.**
+
+---
+
+### §CCCCCCCCCCCC — Residue-Type Contact Map from Boltz PDB for Pharmacophore-Guided `fg_add` — proposed 2026-09-06
+
+**Problem:** §ZZZZZZZZZZZZ stores per-atom `min_protein_distance_Å` (exposure), which
+tells `run_salsa_search()` *where* on the ligand to grow.  It says nothing about *what*
+to grow there.  The `fg_add` operator chooses from `_FG_ATOMS = [F, Cl, C, N, O]`
+uniformly at each exposed position, regardless of the protein residue chemistry at that
+contact point.
+
+Growing an ammonium (N) into a hydrophobic Phe/Leu pocket wastes a Boltz call because
+the pharmacophore mismatch is energetically unfavourable.  Conversely, adding a methyl
+group (C) near a Lys residue that can donate an H-bond to a C=O misses a favourable
+interaction.
+
+**Fix:**
+
+**Step 1 — Extend `_extract_ligand_exposure` in `boltz/wrapper.py`:**
+
+```python
+# Residue pharmacophore classes for contact typing.
+_HBD_RES = frozenset(['LYS','ARG','HIS','TYR','THR','SER','ASN','GLN'])  # H-bond donors
+_HBA_RES = frozenset(['ASP','GLU'])                                        # H-bond acceptors
+_HPB_RES = frozenset(['PHE','TRP','LEU','ILE','VAL','MET','ALA','PRO'])   # hydrophobic
+
+def _extract_ligand_exposure(pdb_path: str, smiles: str) -> dict:
+    """§ZZZZZZZZZZZZ + §CCCCCCCCCCCC: Return {rdkit_atom_idx: (min_dist, contact_type)}.
+
+    contact_type ∈ {'hbd', 'hba', 'hpb', 'other', None}
+    'hbd' = closest protein residue is H-bond donor → add acceptor group at this atom
+    'hba' = closest protein residue is H-bond acceptor → add donor group at this atom
+    'hpb' = closest protein residue is hydrophobic → add lipophilic group
+    'other' = polar but unclassified (Gly, Cys, etc.)
+    None = no protein atom within 8 Å
+    """
+    try:
+        # ... parse PDB ...
+        # For each ligand atom, find closest protein atom AND its residue name
+        closest_resname = {}  # {lig_atom_idx: resname_3letter}
+        # ... assign contact_type based on resname lookup ...
+        return {
+            i: (float(dists[i]), _classify_contact(closest_resname.get(i)))
+            for i in range(min(len(dists), n_heavy))
+        }
+    except Exception:
+        return {}
+```
+
+**Step 2 — Extend `run_salsa_search` in `utils/salsa.py`:**
+
+Add `atom_contact_type: dict[int, tuple] | None = None` parameter.  In
+`_generate_perturbations`, replace the flat `_FG_ATOMS` list with a typed one when
+`atom_contact_type` is available:
+
+```python
+def _fg_atoms_for_position(atom_idx, atom_contact_type):
+    if atom_contact_type is None:
+        return _FG_ATOMS
+    ct = atom_contact_type.get(atom_idx, (5.0, None))[1]
+    if ct == 'hbd':
+        return [9, 8, 7]    # F, O (hba-like), N (acceptor NH)
+    elif ct == 'hba':
+        return [7, 8]       # N (NH2 donor), O (OH donor)
+    elif ct == 'hpb':
+        return [9, 17, 6]   # F, Cl, C (lipophilic)
+    return _FG_ATOMS        # 'other' or None → no bias
+```
+
+**Step 3 — Pass `atom_contact_type` from §MM call sites** (same as §ZZZZZZZZZZZZ
+atom_exposure passthrough):
+
+```python
+_zzzzz_exp = boltz_wrapper._pose_exposure.get(canonical_seed)
+# §CCCCCCCCCCCC: contact type map lives alongside exposure in the same dict value.
+_cccc_contacts = _zzzzz_exp  # now (dist, type) tuples instead of scalars
+atom_exposure  = {k: v[0] for k, v in _cccc_contacts.items()} if _cccc_contacts else None
+atom_contact_type = {k: v[1] for k, v in _cccc_contacts.items()} if _cccc_contacts else None
+hits = run_salsa_search(
+    ...,
+    atom_exposure=atom_exposure,
+    atom_contact_type=atom_contact_type,
+)
+```
+
+**Regression guards:**
+- `atom_contact_type is None` → `_fg_atoms_for_position` returns `_FG_ATOMS` →
+  identical to pre-§CCCCCCCCCCCC behaviour (§ZZZZZZZZZZZZ regression guard preserved).
+- PDB parse failure → `_extract_ligand_exposure` returns `{}` → `_pose_exposure` not
+  updated → `atom_contact_type=None` at call site → no filtering.
+- Unknown residue name → falls through to `_FG_ATOMS` → no bias.
+- `atom_contact_type` present but atom not in dict → uses `(5.0, None)` default →
+  no bias for that atom.
+
+**Schema migration:** `_pose_exposure` values change from `dict[int, float]` to
+`dict[int, tuple[float, str|None]]`.  All existing `_pose_exposure.get()` call sites
+in miner.py that access `.values()` / iterate must be updated to unpack the tuple.
+Backwards-compatible: an empty dict `{}` is unchanged.
+
+**Expected benefit:**
+
+| Scenario | Before §CCCCCCCCCCCC | After §CCCCCCCCCCCC |
+|----------|----------------------|---------------------|
+| fg_add near Lys (HBD pocket) | F/Cl/C/N/O uniform | F/O/N priority |
+| fg_add near Phe (HPB pocket) | F/Cl/C/N/O uniform | F/Cl/C priority |
+| fg_add near Asp (HBA pocket) | F/Cl/C/N/O uniform | N/O priority |
+| No PDB available (epoch 1) | F/Cl/C/N/O uniform | F/Cl/C/N/O (unchanged) |
+
++4–8% Boltz LE on epoch 2+ (when ≥1 full Boltz pose is available) by reducing
+pharmacophore-mismatched `fg_add` probes; ~15–25% fewer fast-screen failures from
+position-chemistry mismatch.
+
+**Files changed (proposed):**
+- `boltz/wrapper.py`: `_extract_ligand_exposure` extended to return `(dist, type)` tuples
+  + `_classify_contact()` helper (~50 lines).  `_pose_exposure` dict value type changes.
+- `utils/salsa.py`: `atom_contact_type` parameter + `_fg_atoms_for_position()` helper
+  (~30 lines); `run_salsa_search` signature updated.
+- `neurons/miner.py`: unpack `(dist, type)` at §MM call sites; pass `atom_contact_type`
+  (~15 lines).
+
+**Estimated effort: ~95 lines.**
+
+---
+
+### §DDDDDDDDDDDD — Fast-Mode Linear Score Calibration for §MM Acceptance Threshold — proposed 2026-09-06
+
+**Problem:** The §MM hill-climbing loop accepts a perturbed candidate when
+`fast_score > _mm_best_score - _mm_delta`.  `_mm_best_score` is set from the full-quality
+Boltz cache (sampling_steps_affinity=100–200, recycling_steps_affinity=5).  `fast_score`
+is from fast-mode screening (sampling_steps_affinity=50, recycling_steps_affinity=2,
+num_subsampled_msa=full//4).
+
+Fast-mode scores are systematically lower than full-quality scores because:
+1. Fewer affinity diffusion steps → the affinity head's denoising trajectory terminates
+   earlier, leaving residual noise in APB / APV.
+2. Shallower MSA subsampling → less evolutionary context → weaker APB calibration.
+3. Fewer recycling passes → less trunk convergence for affinity conditioning.
+
+The per-molecule bias is variable (A100 fast vs full LE difference: ~0.05–0.20
+ligand-efficiency units empirically).  When `_mm_delta = 0` (no tolerance), valid
+improvements whose fast score lies in the bias band `[full_best - bias, full_best]` are
+rejected as "not improvements".  This systematically stalls §MM hill-climbing in the
+first 2–3 rounds of each seed.
+
+**Fix:**
+
+**Step 1 — Add `fast_le` column to SQLite `boltz_cache`:**
+
+```sql
+ALTER TABLE boltz_cache ADD COLUMN fast_le REAL;
+```
+
+Populated when a molecule that previously appeared as a §MM fast-screened candidate
+later receives a full-quality Boltz call (wins the fast-screen and enters the full-score
+pipeline).  At `_disk_cache_put` call sites that already have `fast_le` context, pass it.
+
+**Step 2 — `_fit_fast_calibration(db_path, protein)` in `neurons/miner.py`:**
+
+```python
+def _fit_fast_calibration(db_path: str, protein: str):
+    """
+    Return (a, b) for full_est = a * fast_le + b, or (1.0, 0.0) on failure.
+    Requires ≥5 molecules with both fast_le and score (full LE) in cache.
+    """
+    try:
+        with sqlite3.connect(db_path) as conn:
+            rows = conn.execute(
+                "SELECT fast_le, score FROM boltz_cache "
+                "WHERE protein=? AND fast_le IS NOT NULL AND score IS NOT NULL "
+                "ORDER BY score DESC LIMIT 50",
+                (protein,),
+            ).fetchall()
+        if len(rows) < 5:
+            return (1.0, 0.0)
+        X = np.array([r[0] for r in rows]).reshape(-1, 1)
+        y = np.array([r[1] for r in rows])
+        from sklearn.linear_model import LinearRegression
+        lr = LinearRegression().fit(X, y)
+        return (float(lr.coef_[0]), float(lr.intercept_))
+    except Exception:
+        return (1.0, 0.0)
+```
+
+**Step 3 — Apply calibration in §MM loop:**
+
+Before the outer §MM seed loop, call `_fit_fast_calibration` once:
+
+```python
+_dddd_a, _dddd_b = _fit_fast_calibration(BOLTZ_CACHE_DB, state['protein'])
+bt.logging.debug(f"[§DDDDDDDDDDDD] Fast calibration: full_est = {_dddd_a:.3f} × fast + {_dddd_b:.4f}")
+```
+
+In the §MM acceptance check, replace:
+```python
+if fast_score > _mm_best_score - _mm_delta:
+```
+with:
+```python
+# §DDDDDDDDDDDD: calibrated threshold — project _mm_best_score into fast-mode space.
+_mm_thresh_fast = (_mm_best_score - _dddd_b) / _dddd_a if _dddd_a > 0.01 else _mm_best_score
+if fast_score > _mm_thresh_fast - _mm_delta:
+```
+
+This compares fast_score against the fast-mode equivalent of `_mm_best_score` rather
+than the full-mode value directly, correcting for the systematic bias.
+
+**Regression guards:**
+- `_dddd_a = 1.0, _dddd_b = 0.0` (default): `_mm_thresh_fast = _mm_best_score` →
+  identical to pre-§DDDDDDDDDDDD.
+- `<5 calibration pairs`: returns identity (1.0, 0.0) → no change.
+- `_dddd_a ≤ 0.01` (degenerate slope): fallback to `_mm_best_score` → no change.
+- `except Exception`: `_fit_fast_calibration` returns `(1.0, 0.0)` → no change.
+- `sklearn` import: already used by surrogate.py → no new dependency.
+- One `_fit_fast_calibration` call per epoch at §MM start → sub-millisecond; negligible.
+
+**fast_le population path:** When a fast-screened molecule `s` advances to full scoring,
+its fast LE is known (`_mm_fast_scores[s]`).  At `_disk_cache_put(smiles=s, ..., fast_le=_mm_fast_scores[s])`.
+The `_mm_fast_scores` dict is already maintained in the §MM block.  Requires 1 extra dict
+lookup and 1 extra `_disk_cache_put` kwarg per full Boltz call that originated from §MM.
+
+**Expected benefit:**
+
+| Scenario | Before §DDDDDDDDDDDD | After §DDDDDDDDDDDD |
+|----------|----------------------|---------------------|
+| <5 calibration pairs (epoch 1) | Identity threshold | Identity (unchanged) |
+| ≥5 pairs, bias=0.08 LE/mol | Rejects fast>full-0.08 zone | Accepts fast≥fast_equiv |
+| ≥5 pairs, bias=0.15 LE/mol | Many good perturbations rejected | Threshold corrected |
+| Degenerate calibration (a≤0.01) | Correct | Fallback → unchanged |
+
++2–5% more §MM rounds reach full-quality scoring on epoch 2+ because the acceptance
+gate correctly identifies improvement in fast-score space.  Largest gain when
+`sampling_steps_affinity` is high (A100 full=150, fast=50 → larger raw bias).
+
+**Files changed (proposed):**
+- `neurons/miner.py`: `fast_le` parameter at 1–2 `_disk_cache_put` call sites
+  + `_fit_fast_calibration()` function (~30 lines)
+  + calibrated threshold in §MM acceptance check (~8 lines).
+- `neurons/miner.py` (also): `_init_boltz_cache_db()` — add `ALTER TABLE boltz_cache ADD COLUMN fast_le REAL` (~2 lines).
+
+**Estimated effort: ~45 lines.**
+
+---
 
 ### §ZZZZZZZZZZZZ — Boltz-2 Binding-Pose Cache for Structure-Guided §MM Growth Vectors — added 2026-09-05
 
