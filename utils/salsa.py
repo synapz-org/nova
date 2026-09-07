@@ -131,6 +131,28 @@ def get_cached_pool_fps(
 # ---------------------------------------------------------------------------
 # Perturbation operators
 # ---------------------------------------------------------------------------
+def _fg_atoms_for_position(atom_idx: int, atom_contact_type: Optional[dict]) -> list:
+    """§CCCCCCCCCCCC: Return the fg_add atom-number list biased by pharmacophore contact type.
+
+    When atom_contact_type is None or the atom is not in the dict, returns _FG_ATOMS
+    (all atom types, uniform — identical to pre-§CCCCCCCCCCCC behaviour).
+    Contact types come from BoltzWrapper._extract_ligand_exposure() PDB parsing.
+    """
+    if atom_contact_type is None:
+        return _FG_ATOMS
+    entry = atom_contact_type.get(atom_idx)
+    if entry is None:
+        return _FG_ATOMS
+    ct = entry[1] if isinstance(entry, tuple) and len(entry) >= 2 else entry
+    if ct == 'hbd':
+        return [9, 8, 7]    # F, O (acceptor), N (acceptor NH) — match H-bond donor pocket
+    elif ct == 'hba':
+        return [7, 8]       # N (NH2 donor), O (OH donor) — match H-bond acceptor pocket
+    elif ct == 'hpb':
+        return [9, 17, 6]   # F, Cl, C (lipophilic) — match hydrophobic pocket
+    return _FG_ATOMS        # 'other' → no bias
+
+
 def _atom_perturbation_weight(atom_idx: int, exposure: Optional[dict], op: str) -> float:
     """§ZZZZZZZZZZZZ: Return a relative sampling weight for atom *atom_idx*.
 
@@ -159,6 +181,7 @@ def generate_perturbations(
     operator_weights: Optional[dict] = None,
     return_tags: bool = False,
     atom_exposure: Optional[dict] = None,
+    atom_contact_type: Optional[dict] = None,
 ) -> List:
     """
     Generate up to n_max unique canonical SMILES variants of *smiles* via
@@ -202,6 +225,12 @@ def generate_perturbations(
         decreasing weight order for fg_add and ring_walk (exposed atoms first),
         and in moderate decreasing weight order for bioisostere.  None → uniform
         order identical to pre-§ZZZZZZZZZZZZ behaviour (zero regression).
+
+    atom_contact_type: §CCCCCCCCCCCC — optional {rdkit_atom_idx: (dist_Å, contact_type)}
+        dict from BoltzWrapper._pose_exposure (same source as atom_exposure but carrying
+        contact type alongside distance).  contact_type ∈ {'hbd', 'hba', 'hpb', 'other'}.
+        When provided, the fg_add atom-type list is pharmacophore-biased per atom position.
+        None → _FG_ATOMS uniform (zero regression).
 
     Returns a list of valid canonical SMILES strings (excluding the input),
     or (when return_tags=True) a list of (operator_tag, smiles) tuples.
@@ -272,7 +301,9 @@ def generate_perturbations(
             continue
         if atom.GetAtomicNum() not in _FG_ATTACHMENT_ATOMS:
             continue
-        for fg_an in _FG_ATOMS:
+        # §CCCCCCCCCCCC: pharmacophore-biased FG selection; falls back to _FG_ATOMS when
+        # atom_contact_type is None or atom not in dict — zero regression.
+        for fg_an in _fg_atoms_for_position(atom.GetIdx(), atom_contact_type):
             if len(fga_res) >= _n_fga:
                 break
             rw = Chem.RWMol(mol)
@@ -540,6 +571,7 @@ def run_salsa_search(
     out_operator_tags: Optional[dict] = None,
     dual_surrogate=None,
     atom_exposure: Optional[dict] = None,
+    atom_contact_type: Optional[dict] = None,
 ) -> pd.DataFrame:
     """
     SALSA: Stochastic Approximate Ligand Scoring and Optimisation.
@@ -589,6 +621,11 @@ def run_salsa_search(
             sorts atoms by exposure weight so fg_add and ring_walk probe solvent-exposed
             positions first.  None → identical to pre-§ZZZZZZZZZZZZ behaviour.
 
+        atom_contact_type: §CCCCCCCCCCCC — optional {rdkit_atom_idx: (dist_Å, contact_type)}
+            from BoltzWrapper._pose_exposure.  Passed to generate_perturbations to bias
+            the fg_add atom-type list per position based on pocket pharmacophore chemistry.
+            None → _FG_ATOMS uniform (zero regression).
+
     Returns:
         DataFrame of up to *top_k* rows from *savi_pool_df*, sorted by
         *score_col* descending.  May be empty if no perturbations could be
@@ -630,7 +667,8 @@ def run_salsa_search(
             _tagged = generate_perturbations(
                 best_smiles, n_max=n_perturb,
                 operator_weights=operator_weights, return_tags=True,
-                atom_exposure=atom_exposure,  # §ZZZZZZZZZZZZ
+                atom_exposure=atom_exposure,       # §ZZZZZZZZZZZZ
+                atom_contact_type=atom_contact_type,  # §CCCCCCCCCCCC
             )
             _probe_to_op: dict = {smi: op for op, smi in _tagged}
             perturbations = [smi for _, smi in _tagged]
@@ -638,7 +676,8 @@ def run_salsa_search(
             _probe_to_op = {}
             perturbations = generate_perturbations(
                 best_smiles, n_max=n_perturb, operator_weights=operator_weights,
-                atom_exposure=atom_exposure,  # §ZZZZZZZZZZZZ
+                atom_exposure=atom_exposure,       # §ZZZZZZZZZZZZ
+                atom_contact_type=atom_contact_type,  # §CCCCCCCCCCCC
             )
         if not perturbations:
             logger.debug(f"SALSA round {round_idx + 1}: no perturbations generated from {best_smiles!r}")

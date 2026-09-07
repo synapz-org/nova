@@ -162,14 +162,31 @@ class BoltzWrapper:
         np.random.seed(self.base_seed)
         torch.manual_seed(self.base_seed)
 
+    # §CCCCCCCCCCCC: residue pharmacophore classes for contact typing.
+    _HBD_RES = frozenset(['LYS', 'ARG', 'HIS', 'TYR', 'THR', 'SER', 'ASN', 'GLN'])
+    _HBA_RES = frozenset(['ASP', 'GLU'])
+    _HPB_RES = frozenset(['PHE', 'TRP', 'LEU', 'ILE', 'VAL', 'MET', 'ALA', 'PRO'])
+
+    @staticmethod
+    def _classify_contact(resname: str) -> str:
+        """§CCCCCCCCCCCC: Map a 3-letter residue name to a pharmacophore contact class."""
+        if resname in BoltzWrapper._HBD_RES:
+            return 'hbd'
+        if resname in BoltzWrapper._HBA_RES:
+            return 'hba'
+        if resname in BoltzWrapper._HPB_RES:
+            return 'hpb'
+        return 'other'
+
     @staticmethod
     def _extract_ligand_exposure(pdb_path: str, smiles: str) -> dict:
-        """§ZZZZZZZZZZZZ: Return {rdkit_atom_idx: min_protein_distance_angstrom}.
+        """§ZZZZZZZZZZZZ + §CCCCCCCCCCCC: Return {rdkit_atom_idx: (min_dist_Å, contact_type)}.
 
-        Reads the output PDB and computes for each ligand heavy atom (HETATM)
-        the minimum Euclidean distance to any protein atom (ATOM).  Atoms with
-        small distances are buried in the binding pocket; large distances are
-        solvent-exposed and suitable for fg_add / ring_walk growth operators.
+        contact_type ∈ {'hbd', 'hba', 'hpb', 'other'} based on the closest protein residue.
+        'hbd' → H-bond donor residue (Lys/Arg/His/Tyr/Thr/Ser/Asn/Gln) → add acceptor group
+        'hba' → H-bond acceptor residue (Asp/Glu) → add donor group
+        'hpb' → hydrophobic residue (Phe/Trp/Leu/Ile/Val/Met/Ala/Pro) → add lipophilic group
+        'other' → Gly/Cys/etc. → no pharmacophore bias
         Returns {} on any parse failure so callers degrade gracefully.
         """
         try:
@@ -180,6 +197,7 @@ class BoltzWrapper:
                 return {}
             ligand_coords = []
             protein_coords = []
+            protein_resnames = []  # parallel to protein_coords
             with open(pdb_path) as _f:
                 for line in _f:
                     if line.startswith("HETATM"):
@@ -198,16 +216,24 @@ class BoltzWrapper:
                                 float(line[38:46]),
                                 float(line[46:54]),
                             ])
+                            protein_resnames.append(line[17:20].strip())
                         except ValueError:
                             pass
             if not ligand_coords or not protein_coords:
                 return {}
             L = np.array(ligand_coords, dtype=np.float32)
             P = np.array(protein_coords, dtype=np.float32)
-            # Compute pairwise distances efficiently; result shape (n_lig, n_prot)
-            dists = np.linalg.norm(L[:, None, :] - P[None, :, :], axis=2).min(axis=1)
+            # Shape (n_lig, n_prot); argmin gives index of closest protein atom per ligand atom
+            dist_matrix = np.linalg.norm(L[:, None, :] - P[None, :, :], axis=2)
+            closest_prot_idx = dist_matrix.argmin(axis=1)
+            dists = dist_matrix.min(axis=1)
             n_heavy = mol.GetNumHeavyAtoms()
-            return {i: float(dists[i]) for i in range(min(len(dists), n_heavy))}
+            result = {}
+            for i in range(min(len(dists), n_heavy)):
+                resname = protein_resnames[closest_prot_idx[i]] if closest_prot_idx[i] < len(protein_resnames) else ''
+                contact_type = BoltzWrapper._classify_contact(resname)
+                result[i] = (float(dists[i]), contact_type)
+            return result
         except Exception:
             return {}
 

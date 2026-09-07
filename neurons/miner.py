@@ -129,6 +129,11 @@ def _init_boltz_cache_db(db_path: str) -> None:
             # training down-weight via * max(0.1, iptm).
             # NULL for legacy rows → COALESCE 1.0 → no penalty.
             "ALTER TABLE boltz_cache ADD COLUMN iptm REAL",
+            # §DDDDDDDDDDDD: fast-mode LE recorded when a fast-screened candidate advances
+            # to full-quality scoring.  Used by _fit_fast_calibration() to build an OLS
+            # correction so the §MM acceptance gate compares fast scores in fast-score space
+            # rather than against the full-quality best (which has a systematic positive bias).
+            "ALTER TABLE boltz_cache ADD COLUMN fast_le REAL",
         ):
             try:
                 conn.execute(_col_ddl)
@@ -147,6 +152,31 @@ def _init_boltz_cache_db(db_path: str) -> None:
             conn.execute("ALTER TABLE miner_state ADD COLUMN value_text TEXT")
         except Exception:
             pass
+
+
+def _fit_fast_calibration(db_path: str, protein: str):
+    """§DDDDDDDDDDDD: Fit OLS full_le = a * fast_le + b using cached (fast_le, score) pairs.
+
+    Returns (a, b) = (1.0, 0.0) on failure or when <5 calibration pairs exist,
+    which preserves the pre-§DDDDDDDDDDDD acceptance gate exactly.
+    """
+    try:
+        with sqlite3.connect(db_path) as conn:
+            rows = conn.execute(
+                "SELECT fast_le, score FROM boltz_cache "
+                "WHERE protein=? AND fast_le IS NOT NULL AND score IS NOT NULL "
+                "ORDER BY score DESC LIMIT 50",
+                (protein,),
+            ).fetchall()
+        if len(rows) < 5:
+            return (1.0, 0.0)
+        X = np.array([r[0] for r in rows], dtype=float).reshape(-1, 1)
+        y = np.array([r[1] for r in rows], dtype=float)
+        from sklearn.linear_model import LinearRegression
+        lr = LinearRegression().fit(X, y)
+        return (float(lr.coef_[0]), float(lr.intercept_))
+    except Exception:
+        return (1.0, 0.0)
 
 
 def _disk_cache_get(db_path: str, smiles: str, protein: str) -> Optional[float]:
@@ -178,6 +208,7 @@ def _disk_cache_put(
     complex_iplddt: Optional[float] = None,
     complex_ipde: Optional[float] = None,
     iptm: Optional[float] = None,
+    fast_le: Optional[float] = None,
 ) -> None:
     """Upsert a Boltz score into the persistent cache (silently ignores errors).
 
@@ -203,6 +234,9 @@ def _disk_cache_put(
     §VVVVVVVVVV: iptm is the overall interface iPTM (0–1, higher=better) — for a 2-chain
     protein+ligand complex, this is effectively the cross-chain protein-ligand confidence.
     Low iptm → uncertain binding from both chains → * max(0.1, iptm) in surrogate weight.
+    §DDDDDDDDDDDD: fast_le is the fast-mode ligand-efficiency score recorded when a §MM
+    fast-screened candidate advances to full-quality scoring.  Enables OLS calibration
+    of the acceptance gate so fast scores are compared in fast-score space.
     """
     try:
         with sqlite3.connect(db_path) as conn:
@@ -210,11 +244,11 @@ def _disk_cache_put(
                 "INSERT OR REPLACE INTO boltz_cache "
                 "(smiles, protein, score, product_name, affinity_prob_binary, "
                 "affinity_pred_val, ligand_iptm, boltz_le_std, confidence_score, "
-                "boltz_embedding, psichic_le, complex_iplddt, complex_ipde, iptm) "
-                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                "boltz_embedding, psichic_le, complex_iplddt, complex_ipde, iptm, fast_le) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (smiles, protein, score, product_name, apb, apv, ligand_iptm,
                  boltz_le_std, confidence_score, boltz_embedding, psichic_le,
-                 complex_iplddt, complex_ipde, iptm),
+                 complex_iplddt, complex_ipde, iptm, fast_le),
             )
     except Exception:
         pass
@@ -915,6 +949,35 @@ async def run_psichic_model_loop(state: Dict[str, Any]) -> None:
                 df = df[df['product_smiles'].apply(_pharma_ok)]
                 if df.empty or len(df) < state['config'].num_molecules:
                     continue
+
+                # §BBBBBBBBBBBB: surrogate pre-filter within each streaming chunk.
+                # Only active at RF tier (≥100 cache pts); falls back to full chunk otherwise.
+                # Reduces per-chunk PSICHIC calls by ~75%, freeing CPU for §MM rounds.
+                _bbbb_sds = state.get('startup_dual_surrogate')
+                if _bbbb_sds is not None:
+                    try:
+                        _bbbb_alpha = adaptive_blend_alpha(
+                            state.get('boltz_cache_db', BOLTZ_CACHE_DB),
+                            state['config'].weekly_target,
+                        )
+                        _bbbb_aug = augment_pool_with_surrogate_blend(
+                            df, _bbbb_sds, alpha=_bbbb_alpha,
+                        )
+                        if 'surrogate_salsa_score' in _bbbb_aug.columns:
+                            _bbbb_thresh = _bbbb_aug['surrogate_salsa_score'].quantile(0.75)
+                            _bbbb_filtered = _bbbb_aug[
+                                _bbbb_aug['surrogate_salsa_score'] >= _bbbb_thresh
+                            ].drop(columns=['surrogate_salsa_score']).reset_index(drop=True)
+                            if len(_bbbb_filtered) >= state['config'].num_molecules:
+                                bt.logging.debug(
+                                    f"[§BBBBBBBBBBBB] Surrogate pre-filter: "
+                                    f"{len(df)}→{len(_bbbb_filtered)} molecules "
+                                    f"({len(_bbbb_filtered)/max(1,len(df)):.0%} kept, "
+                                    f"threshold={_bbbb_thresh:.4f})"
+                                )
+                                df = _bbbb_filtered
+                    except Exception:
+                        pass  # Ridge tier / missing columns → full df passes through unchanged
 
                 # Run inference for all targets and antitargets
                 target_scores = []
@@ -2958,6 +3021,15 @@ async def run_boltz_prescoring(state: Dict[str, Any], max_candidates: int = 5) -
         _mm_max_rounds = 10    # A100 / RTX 3090 / default — time guard is active limit
     _mm_stop = False
 
+    # §DDDDDDDDDDDD: calibrated fast→full LE mapping.
+    # _dddd_a * fast_le + _dddd_b ≈ full_le from OLS over cached (fast_le, score) pairs.
+    # Default (1.0, 0.0) = identity; active only when ≥5 calibration pairs available.
+    _dddd_a, _dddd_b = _fit_fast_calibration(db_path, protein)
+    if not (_dddd_a == 1.0 and _dddd_b == 0.0):
+        bt.logging.debug(
+            f"[§DDDDDDDDDDDD] Fast calibration: full_est = {_dddd_a:.3f} × fast + {_dddd_b:.4f}"
+        )
+
     if (
         _mm_seed_smiles is not None
         and math.isfinite(_mm_best_score)
@@ -3009,21 +3081,31 @@ async def run_boltz_prescoring(state: Dict[str, Any], max_candidates: int = 5) -
 
                 # SALSA from current best Boltz seed
                 _mm_op_tags: dict = {}  # §OOOO: {product_name: operator} populated by run_salsa_search
-                # §ZZZZZZZZZZZZ: look up per-atom exposure for the current §MM seed.
-                # wrapper._pose_exposure is keyed by canonical SMILES and populated
-                # in postprocess_data() before PDB file removal.  None when no full-quality
-                # Boltz run has been scored for this seed yet (epoch 1 / first round).
+                # §ZZZZZZZZZZZZ + §CCCCCCCCCCCC: look up per-atom exposure and contact type
+                # for the current §MM seed.  wrapper._pose_exposure now stores
+                # {atom_idx: (dist_Å, contact_type)} tuples (§CCCCCCCCCCCC).  Unpack into
+                # atom_exposure (float dict for §ZZZZZZZZZZZZ weight ordering) and
+                # atom_contact_type (contact type dict for §CCCCCCCCCCCC fg_add biasing).
                 _zzz_exposure = None
+                _cccc_contact_type = None
                 try:
                     _zzz_canon = get_canonical_smiles(_mm_seed_smiles)
-                    _zzz_exposure = wrapper._pose_exposure.get(_zzz_canon)
-                    if _zzz_exposure:
+                    _raw_exp = wrapper._pose_exposure.get(_zzz_canon)
+                    if _raw_exp:
+                        # §CCCCCCCCCCCC: unpack (dist, type) tuples — backwards-compatible with
+                        # float values if any old-format entry somehow remains (isinstance guard).
+                        if _raw_exp and isinstance(next(iter(_raw_exp.values())), tuple):
+                            _zzz_exposure   = {k: v[0] for k, v in _raw_exp.items()}
+                            _cccc_contact_type = {k: v[1] for k, v in _raw_exp.items()}
+                        else:
+                            _zzz_exposure = _raw_exp  # legacy float format — no contact type
                         bt.logging.debug(
-                            f"[§ZZZZZZZZZZZZ] Atom exposure loaded for §MM seed "
-                            f"({len(_zzz_exposure)} atoms)"
+                            f"[§ZZZZZZZZZZZZ/§CCCCCCCCCCCC] Atom exposure + contact type "
+                            f"loaded for §MM seed ({len(_zzz_exposure)} atoms)"
                         )
                 except Exception:
                     _zzz_exposure = None
+                    _cccc_contact_type = None
                 try:
                     _mm_salsa_hits = await asyncio.to_thread(
                         run_salsa_search,
@@ -3038,7 +3120,8 @@ async def run_boltz_prescoring(state: Dict[str, Any], max_candidates: int = 5) -
                         _salsa_operator_weights(_mm_seed_smiles, state.get('salsa_operator_wins')),  # §ZZZZZ + §OOOO
                         _mm_op_tags,  # §OOOO: out_operator_tags
                         _dual,  # §UUUUUUUUUUUU: surrogate pre-filter for perturbation probes
-                        _zzz_exposure,  # §ZZZZZZZZZZZZ: per-atom binding-pose exposure
+                        _zzz_exposure,         # §ZZZZZZZZZZZZ: per-atom binding-pose exposure
+                        _cccc_contact_type,    # §CCCCCCCCCCCC: pharmacophore contact type per atom
                     )
                     # §NNNN: scaffold-diverse selection — each §MM fast-screen slot tests
                     # a different chemical family, maximising coverage per GPU budget.
@@ -3129,6 +3212,26 @@ async def run_boltz_prescoring(state: Dict[str, Any], max_candidates: int = 5) -
                     _mm_w_row = _mm_row_map[_mm_round_winner]
                     _mm_w_canon = get_canonical_smiles(_mm_round_winner)
                     _mm_w_key = (_mm_w_canon, protein)
+                    # §DDDDDDDDDDDD: calibrated acceptance gate.
+                    # Project the winner's fast score into full-quality space using the
+                    # OLS fit.  If the estimate is below _mm_best_score, skip the expensive
+                    # full Boltz call — the molecule is unlikely to improve the epoch best.
+                    # Falls back to always scoring when calibration is identity (default).
+                    if _mm_w_key not in boltz_cache:
+                        _dddd_fast = _mm_screen.get(_mm_round_winner, -math.inf)
+                        if math.isfinite(_dddd_fast) and _dddd_a > 0.01:
+                            _dddd_est = _dddd_a * _dddd_fast + _dddd_b
+                            if _dddd_est < _mm_best_score * 0.97:
+                                bt.logging.debug(
+                                    f"[§DDDDDDDDDDDD] Skip full-score: "
+                                    f"est={_dddd_est:.4f} < 0.97×best={_mm_best_score*0.97:.4f} "
+                                    f"(fast={_dddd_fast:.4f}, a={_dddd_a:.3f}, b={_dddd_b:.4f})"
+                                )
+                                _mm_round_winner = None
+                if _mm_round_winner is not None:
+                    _mm_w_row = _mm_row_map[_mm_round_winner]
+                    _mm_w_canon = get_canonical_smiles(_mm_round_winner)
+                    _mm_w_key = (_mm_w_canon, protein)
                     if _mm_w_key in boltz_cache:
                         _mm_score = boltz_cache[_mm_w_key]
                     else:
@@ -3163,6 +3266,14 @@ async def run_boltz_prescoring(state: Dict[str, Any], max_candidates: int = 5) -
                                     _mm_raw = _mm_w_row.get('combined_score')
                                     if isinstance(_mm_raw, (int, float)) and math.isfinite(float(_mm_raw)):
                                         _mm_ple = float(_mm_raw)
+                                # §DDDDDDDDDDDD: record fast_le so future calibration pairs accumulate.
+                                _dddd_fast_for_cache = _mm_screen.get(_mm_round_winner)
+                                _dddd_fast_for_cache = (
+                                    float(_dddd_fast_for_cache)
+                                    if isinstance(_dddd_fast_for_cache, (int, float))
+                                    and math.isfinite(float(_dddd_fast_for_cache))
+                                    else None
+                                )
                                 _disk_cache_put(
                                     db_path, _mm_w_canon, protein, _mm_score,
                                     product_name=_mm_w_row.get('product_name'),
@@ -3176,6 +3287,7 @@ async def run_boltz_prescoring(state: Dict[str, Any], max_candidates: int = 5) -
                                     complex_iplddt=_mm_ci if isinstance(_mm_ci, (int, float)) else None,  # §MMMMMMMMMM
                                     complex_ipde=_mm_ipde if isinstance(_mm_ipde, (int, float)) else None,  # §UUUUUUUUUU
                                     iptm=_mm_iptm if isinstance(_mm_iptm, (int, float)) else None,  # §VVVVVVVVVV
+                                    fast_le=_dddd_fast_for_cache,  # §DDDDDDDDDDDD
                                 )
                                 if wrapper.last_inference_duration > 0:
                                     state['boltz_time_per_mol'] = wrapper.last_inference_duration

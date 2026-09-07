@@ -1,16 +1,16 @@
 # Boltz-2 Miner Integration
 
-## Current Status (as of 2026-09-06)
+## Current Status (as of 2026-09-07)
 
-**71 roadmap items implemented; 3 proposed.** §ZZZZZZZZZZZZ (Boltz-2 binding-pose cache for structure-guided §MM growth vectors) added 2026-09-05. §AAAAAAAAAAAA (GA population diversity injection from cross-epoch SQLite elite) added 2026-09-04. §YYYYYYYYYYYY (multi-start §MM SALSA from diversity-maximised cache seeds) added 2026-09-03. §XXXXXXXXXXXX (cache-adaptive UCB beta) added 2026-09-01. §WWWWWWWWWWWW (cache-adaptive surrogate blend alpha) added 2026-08-30. §VVVVVVVVVVVV (reliability-adjusted §MM seed selection) added 2026-08-29. §UUUUUUUUUUUU (surrogate pre-filter for SALSA perturbations) added 2026-08-28.
+**74 roadmap items implemented; 0 proposed.** §BBBBBBBBBBBB (intra-chunk PSICHIC batch surrogate pre-filter), §CCCCCCCCCCCC (residue-type contact map for pharmacophore-guided fg_add), and §DDDDDDDDDDDD (fast-mode linear score calibration for §MM acceptance threshold) implemented 2026-09-07. §ZZZZZZZZZZZZ (Boltz-2 binding-pose cache for structure-guided §MM growth vectors) added 2026-09-05. §AAAAAAAAAAAA (GA population diversity injection from cross-epoch SQLite elite) added 2026-09-04. §YYYYYYYYYYYY (multi-start §MM SALSA from diversity-maximised cache seeds) added 2026-09-03. §XXXXXXXXXXXX (cache-adaptive UCB beta) added 2026-09-01. §WWWWWWWWWWWW (cache-adaptive surrogate blend alpha) added 2026-08-30. §VVVVVVVVVVVV (reliability-adjusted §MM seed selection) added 2026-08-29. §UUUUUUUUUUUU (surrogate pre-filter for SALSA perturbations) added 2026-08-28.
 
-3 new items proposed 2026-09-06: §BBBBBBBBBBBB (intra-chunk PSICHIC batch surrogate pre-filter), §CCCCCCCCCCCC (residue-type contact map for pharmacophore-guided fg_add), §DDDDDDDDDDDD (fast-mode linear score calibration for §MM acceptance threshold).
+No items currently proposed.
 
 ---
 
-## Proposed Optimisations (next priorities)
+## Recently Implemented Optimisations
 
-### §BBBBBBBBBBBB — Intra-Chunk PSICHIC Batch Surrogate Pre-Filter — proposed 2026-09-06
+### §BBBBBBBBBBBB — Intra-Chunk PSICHIC Batch Surrogate Pre-Filter — implemented 2026-09-07
 
 **Problem:** Every molecule in each streamed SAVI-2020 chunk (1 000 molecules) is passed
 through PSICHIC scoring (~20 ms/mol on CPU).  On RF-tier epochs (≥100 cache pts) the
@@ -87,7 +87,7 @@ was blocking the async event loop.  The freed time allows:
 
 ---
 
-### §CCCCCCCCCCCC — Residue-Type Contact Map from Boltz PDB for Pharmacophore-Guided `fg_add` — proposed 2026-09-06
+### §CCCCCCCCCCCC — Residue-Type Contact Map from Boltz PDB for Pharmacophore-Guided `fg_add` — implemented 2026-09-07
 
 **Problem:** §ZZZZZZZZZZZZ stores per-atom `min_protein_distance_Å` (exposure), which
 tells `run_salsa_search()` *where* on the ligand to grow.  It says nothing about *what*
@@ -208,7 +208,7 @@ position-chemistry mismatch.
 
 ---
 
-### §DDDDDDDDDDDD — Fast-Mode Linear Score Calibration for §MM Acceptance Threshold — proposed 2026-09-06
+### §DDDDDDDDDDDD — Fast-Mode Linear Score Calibration for §MM Acceptance Threshold — implemented 2026-09-07
 
 **Problem:** The §MM hill-climbing loop accepts a perturbed candidate when
 `fast_score > _mm_best_score - _mm_delta`.  `_mm_best_score` is set from the full-quality
