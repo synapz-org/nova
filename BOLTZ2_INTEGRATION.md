@@ -1,10 +1,236 @@
 # Boltz-2 Miner Integration
 
-## Current Status (as of 2026-09-07)
+## Current Status (as of 2026-09-08)
 
-**74 roadmap items implemented; 0 proposed.** §BBBBBBBBBBBB (intra-chunk PSICHIC batch surrogate pre-filter), §CCCCCCCCCCCC (residue-type contact map for pharmacophore-guided fg_add), and §DDDDDDDDDDDD (fast-mode linear score calibration for §MM acceptance threshold) implemented 2026-09-07. §ZZZZZZZZZZZZ (Boltz-2 binding-pose cache for structure-guided §MM growth vectors) added 2026-09-05. §AAAAAAAAAAAA (GA population diversity injection from cross-epoch SQLite elite) added 2026-09-04. §YYYYYYYYYYYY (multi-start §MM SALSA from diversity-maximised cache seeds) added 2026-09-03. §XXXXXXXXXXXX (cache-adaptive UCB beta) added 2026-09-01. §WWWWWWWWWWWW (cache-adaptive surrogate blend alpha) added 2026-08-30. §VVVVVVVVVVVV (reliability-adjusted §MM seed selection) added 2026-08-29. §UUUUUUUUUUUU (surrogate pre-filter for SALSA perturbations) added 2026-08-28.
+**74 roadmap items implemented; 2 proposed.** §BBBBBBBBBBBB (intra-chunk PSICHIC batch surrogate pre-filter), §CCCCCCCCCCCC (residue-type contact map for pharmacophore-guided fg_add), and §DDDDDDDDDDDD (fast-mode linear score calibration for §MM acceptance threshold) implemented 2026-09-07. §ZZZZZZZZZZZZ (Boltz-2 binding-pose cache for structure-guided §MM growth vectors) added 2026-09-05. §AAAAAAAAAAAA (GA population diversity injection from cross-epoch SQLite elite) added 2026-09-04. §YYYYYYYYYYYY (multi-start §MM SALSA from diversity-maximised cache seeds) added 2026-09-03.
 
-No items currently proposed.
+**New proposals (2026-09-08):**
+- **§EEEEEEEEEEEE** (item 75): §MM diminishing-returns early exit — when last 3 per-round LE improvement deltas are all < 0.003, advance to the next §YYYYYYYYYYYY diversity seed instead of running another round; frees 2–4 §MM round budgets per epoch.
+- **§FFFFFFFFFFFFFFFF** (item 76): GradientBoosting surrogate tier at ≥600 cache points — add sklearn `GradientBoostingRegressor` as a 3rd surrogate tier above RF, capturing non-linear feature interactions that RF's independent trees miss; no new dependencies.
+
+**Proposed (not yet implemented):** §EEEEEEEEEEEE, §FFFFFFFFFFFFFFFF.
+
+---
+
+## Proposed Optimisations
+
+### §EEEEEEEEEEEE — §MM Diminishing-Returns Early Exit to Next Global Seed — proposed 2026-09-08
+
+**Problem:**
+
+In the §YYYYYYYYYYYY multi-start §MM loop, each global seed (up to 3) runs its own
+sequence of SALSA rounds within the shared `_mm_max_rounds` budget.  The existing
+convergence mechanism is binary:
+
+- **§QQ/§VV basin-hop**: triggered when `_mm_improved is False` (zero improvement) —
+  hops to an alternative seed from `all_scores`.
+- **Time guard**: triggered when `_mm_remaining_s < _mm_t_mol * 2 + 120`.
+
+There is no detection of **diminishing-returns convergence** — the case where a seed
+keeps making small improvements (delta ∈ [0.001, 0.003] LE per round) that fall within
+Boltz-2's stochastic variance.  Continuing to run rounds in this regime wastes GPU
+budget that could be spent on the next §YYYYYYYYYYYY diversity seed, which may escape
+the current local optimum entirely.
+
+The existing boltz_le_std / boltz_ww_std data (§WWWWWWWWWWWW / §XXXXXXXX) shows that
+Boltz-2's per-run variance is typically 0.01–0.05 LE on A100.  An improvement of 0.003
+LE per round is therefore within Boltz-2's noise floor for most molecules.  After three
+consecutive micro-improvements, the probability that further rounds will yield a delta
+> 0.003 LE diminishes rapidly: the seed has effectively converged to its local basin.
+
+**Fix:**
+
+Add a deque `_mm_delta_history` (maxlen=3) that tracks per-round LE improvement deltas
+within the current §YYYYYYYYYYYY seed sequence.  When `_mm_improved is True`, append
+`_mm_round_best_score - _mm_best_score` to the deque.  After updating `_mm_best_score`
+and `_mm_seed_smiles`, check for diminishing returns before the next round:
+
+```python
+# §EEEEEEEEEEEE: diminishing-returns early exit.
+# Threshold calibrated to Boltz-2 stochastic variance (~0.01-0.05 LE on A100).
+_MM_DIM_THRESHOLD = 0.003  # LE per round; improvements below this are noise-level
+_mm_delta_history: collections.deque = collections.deque(maxlen=3)
+
+# ... inside the _mm_improved block, after updating _mm_best_score:
+_mm_delta = _mm_round_best_score - _mm_best_score  # improvement this round
+_mm_best_score = _mm_round_best_score               # advance epoch best
+_mm_seed_smiles = _mm_round_best_smiles
+_mm_delta_history.append(_mm_delta)
+if (
+    len(_mm_seed_list) > 1                          # only useful with §YYYYYYYYYYYY
+    and len(_mm_delta_history) == 3
+    and all(d < _MM_DIM_THRESHOLD for d in _mm_delta_history)
+    and _mm_global_seed_idx < len(_mm_seed_list) - 1  # another seed exists
+):
+    bt.logging.info(
+        f"[§EEEEEEEEEEEE] Diminishing returns: last 3 deltas "
+        f"{[f'{d:.4f}' for d in _mm_delta_history]} all < {_MM_DIM_THRESHOLD} — "
+        f"advancing to next §YYYYYYYYYYYY seed."
+    )
+    break  # outer per-seed loop continues; _mm_delta_history resets on next seed
+```
+
+The `break` exits the inner `_mm_round_idx` loop; the outer `_mm_global_seed_idx` loop
+(§YYYYYYYYYYYY) continues with the next diversity seed.  `_mm_delta_history` is
+implicitly reset because a new deque is created per §EEEEEEEEEEEE block, OR the deque
+can persist across seeds (accumulated history doesn't fire because the first few rounds
+of the new seed have fresh deltas that typically exceed 0.003 on a new chemical basin).
+
+**Guards:**
+
+- `len(_mm_seed_list) > 1`: no-op when §YYYYYYYYYYYY has only 1 seed (cold start,
+  few cache points) — identical to pre-§EEEEEEEEEEEE.
+- `_mm_global_seed_idx < len(_mm_seed_list) - 1`: no early exit from the LAST
+  §YYYYYYYYYYYY seed, since there's no benefit to stopping early then.
+- `len(_mm_delta_history) == 3`: fires only after exactly 3 micro-improvement rounds,
+  not on the first or second.
+- `all(d < _MM_DIM_THRESHOLD ...)`: any round with delta ≥ 0.003 resets the signal
+  (deque will no longer have 3 consecutive micro-improvements until they accumulate).
+- `_mm_best_score` and `_mm_seed_smiles` are always advanced BEFORE the break, so
+  the NEXT §YYYYYYYYYYYY seed continues from the current best, not the original seed.
+
+**Expected benefit:**
+
+| Scenario | Rounds saved | Freed budget |
+|----------|-------------|--------------|
+| Seed 1 converges in 5 rounds with diminishing deltas; 2 more seeds exist | 2–4 rounds | 90–180 s on A100 |
+| All seeds improve rapidly (delta > 0.003); §YYYYYYYYYYYY has 3 diverse seeds | 0 (no early exit) | — |
+| §YYYYYYYYYYYY has only 1 seed (cold start) | 0 (guard fires) | — |
+
+Freed rounds allow the 2nd/3rd §YYYYYYYYYYYY seed to explore a new scaffold basin,
+potentially escaping the current local optimum.  Expected gain: **+2–4% Boltz LE** on
+epoch 2+ warm-cache runs with ≥3 diverse cached scaffolds (same as §YYYYYYYYYYYY's
+prerequisite).
+
+**Files changed (proposed):**
+- `neurons/miner.py`: ~22 lines in the §MM `_mm_improved` block (around line 3474).
+  Import `collections` already present at top of file.
+
+---
+
+### §FFFFFFFFFFFFFFFF — GradientBoosting Surrogate Tier at ≥600 Cache Points — proposed 2026-09-08
+
+**Problem:**
+
+The surrogate uses two tiers:
+1. **Ridge regression** (< 100 pts): linear, highly regularised, handles sparse data.
+2. **RandomForestRegressor** (≥ 100 pts): handles non-linear scaffold–score patterns.
+
+RandomForest builds independent decision trees and averages them.  This is effective
+for moderate datasets (100–500 pts) but has a structural weakness at larger cache sizes
+(600+ pts): each tree is trained on a bootstrap sample of ~63% of points, and feature
+splits are chosen from a random subset.  This randomness prevents the ensemble from
+learning *systematic* non-linear interactions between features.
+
+For binding affinity prediction, pharmacophore complementarity requires feature
+interactions: e.g., the combination of (has halogen at R-group 2 AND faces HBA residue)
+is more informative than either feature alone.  GradientBoostingRegressor (GBM) builds
+trees sequentially, each correcting the residual of the previous.  Residual learning
+captures second- and third-order interactions that RF's independence assumption misses.
+On chemical property prediction benchmarks (ADMET, pKi), GBM typically outperforms RF
+by 5–15% R² at 500+ training points.
+
+`sklearn.ensemble.GradientBoostingRegressor` is in scikit-learn 1.6.1 (already
+installed) — no new dependencies required.
+
+**Fix:**
+
+Add a `_GBM_THRESHOLD = 600` constant alongside `_RF_THRESHOLD = 100`.  In
+`fit_dual_surrogate()`, select GBM when `len(rows) >= _GBM_THRESHOLD`:
+
+```python
+_GBM_THRESHOLD = 600
+
+from sklearn.ensemble import GradientBoostingRegressor, RandomForestRegressor
+from sklearn.linear_model import Ridge
+
+if n_pts >= _GBM_THRESHOLD:
+    learner_apb = GradientBoostingRegressor(
+        n_estimators=100,
+        max_depth=4,
+        learning_rate=0.08,
+        subsample=0.8,
+        random_state=68,
+        n_iter_no_change=10,  # early stopping via validation loss
+        validation_fraction=0.15,
+    )
+    learner_apv = GradientBoostingRegressor(
+        n_estimators=100,
+        max_depth=4,
+        learning_rate=0.08,
+        subsample=0.8,
+        random_state=68,
+        n_iter_no_change=10,
+        validation_fraction=0.15,
+    )
+elif n_pts >= _RF_THRESHOLD:
+    learner_apb = RandomForestRegressor(n_estimators=100, ...)
+    learner_apv = RandomForestRegressor(n_estimators=100, ...)
+else:
+    learner_apb = Ridge(alpha=1.0)
+    learner_apv = Ridge(alpha=1.0)
+```
+
+**Hyperparameter rationale:**
+- `n_estimators=100`: same as RF — avoids training time regression.
+- `max_depth=4`: captures 3rd-order feature interactions (halogen × position × residue
+  contact type) without overfitting on 600 pts with 276 features.
+- `learning_rate=0.08`: slower than the default 0.1 to benefit from `n_estimators=100`.
+- `subsample=0.8`: stochastic gradient boosting, reduces variance, improves NDCG.
+- `n_iter_no_change=10` + `validation_fraction=0.15`: GBM's built-in early stopping
+  halts at the best validation epoch, preventing overfitting without a separate
+  validation split in the caller.
+
+**GBM uncertainty estimates:**
+
+GBM is not a tree ensemble, so `predict()` returns point estimates without per-tree
+variance.  UCB exploration (§AAAAAA/§XXXXXXXXXXXX) relies on `rank_pool_by_surrogate()`
+which returns `(mean, std)`.  For GBM at the ≥600 pt tier, return
+`std = np.zeros(n_samples)` — identical to the existing Ridge fallback.  At 600+ pts,
+the surrogate mean is sufficiently reliable that UCB beta is already at 0.5
+(§XXXXXXXXXXXX's minimum), so zero std collapses UCB to pure exploitation, which is
+correct: a 600-pt cache on a weekly target has exhausted most meaningful exploration.
+
+**Alternative: quantile GBM for uncertainty**
+
+`GradientBoostingRegressor(loss='quantile', alpha=0.84)` produces calibrated 84th-
+percentile predictions that proxy UCB(β=1) directly.  Fitting 3 models (q=0.5/0.84 for
+APB/APV) would give uncertainty but at 3× training cost.  Given §XXXXXXXXXXXX already
+suppresses exploration at 600+ pts, this extension is not needed for the initial
+implementation.
+
+**Regression guards:**
+
+- `_GBM_THRESHOLD = 600`: RF at 100–599 pts is unchanged.  Ridge at <100 pts unchanged.
+- `n_iter_no_change=10` + `validation_fraction=0.15`: guards against overfitting at
+  exactly 600 pts (minimum tier entry).
+- `isinstance(learner, GradientBoostingRegressor)` guard in `rank_pool_by_surrogate()`
+  returns zero std — identical to Ridge behaviour — so no change to UCB callers.
+- GBM fit time on 600 pts × 276 features × 100 estimators ≈ 4–8 s (sklearn CPU).  This
+  replaces an RF fit on the same data (~2–3 s).  The extra 2–5 s is paid at the start of
+  each epoch after surrogate initialisation and at each §IIIIII online refresh.  On a
+  72-minute epoch with ~3 §IIIIII refreshes, total overhead ≈ 10–20 s — acceptable.
+
+**Expected benefit:**
+
+| Cache size | Surrogate | OOB R² (typical) | Expected NDCG gain |
+|------------|-----------|------------------|--------------------|
+| 100–599 pts | RF | 0.5–0.75 | — (baseline) |
+| 600+ pts | GBM (proposed) | 0.65–0.85 (estimated) | +3–6% |
+
+GBM captures cross-feature synergies (halogen × contact-type × HA-count) that RF
+averages out.  On a well-studied weekly target with 600+ Boltz calls accumulated (typical
+from week 2 onward on a stable target), the NDCG improvement would cascade to:
+- Better SALSA pool ranking in §HHHHHHHHHH (surrogate-blended pool score).
+- Better UCB candidate selection in §AAAAAA/§XXXXXXXXXXXX.
+- Better §BBBBBBBBBBBB chunk pre-filter quality.
+- Better §RRRRRRRRRRRR reaction-class weight accuracy.
+
+**Files changed (proposed):**
+- `utils/surrogate.py`: ~50 lines — add `_GBM_THRESHOLD` constant; add GBM
+  initialisation branch in `fit_dual_surrogate()`; add
+  `isinstance(GradientBoostingRegressor)` guard in `rank_pool_by_surrogate()`.
+- `neurons/miner.py`: 0 lines — GBM is a drop-in for RF from the caller's perspective.
 
 ---
 
