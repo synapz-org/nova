@@ -3056,6 +3056,7 @@ async def run_boltz_prescoring(state: Dict[str, Any], max_candidates: int = 5) -
                 )
             _mm_seed_smiles = _mm_global_seed
             _mm_tried_seeds: set = set()  # prevent cycling when basin-hopping
+            _eeee_deltas: list = []  # §EEEEEEEEEEEE: last-3 per-round LE improvement deltas
             for _mm_round_idx in range(_mm_max_rounds):
                 if _mm_stop:
                     break
@@ -3376,6 +3377,7 @@ async def run_boltz_prescoring(state: Dict[str, Any], max_candidates: int = 5) -
                     ):
                         all_scores[_mm_ck2[0]] = _mm_cv2
 
+                _eeee_pre_round_best = _mm_best_score  # §EEEEEEEEEEEE: snapshot before potential update
                 _mm_rounds_run += 1  # §YYYYYYYYYYYY: accumulate across all seeds
 
                 if not _mm_improved:
@@ -3475,6 +3477,24 @@ async def run_boltz_prescoring(state: Dict[str, Any], max_candidates: int = 5) -
                     # Advance seed to this round's best for the next iteration
                     _mm_best_score = _mm_round_best_score
                     _mm_seed_smiles = _mm_round_best_smiles
+
+                # §EEEEEEEEEEEE: Diminishing-returns early exit.
+                # Track last 3 per-round LE deltas; when all 3 < 0.003 LE and a next
+                # §YYYYYYYYYYYY global seed exists, break to save rounds for that seed.
+                _eeee_delta = max(0.0, _mm_best_score - _eeee_pre_round_best)
+                _eeee_deltas = (_eeee_deltas + [_eeee_delta])[-3:]
+                if (
+                    len(_eeee_deltas) == 3
+                    and all(d < 0.003 for d in _eeee_deltas)
+                    and _mm_global_seed_idx < len(_mm_seed_list) - 1
+                ):
+                    bt.logging.info(
+                        f"[§EEEEEEEEEEEE] Diminishing returns "
+                        f"(deltas={[f'{d:.4f}' for d in _eeee_deltas]}) — "
+                        f"advancing to §YYYYYYYYYYYY seed "
+                        f"{_mm_global_seed_idx + 2}/{len(_mm_seed_list)}."
+                    )
+                    break
 
         bt.logging.info(
             f"§MM complete: {_mm_rounds_run} round(s) run, "

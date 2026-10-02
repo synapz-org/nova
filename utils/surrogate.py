@@ -88,6 +88,7 @@ def _descriptor_vector(smiles: str) -> Optional[list]:
 
 
 _RF_THRESHOLD = 100  # §QQQQ: switch to RandomForest above this many training points
+_GB_THRESHOLD = 600  # §FFFFFFFFFFFFFFFF: switch to GradientBoosting above this many training points
 
 
 def adaptive_blend_alpha(
@@ -185,7 +186,7 @@ def fit_surrogate(db_path: str, protein: str, min_points: int = 40):
     """
     try:
         from sklearn.linear_model import Ridge
-        from sklearn.ensemble import RandomForestRegressor
+        from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor
         from sklearn.pipeline import Pipeline
         from sklearn.preprocessing import StandardScaler
     except ImportError:
@@ -254,7 +255,20 @@ def fit_surrogate(db_path: str, protein: str, min_points: int = 40):
         return None
 
     try:
-        if len(X) >= _RF_THRESHOLD:
+        if len(X) >= _GB_THRESHOLD:
+            # §FFFFFFFFFFFFFFFF: GradientBoosting captures non-linear feature
+            # interactions (halogen × contact-type × HA-count) that RF's
+            # independent trees miss; n_iter_no_change provides early stopping.
+            learner = GradientBoostingRegressor(
+                n_estimators=100,
+                max_depth=4,
+                learning_rate=0.08,
+                subsample=0.8,
+                n_iter_no_change=10,
+                validation_fraction=0.1,
+                random_state=68,
+            )
+        elif len(X) >= _RF_THRESHOLD:
             # §QQQQ: RandomForest for non-linear scaffold-score patterns.
             learner = RandomForestRegressor(
                 n_estimators=100,
@@ -402,7 +416,7 @@ def fit_dual_surrogate(db_path: str, protein: str, min_points: int = 40):
     """
     try:
         from sklearn.linear_model import Ridge
-        from sklearn.ensemble import RandomForestRegressor
+        from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor
         from sklearn.pipeline import Pipeline
         from sklearn.preprocessing import StandardScaler
     except ImportError:
@@ -472,7 +486,14 @@ def fit_dual_surrogate(db_path: str, protein: str, min_points: int = 40):
         return None
 
     def _make_pipeline(n: int):
-        if n >= _RF_THRESHOLD:
+        if n >= _GB_THRESHOLD:
+            # §FFFFFFFFFFFFFFFF: GradientBoosting 3rd tier at ≥600 pts.
+            learner = GradientBoostingRegressor(
+                n_estimators=100, max_depth=4, learning_rate=0.08,
+                subsample=0.8, n_iter_no_change=10,
+                validation_fraction=0.1, random_state=68,
+            )
+        elif n >= _RF_THRESHOLD:
             learner = RandomForestRegressor(
                 n_estimators=100, max_features='sqrt', random_state=68, n_jobs=1
             )
@@ -817,7 +838,7 @@ def fit_dual_surrogate_with_embeddings(db_path: str, protein: str, min_points: i
     """
     try:
         from sklearn.linear_model import Ridge
-        from sklearn.ensemble import RandomForestRegressor
+        from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor
         from sklearn.pipeline import Pipeline
         from sklearn.preprocessing import StandardScaler
     except ImportError:
@@ -883,7 +904,14 @@ def fit_dual_surrogate_with_embeddings(db_path: str, protein: str, min_points: i
         return None
 
     def _make_pipeline(n: int):
-        if n >= _RF_THRESHOLD:
+        if n >= _GB_THRESHOLD:
+            # §FFFFFFFFFFFFFFFF: GradientBoosting 3rd tier at ≥600 pts.
+            learner = GradientBoostingRegressor(
+                n_estimators=100, max_depth=4, learning_rate=0.08,
+                subsample=0.8, n_iter_no_change=10,
+                validation_fraction=0.1, random_state=68,
+            )
+        elif n >= _RF_THRESHOLD:
             learner = RandomForestRegressor(
                 n_estimators=100, max_features='sqrt', random_state=68, n_jobs=1
             )
