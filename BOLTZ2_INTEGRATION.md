@@ -1,20 +1,81 @@
 # Boltz-2 Miner Integration
 
-## Current Status (as of 2026-09-08)
+## Current Status (as of 2026-10-03)
 
-**74 roadmap items implemented; 2 proposed.** §BBBBBBBBBBBB (intra-chunk PSICHIC batch surrogate pre-filter), §CCCCCCCCCCCC (residue-type contact map for pharmacophore-guided fg_add), and §DDDDDDDDDDDD (fast-mode linear score calibration for §MM acceptance threshold) implemented 2026-09-07. §ZZZZZZZZZZZZ (Boltz-2 binding-pose cache for structure-guided §MM growth vectors) added 2026-09-05. §AAAAAAAAAAAA (GA population diversity injection from cross-epoch SQLite elite) added 2026-09-04. §YYYYYYYYYYYY (multi-start §MM SALSA from diversity-maximised cache seeds) added 2026-09-03.
+**77 roadmap items implemented; 0 proposed.** §GGGGGGGGGGGG (freed-round reallocation from §EEEEEEEEEEEE to next §YYYYYYYYYYYY seed) implemented 2026-10-03. §EEEEEEEEEEEE (§MM diminishing-returns early exit) and §FFFFFFFFFFFFFFFF (GradientBoosting surrogate 3rd tier) implemented 2026-10-02. §BBBBBBBBBBBB/§CCCCCCCCCCCC/§DDDDDDDDDDDD implemented 2026-09-07.
 
-**New proposals (2026-09-08):**
-- **§EEEEEEEEEEEE** (item 75): §MM diminishing-returns early exit — when last 3 per-round LE improvement deltas are all < 0.003, advance to the next §YYYYYYYYYYYY diversity seed instead of running another round; frees 2–4 §MM round budgets per epoch.
-- **§FFFFFFFFFFFFFFFF** (item 76): GradientBoosting surrogate tier at ≥600 cache points — add sklearn `GradientBoostingRegressor` as a 3rd surrogate tier above RF, capturing non-linear feature interactions that RF's independent trees miss; no new dependencies.
-
-**Proposed (not yet implemented):** §EEEEEEEEEEEE, §FFFFFFFFFFFFFFFF.
+**No open proposals.**
 
 ---
 
-## Proposed Optimisations
+## Recently Implemented Optimisations (latest first)
 
-### §EEEEEEEEEEEE — §MM Diminishing-Returns Early Exit to Next Global Seed — proposed 2026-09-08
+### §GGGGGGGGGGGG — §EEEEEEEEEEEE Freed-Round Reallocation to Next §YYYYYYYYYYYY Seed — implemented 2026-10-03
+
+**Problem:**
+
+When §EEEEEEEEEEEE triggers a diminishing-returns early exit for a §YYYYYYYYYYYY global seed,
+the unused portion of that seed's `_mm_max_rounds` budget is simply discarded.  For example,
+if `_mm_max_rounds=10` and §EEEEEEEEEEEE exits at round 6, 4 rounds of GPU time are left on
+the table rather than given to the next diversity seed.  The next seed enters with only the
+standard `_mm_max_rounds` budget, even though the epoch still has spare time and the previous
+seed's early exit implies the next seed is likely exploring a genuinely new chemical basin.
+
+**Fix:**
+
+Track `_mm_freed_rounds: int = 0` before the §YYYYYYYYYYYY outer loop.  At the start of each
+seed iteration, compute `_mm_seed_round_budget = _mm_max_rounds + _mm_freed_rounds` and reset
+`_mm_freed_rounds = 0`.  Replace `range(_mm_max_rounds)` with `range(_mm_seed_round_budget)`.
+When §EEEEEEEEEEEE breaks, set `_mm_freed_rounds = _mm_seed_round_budget - (_mm_round_idx + 1)`
+so the next seed inherits the saved budget.
+
+```python
+# Before outer loop:
+_mm_freed_rounds: int = 0  # §GGGGGGGGGGGG
+
+# Inside outer loop, before inner loop:
+_mm_seed_round_budget = _mm_max_rounds + _mm_freed_rounds  # §GGGGGGGGGGGG
+_mm_freed_rounds = 0  # consumed by this seed
+for _mm_round_idx in range(_mm_seed_round_budget):  # was range(_mm_max_rounds)
+
+# Inside §EEEEEEEEEEEE block, before break:
+_mm_freed_rounds = _mm_seed_round_budget - (_mm_round_idx + 1)
+```
+
+**Guards:**
+
+- `_mm_freed_rounds = 0` on the last seed: no next seed exists, so freed rounds are lost
+  (same as before).  This is correct — there is nowhere to send them.
+- The real limiting factor is always the time guard (`_mm_remaining_s < _mm_t_mol*2+120`).
+  Extra rounds only help when time remains; the guard stops exploration naturally if it does not.
+- First seed (no prior freed rounds): `_mm_seed_round_budget = _mm_max_rounds + 0` — identical
+  to pre-§GGGGGGGGGGGG, zero regression.
+- §EEEEEEEEEEEE guard `_mm_global_seed_idx < len(_mm_seed_list) - 1` already ensures we never
+  exit the last seed early, so `_mm_freed_rounds` is never set for the last seed.
+
+**Expected benefit:**
+
+| Scenario | Freed rounds | Transferred to | Expected gain |
+|----------|-------------|----------------|---------------|
+| Seed 1 exits at round 6 (10-round budget), 2 more seeds | 4 rounds | Seed 2 gets 14-round budget | +4 §MM rounds on seed 2, ~180 s extra on A100 |
+| Seed 2 exits at round 8 (14-round budget after §GGGGGGGGGGGG), 1 more seed | 6 rounds | Seed 3 gets 16-round budget | Further +6 rounds |
+| Seeds improve rapidly (§EEEEEEEEEEEE never fires) | 0 | — | Zero regression |
+
+On a 3-seed §YYYYYYYYYYYY run where both seeds 1 and 2 converge early (common on week-3+
+warm-cache epochs), seed 3 can receive up to `_mm_max_rounds × 2` bonus rounds, effectively
+tripling its hill-climbing depth in the most promising unexplored basin.
+
+**Expected gain:** +2–6% Boltz LE on epoch 2+ warm-cache runs with 3 §YYYYYYYYYYYY seeds
+(requires §EEEEEEEEEEEE to fire at least once).
+
+**Files changed:**
+- `neurons/miner.py`: ~7 lines across 3 edit points in the §MM block.
+
+---
+
+## Previously Proposed, Now Implemented
+
+### §EEEEEEEEEEEE — §MM Diminishing-Returns Early Exit to Next Global Seed — implemented 2026-10-02
 
 **Problem:**
 
@@ -108,7 +169,7 @@ prerequisite).
 
 ---
 
-### §FFFFFFFFFFFFFFFF — GradientBoosting Surrogate Tier at ≥600 Cache Points — proposed 2026-09-08
+### §FFFFFFFFFFFFFFFF — GradientBoosting Surrogate Tier at ≥600 Cache Points — implemented 2026-10-02
 
 **Problem:**
 

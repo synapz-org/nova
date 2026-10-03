@@ -3041,6 +3041,7 @@ async def run_boltz_prescoring(state: Dict[str, Any], max_candidates: int = 5) -
             f"(seed_score={_mm_best_score:.4f}, max_rounds={_mm_max_rounds})"
         )
         _mm_rounds_run = 0
+        _mm_freed_rounds: int = 0  # §GGGGGGGGGGGG: rounds saved by §EEEEEEEEEEEE early exit
         # §YYYYYYYYYYYY: outer loop over diversity-augmented seed list.
         # Each global seed runs its own §MM round sequence (§KKKKKK cap per seed).
         # _mm_best_score is global across seeds so improvement comparisons are consistent.
@@ -3057,7 +3058,10 @@ async def run_boltz_prescoring(state: Dict[str, Any], max_candidates: int = 5) -
             _mm_seed_smiles = _mm_global_seed
             _mm_tried_seeds: set = set()  # prevent cycling when basin-hopping
             _eeee_deltas: list = []  # §EEEEEEEEEEEE: last-3 per-round LE improvement deltas
-            for _mm_round_idx in range(_mm_max_rounds):
+            # §GGGGGGGGGGGG: inherit freed rounds from §EEEEEEEEEEEE early exit on the prev seed.
+            _mm_seed_round_budget = _mm_max_rounds + _mm_freed_rounds
+            _mm_freed_rounds = 0  # consumed by this seed
+            for _mm_round_idx in range(_mm_seed_round_budget):
                 if _mm_stop:
                     break
 
@@ -3488,11 +3492,14 @@ async def run_boltz_prescoring(state: Dict[str, Any], max_candidates: int = 5) -
                     and all(d < 0.003 for d in _eeee_deltas)
                     and _mm_global_seed_idx < len(_mm_seed_list) - 1
                 ):
+                    # §GGGGGGGGGGGG: bank unused rounds for the next §YYYYYYYYYYYY seed.
+                    _mm_freed_rounds = _mm_seed_round_budget - (_mm_round_idx + 1)
                     bt.logging.info(
                         f"[§EEEEEEEEEEEE] Diminishing returns "
                         f"(deltas={[f'{d:.4f}' for d in _eeee_deltas]}) — "
                         f"advancing to §YYYYYYYYYYYY seed "
-                        f"{_mm_global_seed_idx + 2}/{len(_mm_seed_list)}."
+                        f"{_mm_global_seed_idx + 2}/{len(_mm_seed_list)} "
+                        f"(+{_mm_freed_rounds} freed rounds via §GGGGGGGGGGGG)."
                     )
                     break
 
