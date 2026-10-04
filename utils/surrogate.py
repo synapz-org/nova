@@ -769,6 +769,70 @@ def augment_pool_with_surrogate_blend(
 
 _N_EMB_COMPONENTS = 32
 _MIN_EMB_ROWS = 20
+# §HHHHHHHHHHHH: z pair-representation interface embedding PCA components.
+_N_ZEMB_COMPONENTS = 16
+_MIN_ZEMB_ROWS = 20
+
+
+def _load_z_embeddings_from_cache(db_path: str, protein: str) -> tuple:
+    """§HHHHHHHHHHHH: Load (smiles → 16D PCA vector) dict from z-embedding BLOB column.
+
+    Returns (fitted_pca, zemb_dict) where zemb_dict maps canonical SMILES to a
+    float32 array of shape (_N_ZEMB_COMPONENTS,).  Returns (None, {}) when fewer
+    than _MIN_ZEMB_ROWS rows exist or on any error.
+    """
+    try:
+        from sklearn.decomposition import PCA
+    except ImportError:
+        return None, {}
+
+    try:
+        with sqlite3.connect(db_path) as conn:
+            rows = conn.execute(
+                "SELECT smiles, boltz_z_embedding FROM boltz_cache "
+                "WHERE protein=? AND boltz_z_embedding IS NOT NULL",
+                (protein,),
+            ).fetchall()
+    except Exception:
+        return None, {}
+
+    if len(rows) < _MIN_ZEMB_ROWS:
+        return None, {}
+
+    smiles_list, raw_zembs = [], []
+    for smiles, blob in rows:
+        try:
+            zemb = np.frombuffer(blob, dtype=np.float32)
+            if zemb.ndim == 1 and zemb.shape[0] > 0:
+                smiles_list.append(smiles)
+                raw_zembs.append(zemb)
+        except Exception:
+            pass
+
+    if len(smiles_list) < _MIN_ZEMB_ROWS:
+        return None, {}
+
+    # All vectors must share the same d_z for PCA; filter inconsistent lengths.
+    d_z = raw_zembs[0].shape[0]
+    raw_zembs = [v for v in raw_zembs if v.shape[0] == d_z]
+    smiles_list = smiles_list[:len(raw_zembs)]
+    if len(smiles_list) < _MIN_ZEMB_ROWS:
+        return None, {}
+
+    try:
+        Z = np.stack(raw_zembs)
+        n_comp = min(_N_ZEMB_COMPONENTS, Z.shape[0] - 1, Z.shape[1])
+        if n_comp < 1:
+            return None, {}
+        pca = PCA(n_components=n_comp, random_state=68)
+        Z_red = pca.fit_transform(Z)
+        if n_comp < _N_ZEMB_COMPONENTS:
+            pad = np.zeros((Z_red.shape[0], _N_ZEMB_COMPONENTS - n_comp), dtype=np.float32)
+            Z_red = np.hstack([Z_red, pad])
+        zemb_dict = {s: Z_red[i].astype(np.float32) for i, s in enumerate(smiles_list)}
+        return pca, zemb_dict
+    except Exception:
+        return None, {}
 
 
 def _load_embeddings_from_cache(db_path: str, protein: str) -> tuple:
@@ -828,13 +892,14 @@ def _load_embeddings_from_cache(db_path: str, protein: str) -> tuple:
 def fit_dual_surrogate_with_embeddings(db_path: str, protein: str, min_points: int = 40):
     """§HHHHHHHHHH: Dual APB/APV surrogate optionally augmented with PCA embeddings.
 
-    Returns (model_apb, model_apv, emb_pca, emb_dict) where emb_pca and emb_dict
-    are populated when ≥ _MIN_EMB_ROWS embedding rows exist; otherwise both are
-    None/{} and the models use only the 84D descriptor features (identical to
-    fit_dual_surrogate).  Returns None when fewer than min_points valid training
-    examples exist or sklearn is unavailable.
+    Returns (model_apb, model_apv, emb_pca, emb_dict, z_info) where:
+    - emb_pca/emb_dict: 32D PCA of s single-representation (§HHHHHHHHHH)
+    - z_info = (z_pca, zemb_dict): 16D PCA of z interface embedding (§HHHHHHHHHHHH)
+    emb_pca and z_pca are None when fewer than _MIN_EMB_ROWS / _MIN_ZEMB_ROWS rows
+    exist.  Returns None when fewer than min_points valid training examples exist or
+    sklearn is unavailable.
 
-    Callers pass the 4-tuple to dual_surrogate_ucb_rank_pool_emb() for ranking.
+    Callers pass the 5-tuple to dual_surrogate_ucb_rank_pool_emb() for ranking.
     """
     try:
         from sklearn.linear_model import Ridge
@@ -846,6 +911,9 @@ def fit_dual_surrogate_with_embeddings(db_path: str, protein: str, min_points: i
 
     emb_pca, emb_dict = _load_embeddings_from_cache(db_path, protein)
     has_emb = emb_pca is not None
+    # §HHHHHHHHHHHH: z interface pair-representation embeddings.
+    z_pca, zemb_dict = _load_z_embeddings_from_cache(db_path, protein)
+    has_zemb = z_pca is not None
 
     try:
         with sqlite3.connect(db_path) as conn:
@@ -871,22 +939,28 @@ def fit_dual_surrogate_with_embeddings(db_path: str, protein: str, min_points: i
     if len(rows) < min_points:
         return None
 
-    # §IIIIIIIIII: feature order is [84D desc] + [psichic_le] + [32D PCA] = 117D.
-    # psichic_le sits between descriptors and PCA so StandardScaler normalises it
-    # alongside the other continuous features before the PCA block.
+    # §IIIIIIIIII: feature order is [276D desc] + [psichic_le] + [32D s-PCA]
+    #              + [16D z-PCA] = 325D (with both embeddings active).
+    # psichic_le sits between descriptors and PCA blocks so StandardScaler
+    # normalises it alongside other continuous features before the PCA blocks.
     # §MMMMMMMMMM: complex_iplddt used as surrogate weight only (not a feature).
     # §UUUUUUUUUU: complex_ipde used as surrogate weight only (not a feature).
     # §VVVVVVVVVV: iptm used as surrogate weight only (not a feature).
     zeros_emb = [0.0] * _N_EMB_COMPONENTS
+    zeros_zemb = [0.0] * _N_ZEMB_COMPONENTS  # §HHHHHHHHHHHH: z zero-pad
     X, y_apb, y_apv, weights = [], [], [], []
     for smiles, apb, apv, lig_iptm, le_std, ww_std, conf_score, psichic_le, iplddt, ipde, iptm in rows:
         vec = _descriptor_vector(smiles)
         if vec is None:
             continue
-        vec = vec + [float(psichic_le)]  # §IIIIIIIIII: 85D descriptor+psichic block
+        vec = vec + [float(psichic_le)]  # §IIIIIIIIII: 277D descriptor+psichic block
         if has_emb:
             emb_feat = emb_dict.get(smiles)
             vec = vec + (list(emb_feat) if emb_feat is not None else zeros_emb)
+        # §HHHHHHHHHHHH: append z interface embedding PCA components.
+        if has_zemb:
+            zemb_feat = zemb_dict.get(smiles)
+            vec = vec + (list(zemb_feat) if zemb_feat is not None else zeros_zemb)
         X.append(vec)
         y_apb.append(float(apb))
         y_apv.append(float(apv))
@@ -925,7 +999,7 @@ def fit_dual_surrogate_with_embeddings(db_path: str, protein: str, min_points: i
         model_apb.fit(X, y_apb, model__sample_weight=_w)
         model_apv = _make_pipeline(len(X))
         model_apv.fit(X, y_apv, model__sample_weight=_w)
-        return (model_apb, model_apv, emb_pca, emb_dict)
+        return (model_apb, model_apv, emb_pca, emb_dict, (z_pca, zemb_dict))  # §HHHHHHHHHHHH
     except Exception:
         return None
 
@@ -941,20 +1015,27 @@ def dual_surrogate_ucb_rank_pool_emb(
 ):
     """§HHHHHHHHHH: UCB ranking using the embedding-augmented dual surrogate.
 
-    emb_result is the (model_apb, model_apv, emb_pca, emb_dict) tuple from
-    fit_dual_surrogate_with_embeddings().  Pool molecules not in emb_dict get
-    zero-padded PCA components (neutral prior).  Falls back to plain mean ranking
-    when RF variance is unavailable (Ridge tier or error).
+    emb_result is the (model_apb, model_apv, emb_pca, emb_dict, z_info) 5-tuple
+    from fit_dual_surrogate_with_embeddings().  Pool molecules not in emb_dict or
+    zemb_dict get zero-padded PCA components (neutral prior).  Falls back to plain
+    mean ranking when RF variance is unavailable (Ridge tier or error).
 
     §KKKKKKKKKK: When gamma > 0 and embeddings are available, a cosine-distance
     bonus from the centroid of already-scored molecules is added to the UCB score,
     rewarding candidates that occupy unexplored binding-pose space.
+    §HHHHHHHHHHHH: z interface pair-representation features appended when available.
     """
     if emb_result is None:
         return pool_df
 
-    model_apb, model_apv, emb_pca, emb_dict = emb_result
+    if len(emb_result) == 5:
+        model_apb, model_apv, emb_pca, emb_dict, z_info = emb_result
+        z_pca, zemb_dict = z_info if z_info else (None, {})
+    else:
+        model_apb, model_apv, emb_pca, emb_dict = emb_result
+        z_pca, zemb_dict = None, {}
     has_emb = emb_pca is not None
+    has_zemb = z_pca is not None  # §HHHHHHHHHHHH
 
     try:
         from sklearn.ensemble import RandomForestRegressor
@@ -970,24 +1051,23 @@ def dual_surrogate_ucb_rank_pool_emb(
         if n_valid < max(1, len(pool_df) * 0.5):
             return pool_df
 
-        # §IIIIIIIIII: feature order [84D] + [psichic_le] + [32D PCA] = 117D.
+        # §IIIIIIIIII/§HHHHHHHHHHHH: feature order
+        #   [276D desc] + [psichic_le] + [32D s-PCA] + [16D z-PCA] = 325D max.
         zeros_desc = [0.0] * _N_FEATURES
         zeros_emb = [0.0] * _N_EMB_COMPONENTS
+        zeros_zemb = [0.0] * _N_ZEMB_COMPONENTS  # §HHHHHHHHHHHH
         psichic_le_vals = (
             pool_df[psichic_le_col].fillna(0.0).values.astype(float)
             if psichic_le_col in pool_df.columns else np.zeros(len(pool_df))
         )
-        if has_emb:
-            X = [
-                (d if d is not None else zeros_desc) + [float(pl)] +
-                list(emb_dict.get(s, np.zeros(_N_EMB_COMPONENTS, dtype=np.float32)))
-                for d, s, pl in zip(desc_vecs, smiles_list, psichic_le_vals)
-            ]
-        else:
-            X = [
-                (d if d is not None else zeros_desc) + [float(pl)]
-                for d, pl in zip(desc_vecs, psichic_le_vals)
-            ]
+        X = []
+        for d, s, pl in zip(desc_vecs, smiles_list, psichic_le_vals):
+            row = (d if d is not None else zeros_desc) + [float(pl)]
+            if has_emb:
+                row = row + list(emb_dict.get(s, np.zeros(_N_EMB_COMPONENTS, dtype=np.float32)))
+            if has_zemb:
+                row = row + list(zemb_dict.get(s, np.zeros(_N_ZEMB_COMPONENTS, dtype=np.float32)))
+            X.append(row)
 
         if ha_col in pool_df.columns:
             ha_vals = pool_df[ha_col].fillna(25).values.astype(float)

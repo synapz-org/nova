@@ -172,6 +172,34 @@ def upload_boltz_cache_export(db_path: str, protein: str) -> bool:
         except Exception:
             pass
 
+        # §HHHHHHHHHHHH: Export top-20 z interface embedding blobs (d_z-D float32).
+        # Typically 128D = 512 bytes each; 20 vectors ≈ 10 KB raw, ~3 KB compressed.
+        # Imported at restart to warm-start the z-augmented surrogate alongside §PPPPPPPPPP.
+        z_embeddings = []
+        try:
+            import numpy as _np_zemb
+            c.execute(
+                "SELECT smiles, boltz_z_embedding FROM boltz_cache "
+                "WHERE protein=? AND boltz_z_embedding IS NOT NULL "
+                "ORDER BY score DESC LIMIT 20",
+                (protein,),
+            )
+            for _zsm, _zblob in c.fetchall():
+                if not _zblob:
+                    continue
+                try:
+                    _za = _np_zemb.frombuffer(_zblob, dtype=_np_zemb.float32)
+                    if _za.ndim == 1 and _za.shape[0] > 0:
+                        z_embeddings.append({
+                            "smiles": _zsm,
+                            "zemb_b64": base64.b64encode(_zblob).decode(),
+                            "d_z": int(_za.shape[0]),
+                        })
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
         conn.close()
 
         export = {
@@ -180,7 +208,8 @@ def upload_boltz_cache_export(db_path: str, protein: str) -> bool:
             "entries": entries,
             "state": state_out,
             "history": history,
-            "embeddings": embeddings,  # §PPPPPPPPPP
+            "embeddings": embeddings,     # §PPPPPPPPPP
+            "z_embeddings": z_embeddings,  # §HHHHHHHHHHHH
         }
         # §EEEEEEEEEE: gzip-compress JSON before base64 encoding.
         # JSON is highly compressible (~65-75% reduction); 1000 entries compress to

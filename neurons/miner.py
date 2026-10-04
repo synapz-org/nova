@@ -101,6 +101,11 @@ def _init_boltz_cache_db(db_path: str) -> None:
             # protein-conditioned PCA-augmented RF surrogate that captures binding
             # complementarity beyond Morgan fingerprint topology.
             "ALTER TABLE boltz_cache ADD COLUMN boltz_embedding BLOB",
+            # §HHHHHHHHHHHH: store mean-pooled Boltz-2 pair-representation interface
+            # embedding (d_z-D float32, typically 128D).  Extracted from z[-n_lig:, :n_prot, :]
+            # at full-quality run time; complements boltz_embedding (s-based per-token) with
+            # pairwise protein-ligand interaction information from the evoformer pair stack.
+            "ALTER TABLE boltz_cache ADD COLUMN boltz_z_embedding BLOB",
             # §IIIIIIIIII: store PSICHIC ligand-efficiency score (combined_score =
             # (target_affinity - weight*antitarget_affinity) / heavy_atoms) recorded
             # at Boltz call time.  Used as an extra surrogate training feature so the
@@ -204,6 +209,7 @@ def _disk_cache_put(
     boltz_le_std: Optional[float] = None,
     confidence_score: Optional[float] = None,
     boltz_embedding: Optional[bytes] = None,
+    boltz_z_embedding: Optional[bytes] = None,
     psichic_le: Optional[float] = None,
     complex_iplddt: Optional[float] = None,
     complex_ipde: Optional[float] = None,
@@ -244,11 +250,12 @@ def _disk_cache_put(
                 "INSERT OR REPLACE INTO boltz_cache "
                 "(smiles, protein, score, product_name, affinity_prob_binary, "
                 "affinity_pred_val, ligand_iptm, boltz_le_std, confidence_score, "
-                "boltz_embedding, psichic_le, complex_iplddt, complex_ipde, iptm, fast_le) "
-                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                "boltz_embedding, boltz_z_embedding, psichic_le, complex_iplddt, "
+                "complex_ipde, iptm, fast_le) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (smiles, protein, score, product_name, apb, apv, ligand_iptm,
-                 boltz_le_std, confidence_score, boltz_embedding, psichic_le,
-                 complex_iplddt, complex_ipde, iptm, fast_le),
+                 boltz_le_std, confidence_score, boltz_embedding, boltz_z_embedding,
+                 psichic_le, complex_iplddt, complex_ipde, iptm, fast_le),
             )
     except Exception:
         pass
@@ -257,6 +264,15 @@ def _disk_cache_put(
 def _emb_to_bytes(comps: dict) -> Optional[bytes]:
     """§HHHHHHHHHH: Extract embedding bytes from per_molecule_components dict for cache storage."""
     emb = comps.get('boltz_embedding')
+    try:
+        return emb.tobytes() if emb is not None else None
+    except Exception:
+        return None
+
+
+def _z_emb_to_bytes(comps: dict) -> Optional[bytes]:
+    """§HHHHHHHHHHHH: Extract z interface embedding bytes for cache storage."""
+    emb = comps.get('boltz_z_embedding')
     try:
         return emb.tobytes() if emb is not None else None
     except Exception:
@@ -2615,6 +2631,7 @@ async def run_boltz_prescoring(state: Dict[str, Any], max_candidates: int = 5) -
                         boltz_le_std=_wwwwwww_le_std,
                         confidence_score=_fffff_cs if isinstance(_fffff_cs, (int, float)) else None,
                         boltz_embedding=_emb_to_bytes(_comps),
+                        boltz_z_embedding=_z_emb_to_bytes(_comps),  # §HHHHHHHHHHHH
                         psichic_le=_psichic_le_map.get(canon),  # §IIIIIIIIII
                         complex_iplddt=_mmm_ci if isinstance(_mmm_ci, (int, float)) else None,  # §MMMMMMMMMM
                         complex_ipde=_uuu_ipde if isinstance(_uuu_ipde, (int, float)) else None,  # §UUUUUUUUUU
@@ -2843,6 +2860,7 @@ async def run_boltz_prescoring(state: Dict[str, Any], max_candidates: int = 5) -
                                         boltz_le_std=_compute_le_std(_ff_comps),
                                         confidence_score=_ff_cs if isinstance(_ff_cs, (int, float)) else None,
                                         boltz_embedding=_emb_to_bytes(_ff_comps),
+                                        boltz_z_embedding=_z_emb_to_bytes(_ff_comps),  # §HHHHHHHHHHHH
                                         psichic_le=_ff_ple,  # §IIIIIIIIII
                                         complex_iplddt=_ff_ci if isinstance(_ff_ci, (int, float)) else None,  # §MMMMMMMMMM
                                         complex_ipde=_ff_ipde if isinstance(_ff_ipde, (int, float)) else None,  # §UUUUUUUUUU
@@ -3288,6 +3306,7 @@ async def run_boltz_prescoring(state: Dict[str, Any], max_candidates: int = 5) -
                                     boltz_le_std=_compute_le_std(_mm_comps),
                                     confidence_score=_mm_cs if isinstance(_mm_cs, (int, float)) else None,
                                     boltz_embedding=_emb_to_bytes(_mm_comps),
+                                    boltz_z_embedding=_z_emb_to_bytes(_mm_comps),  # §HHHHHHHHHHHH
                                     psichic_le=_mm_ple,  # §IIIIIIIIII
                                     complex_iplddt=_mm_ci if isinstance(_mm_ci, (int, float)) else None,  # §MMMMMMMMMM
                                     complex_ipde=_mm_ipde if isinstance(_mm_ipde, (int, float)) else None,  # §UUUUUUUUUU
@@ -3718,6 +3737,7 @@ async def run_boltz_prescoring(state: Dict[str, Any], max_candidates: int = 5) -
                                                     _xx_cs, (int, float)
                                                 ) else None,
                                                 boltz_embedding=_emb_to_bytes(_xx_comps),
+                                                boltz_z_embedding=_z_emb_to_bytes(_xx_comps),  # §HHHHHHHHHHHH
                                                 psichic_le=None,  # §IIIIIIIIII: tautomer
                                                 complex_iplddt=_xx_ci if isinstance(_xx_ci, (int, float)) else None,  # §MMMMMMMMMM
                                                 complex_ipde=_xx_ipde if isinstance(_xx_ipde, (int, float)) else None,  # §UUUUUUUUUU
@@ -3991,6 +4011,7 @@ async def run_boltz_prescoring(state: Dict[str, Any], max_candidates: int = 5) -
                                         _tt_cs, (int, float)
                                     ) else None,
                                     boltz_embedding=_emb_to_bytes(_tt_comps),
+                                    boltz_z_embedding=_z_emb_to_bytes(_tt_comps),  # §HHHHHHHHHHHH
                                     psichic_le=None,  # §IIIIIIIIII: tautomer
                                     complex_iplddt=_tt_ci if isinstance(_tt_ci, (int, float)) else None,  # §MMMMMMMMMM
                                     complex_ipde=_tt_ipde if isinstance(_tt_ipde, (int, float)) else None,  # §UUUUUUUUUU
@@ -4687,6 +4708,35 @@ async def run_miner(config: argparse.Namespace) -> None:
                         bt.logging.info(
                             f"[§PPPPPPPPPP] Imported {_pppppppppp_n} Boltz-2 embedding(s) from "
                             f"GitHub export — embedding surrogate warm-start enabled."
+                        )
+                # §HHHHHHHHHHHH: Import z interface embedding blobs from GitHub export.
+                _hhhhhhhhhhhh_zembs = _pppppp_data.get('z_embeddings', [])
+                if _hhhhhhhhhhhh_zembs:
+                    _hhhhhhhhhhhh_n = 0
+                    with sqlite3.connect(state['boltz_cache_db']) as _zpe_conn:
+                        for _zpe in _hhhhhhhhhhhh_zembs:
+                            try:
+                                _zpe_sm = _zpe.get('smiles', '')
+                                _zpe_b64 = _zpe.get('zemb_b64', '')
+                                _zpe_dz = int(_zpe.get('d_z', 0))
+                                if not _zpe_sm or not _zpe_b64 or _zpe_dz <= 0:
+                                    continue
+                                _zpe_blob = base64.b64decode(_zpe_b64)
+                                if len(_zpe_blob) != _zpe_dz * 4:
+                                    continue
+                                _zpe_conn.execute(
+                                    "UPDATE boltz_cache SET boltz_z_embedding=? "
+                                    "WHERE smiles=? AND protein=? "
+                                    "AND boltz_z_embedding IS NULL",
+                                    (_zpe_blob, _zpe_sm, config.weekly_target),
+                                )
+                                _hhhhhhhhhhhh_n += 1
+                            except Exception:
+                                pass
+                    if _hhhhhhhhhhhh_n:
+                        bt.logging.info(
+                            f"[§HHHHHHHHHHHH] Imported {_hhhhhhhhhhhh_n} z-embedding(s) from "
+                            f"GitHub export — z-surrogate warm-start enabled."
                         )
             # §RRRRRR: Import cross-target history regardless of protein match.
             # On fresh container + protein rotation, §WWWWW found nothing (empty SQLite).

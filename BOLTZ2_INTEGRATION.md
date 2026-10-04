@@ -1,14 +1,101 @@
 # Boltz-2 Miner Integration
 
-## Current Status (as of 2026-10-03)
+## Current Status (as of 2026-10-04)
 
-**77 roadmap items implemented; 0 proposed.** §GGGGGGGGGGGG (freed-round reallocation from §EEEEEEEEEEEE to next §YYYYYYYYYYYY seed) implemented 2026-10-03. §EEEEEEEEEEEE (§MM diminishing-returns early exit) and §FFFFFFFFFFFFFFFF (GradientBoosting surrogate 3rd tier) implemented 2026-10-02. §BBBBBBBBBBBB/§CCCCCCCCCCCC/§DDDDDDDDDDDD implemented 2026-09-07.
+**78 roadmap items implemented; 0 proposed.** §HHHHHHHHHHHH (Boltz-2 z-matrix interface embedding for surrogate) implemented 2026-10-04. §GGGGGGGGGGGG (freed-round reallocation from §EEEEEEEEEEEE to next §YYYYYYYYYYYY seed) implemented 2026-10-03. §EEEEEEEEEEEE (§MM diminishing-returns early exit) and §FFFFFFFFFFFFFFFF (GradientBoosting surrogate 3rd tier) implemented 2026-10-02.
 
 **No open proposals.**
 
 ---
 
 ## Recently Implemented Optimisations (latest first)
+
+### §HHHHHHHHHHHH — Boltz-2 Pair-Representation Interface Embedding for Surrogate — implemented 2026-10-04
+
+**Problem:**
+
+The §HHHHHHHHHH embedding surrogate uses the evoformer **single representation** `s`
+(shape: N_tokens × 384).  Mean-pooling the ligand chain rows gives a 384D vector
+capturing per-token identity, but discards all pairwise interaction information.
+Boltz-2 also writes the **pair representation** `z` (shape: N_tokens × N_tokens × d_z,
+typically d_z=128) to every `embeddings_{mol_idx}.npz` file when `write_embeddings=True`.
+The z matrix encodes how each pair of tokens interacts in the evoformer attention —
+it is the primary carrier of protein–ligand complementarity information in the
+model.  The ligand-to-protein submatrix `z[-n_lig:, :n_prot, :]` (shape:
+n_lig × n_prot × d_z) specifically captures the interface interaction quality: which
+ligand atoms are near which protein residues, and how strongly they interact in the
+evoformer's learned representation space.  This information is complementary to `s`
+(which is per-token) and is not captured by any existing surrogate feature (Morgan FP,
+physicochemical descriptors, PSICHIC score, or s-embedding).
+
+**Fix:**
+
+1. **`boltz/wrapper.py` `postprocess_data()`** — when loading the embeddings NPZ,
+   also load `z` and extract the ligand-protein interface mean inline:
+   ```python
+   _z_full = _emb_npz['z']           # (N, N, d_z)
+   _n_lig_z = get_heavy_atom_count(smiles)
+   _n_prot_z = _z_full.shape[0] - _n_lig_z
+   _z_iface = _z_full[-_n_lig_z:, :_n_prot_z, :]  # (n_lig, n_prot, d_z)
+   scores[mol_idx]['_z_emb'] = _z_iface.mean(axis=(0, 1)).astype(np.float32)
+   del _z_full  # free immediately; only 128D mean retained
+   ```
+   Store the 128D vector in `per_molecule_components[uid][smiles]['boltz_z_embedding']`.
+
+2. **`neurons/miner.py`** — add `boltz_z_embedding BLOB` column to `boltz_cache` via
+   `ALTER TABLE` migration; add `_z_emb_to_bytes()` helper; add `boltz_z_embedding`
+   parameter to `_disk_cache_put()` and its INSERT query; update 5 full-quality
+   `_disk_cache_put` call sites (main pass, §FF, §MM, §XX, §TTTTTTTTTT).
+   Also import z embeddings from GitHub export at startup.
+
+3. **`utils/surrogate.py`** — add `_N_ZEMB_COMPONENTS = 16` and
+   `_load_z_embeddings_from_cache()` (analogous to `_load_embeddings_from_cache()`);
+   update `fit_dual_surrogate_with_embeddings()` to load z PCA and append 16D z
+   components after the 32D s components in the feature vector, extending the
+   maximum feature dimensionality from 309D → 325D.  Return value extended from
+   4-tuple to 5-tuple `(model_apb, model_apv, emb_pca, emb_dict, (z_pca, zemb_dict))`;
+   `dual_surrogate_ucb_rank_pool_emb()` unpacks the 5-tuple with a len-check for
+   backward compatibility.
+
+4. **`utils/github.py`** — export top-20 z embedding blobs (128D × 4 bytes = 512 B
+   each; ≈10 KB raw, ~3 KB compressed) in the gzip export alongside `boltz_embedding`.
+   Import them at startup via `boltz_z_embedding` UPDATE just like §PPPPPPPPPP.
+
+**Guards:**
+
+- z extraction uses a `try/except` around every step and silently skips on any
+  failure (missing key, shape mismatch, SMILES parse failure).
+- `del _z_full` immediately after mean-pooling: the large (N² × d_z) array is freed
+  without entering any cache dict.  For a 320-token complex this avoids retaining
+  ~52 MB per molecule while postprocess_data iterates over the full batch.
+- `_load_z_embeddings_from_cache()` enforces consistent `d_z` across all rows and
+  requires `_MIN_ZEMB_ROWS = 20` before fitting PCA (same as s embeddings).
+- `dual_surrogate_ucb_rank_pool_emb()` checks `len(emb_result) == 5` so old cached
+  4-tuples (from in-process surrogate state) still work without AttributeError.
+- Feature vector width is consistent between `fit_dual_surrogate_with_embeddings()`
+  (training) and `dual_surrogate_ucb_rank_pool_emb()` (inference): both append
+  `zeros_zemb` for pool molecules without a cached z embedding, so surrogate
+  predictions never see a mismatched feature dimension.
+
+**Expected gain:**
+
+The z interface embedding captures protein–ligand pairwise interaction quality in the
+evoformer representation space — information orthogonal to all existing features.
+Molecules that share similar Morgan FP topology but differ in their protein-interface
+interaction mode (e.g., same scaffold, different binding pocket orientation) now have
+distinguishable z features.  Expected gain: **+1-3% surrogate NDCG** at ≥20 z-embedding
+rows (week-1 to week-2+ runs), stacking with §HHHHHHHHHH (s embedding).  Largest
+impact when Boltz-2's pose predictions vary significantly across candidates (e.g., early
+epoch, diverse initial pool), since z directly encodes pose-level interaction quality.
+
+**Files changed:**
+- `boltz/wrapper.py`: ~30 lines (z extraction in NPZ loading + z_emb in components dict)
+- `neurons/miner.py`: ~55 lines (schema migration, helper, function sig + INSERT, 5 call sites, import)
+- `utils/surrogate.py`: ~80 lines (new loading function + training + inference updates)
+- `utils/github.py`: ~30 lines (export + z_embeddings key)
+- `BOLTZ2_INTEGRATION.md`: this entry
+
+---
 
 ### §GGGGGGGGGGGG — §EEEEEEEEEEEE Freed-Round Reallocation to Next §YYYYYYYYYYYY Seed — implemented 2026-10-03
 

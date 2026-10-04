@@ -451,10 +451,31 @@ properties:
                         scores[mol_idx].update(confidence_data)
                     elif filepath.startswith('embeddings') and filepath.endswith('.npz'):
                         # §HHHHHHHHHH: load trunk single-representation for ligand embedding.
+                        # §HHHHHHHHHHHH: also extract ligand-protein interface z embedding.
                         # The file is only written for full-quality runs (write_embeddings=True).
                         try:
                             _emb_npz = np.load(os.path.join(results_path, filepath))
                             scores[mol_idx]['_s_arr'] = _emb_npz['s']
+                            # §HHHHHHHHHHHH: extract ligand-to-protein interface z embedding.
+                            # z shape: (N_tokens, N_tokens, d_z).  Ligand tokens are the last
+                            # n_lig rows/cols (chain B, 1 token per heavy atom).  Mean-pool the
+                            # ligand-to-protein submatrix z[-n_lig:, :n_prot, :] to a d_z-D
+                            # vector capturing pairwise interface interaction quality.
+                            # Extraction is inline to avoid retaining the large (N²×d_z) array.
+                            if 'z' in _emb_npz:
+                                try:
+                                    _z_full = _emb_npz['z']  # (N, N, d_z)
+                                    _n_lig_z = get_heavy_atom_count(smiles)
+                                    if _n_lig_z and _n_lig_z > 0:
+                                        _n_prot_z = _z_full.shape[0] - _n_lig_z
+                                        if _n_prot_z > 0 and _z_full.ndim == 3:
+                                            _z_iface = _z_full[-_n_lig_z:, :_n_prot_z, :]
+                                            scores[mol_idx]['_z_emb'] = (
+                                                _z_iface.mean(axis=(0, 1)).astype(np.float32)
+                                            )
+                                    del _z_full
+                                except Exception:
+                                    pass
                         except Exception:
                             pass
                     elif filepath.endswith('.pdb') and '_model_0' in filepath:
@@ -582,6 +603,18 @@ properties:
                     except Exception:
                         pass
 
+                # §HHHHHHHHHHHH: mean-pooled ligand-protein interface pair representation.
+                # _z_emb is the d_z-D mean of z[-n_lig:, :n_prot, :] extracted at load time.
+                # Only available for full-quality runs with enough protein/ligand tokens.
+                boltz_z_embedding = None
+                _z_emb = mol_scores.get('_z_emb')
+                if _z_emb is not None:
+                    try:
+                        if _z_emb.ndim == 1 and _z_emb.shape[0] > 0:
+                            boltz_z_embedding = _z_emb
+                    except Exception:
+                        pass
+
                 if uid not in self.per_molecule_components:
                     self.per_molecule_components[uid] = {}
                 self.per_molecule_components[uid][smiles] = {
@@ -604,6 +637,7 @@ properties:
                     "pair_chains_iptm": pair_chains_iptm,
                     "heavy_atom_count": heavy_atom_count,
                     "boltz_embedding": boltz_embedding,
+                    "boltz_z_embedding": boltz_z_embedding,  # §HHHHHHHHHHHH
                 }
         bt.logging.debug(f"final_boltz_scores: {final_boltz_scores}")
 
