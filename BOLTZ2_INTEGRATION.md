@@ -1,10 +1,199 @@
 # Boltz-2 Miner Integration
 
-## Current Status (as of 2026-10-04)
+## Current Status (as of 2026-10-07)
 
-**78 roadmap items implemented; 0 proposed.** §HHHHHHHHHHHH (Boltz-2 z-matrix interface embedding for surrogate) implemented 2026-10-04. §GGGGGGGGGGGG (freed-round reallocation from §EEEEEEEEEEEE to next §YYYYYYYYYYYY seed) implemented 2026-10-03. §EEEEEEEEEEEE (§MM diminishing-returns early exit) and §FFFFFFFFFFFFFFFF (GradientBoosting surrogate 3rd tier) implemented 2026-10-02.
+**78 roadmap items implemented; 2 proposed.** §HHHHHHHHHHHH (Boltz-2 z-matrix interface embedding for surrogate) implemented 2026-10-04. §GGGGGGGGGGGG (freed-round reallocation from §EEEEEEEEEEEE to next §YYYYYYYYYYYY seed) implemented 2026-10-03. §EEEEEEEEEEEE (§MM diminishing-returns early exit) and §FFFFFFFFFFFFFFFF (GradientBoosting surrogate 3rd tier) implemented 2026-10-02.
 
-**No open proposals.**
+**Open proposals: §IIIIIIIIIIII (ring-closure SALSA operator), §JJJJJJJJJJJJ (step-scale temperature ensemble for final submission).**
+
+---
+
+## Proposed Next Optimisations (2026-10-07)
+
+### §IIIIIIIIIIII — Ring-Closure SALSA Operator for HAC Reduction
+
+**Problem:**
+
+The SALSA perturbation operator set has five operators: bioisostere, fg_add, terminal_remove,
+ring_walk, scaffold_hop (expanded to full-coverage in §PP). The `ring_walk` operator changes the
+*size* of an existing ring by ±1 member; `scaffold_hop` replaces an existing ring with a different
+ring system. Neither operator can *form* a new ring from two open-chain functional groups on the
+same molecule.
+
+Ring closure (intramolecular cyclization) is a standard medicinal chemistry optimisation step:
+connecting two pendant groups (NH₂+COOH → lactam, OH+COOH → lactone, NH₂+CHO → imine/ring,
+OH+ketone → hemiketal ring) into a 5- or 6-membered ring simultaneously:
+
+1. Eliminates rotatable bonds (improves conformational pre-organisation for binding)
+2. Reduces HAC by 0–2 (water or small group lost in the cyclisation; direct benefit to the LE
+   formula denominator)
+3. Accesses scaffold-diverse ring systems beyond the SALSA neighbourhood of the seed molecule
+
+The LE scoring formula `(APB − APV) / HAC` directly rewards lower HAC. A molecule with HAC=28
+scoring 0.52 raw would score 0.60 after a ring-closure that reduces HAC to 24 while maintaining
+the same raw affinity terms — a **15% LE improvement without any affinity change**.
+
+**Fix:**
+
+Add a `ring_close_variants(mol)` operator to `utils/salsa.py`:
+
+```python
+from rdkit import Chem
+from rdkit.Chem import AllChem, rdMolDescriptors
+
+_RINGCLOSE_PAIRS = [
+    # (donor SMARTS, acceptor SMARTS, new_ring_smarts, ring_size)
+    ('[NH2]', '[CX3](=O)[OH]',  'lactam-5',  5),   # NH2 + COOH → lactam
+    ('[OH]',  '[CX3](=O)[OH]',  'lactone-5', 5),   # OH + COOH → lactone
+    ('[NH2]', '[CX3H1]=O',      'imine-5',   5),   # NH2 + CHO → dihydroisoxazole
+]
+
+def ring_close_variants(mol: Chem.Mol) -> list[Chem.Mol]:
+    """Attempt intramolecular cyclisation between reactive group pairs."""
+    variants = []
+    for donor_smarts, acceptor_smarts, _, ring_size in _RINGCLOSE_PAIRS:
+        donor_pat  = Chem.MolFromSmarts(donor_smarts)
+        accept_pat = Chem.MolFromSmarts(acceptor_smarts)
+        donors    = mol.GetSubstructMatches(donor_pat)
+        acceptors = mol.GetSubstructMatches(accept_pat)
+        for d_idx_tuple in donors:
+            for a_idx_tuple in acceptors:
+                d_atom = d_idx_tuple[0]
+                a_atom = a_idx_tuple[0]
+                # Check that the two groups are 3–5 bonds apart for ring_size 5/6
+                try:
+                    path_len = len(Chem.GetShortestPath(mol, d_atom, a_atom)) - 1
+                    if path_len < 2 or path_len > ring_size - 1:
+                        continue
+                    rw = Chem.RWMol(mol)
+                    rw.AddBond(d_atom, a_atom, Chem.BondType.SINGLE)
+                    Chem.SanitizeMol(rw)
+                    candidate = rw.GetMol()
+                    if rdMolDescriptors.CalcNumRings(candidate) > rdMolDescriptors.CalcNumRings(mol) + 1:
+                        continue  # avoid fused ring explosion
+                    variants.append(candidate)
+                except Exception:
+                    pass
+    return variants
+```
+
+Integration into `run_salsa_search()`:
+- Add `'ring_close'` to the operator list alongside existing 5 operators
+- Wire into §OOOO bandit weighting (1 new win counter)
+- Apply `is_boltz_safe_smiles` + HAC ≤ limit filter to all ring-closed candidates (same as other operators)
+- §ZZZZZ HA-adaptive budget counts ring_close under the same `n_perturb` budget
+
+**Regression guards:**
+- `try/except` on every ring closure attempt (path calculation and bond addition both raise on unusual valence)
+- Path-length guard `2 ≤ path_len ≤ ring_size − 1` prevents closure across the whole molecule (macrocyclisation is out of scope)
+- Ring-count guard prevents fused-ring explosion from double bond-adds
+- No new imports needed (rdkit.Chem.rdMolDescriptors already imported in utils/salsa.py)
+
+**Estimated implementation effort:** ~55 lines in `utils/salsa.py` + §OOOO counter extension (~6 lines in `neurons/miner.py`).
+
+**Expected gain:**
+
+| Scenario | Expected Boltz LE gain |
+|----------|------------------------|
+| Seed molecule has cyclisable NH₂+COOH or OH+COOH pair | +10–18% LE from HAC reduction (direct formula gain) |
+| Ring closure also improves binding pose rigidity | +APB/−APV gain on top of HAC reduction |
+| No cyclisable pair present in seed | Zero regression; ring_close fires 0 variants |
+| §OOOO bandit penalises ring_close after 0 wins | Budget allocation shifted back to productive operators |
+
+Overall: **+2–4% Boltz LE** on epochs where the top seed molecule has cyclisable groups (estimated ~25% of targets); zero regression otherwise. Highest impact on molecules generated by fg_add that introduce COOH/NH₂ groups at accessible positions.
+
+---
+
+### §JJJJJJJJJJJJ — Step-Scale Temperature Ensemble for Final Submission Validation
+
+**Problem:**
+
+§WW runs the final top-2 epoch candidates at 3 random seeds (42, 68, 123) and averages their
+ligand-efficiency scores to detect high-variance single-seed outliers. The `step_scale` parameter
+of Boltz-2's diffusion process is a *different* axis of sampling stochasticity: it controls the
+physical "temperature" of the diffusion trajectory (step_scale < 1.0 → conservative/low-energy
+sampling; step_scale > 1.0 → exploratory/high-entropy sampling). Varying seed samples different
+starting noise; varying step_scale changes the energy landscape being sampled.
+
+Current miner: step_scale is always `None` (default = 1.0) for all Boltz-2 calls, including the
+§WW final-validation calls. This means every stability estimate uses the same sampling temperature,
+potentially missing cases where:
+- Default step_scale=1.0 happens to land in a favourable local minimum (over-optimistic score)
+- A lower step_scale=0.7 (conservative) gives a more reproducible binding mode
+- The gap between step_scale variants is large → the molecule's binding is temperature-sensitive
+  and the score is likely a diffusion artefact
+
+**Fix:**
+
+After §WW selects the final submission SMILES and before epoch-end commit, fire 2 additional
+full-quality Boltz-2 calls at `step_scale=0.7` and `step_scale=1.3`:
+
+```python
+# §JJJJJJJJJJJJ: step-scale temperature ensemble
+# Gate: only fire when remaining epoch time > 2 × last_inference_duration
+if (_time_until_epoch_end() > 2 * boltz_wrapper.last_inference_duration
+        and _jjjjjjjjjjjj_std_budget_remaining(state)):
+    _ts_scores = []
+    for _ts in [0.7, 1.3]:
+        _ts_result = boltz_wrapper.score_molecules_target(
+            {0: {'smiles': [_final_smiles]}}, ...,
+            step_scale=_ts, fast=False, seed=68
+        )
+        if _ts_result is not None:
+            _ts_scores.append(_ts_result.get('boltz_le', None))
+    if len(_ts_scores) >= 1:
+        _base_le = state['epoch_best_le']
+        _all_les = [_base_le] + [s for s in _ts_scores if s is not None]
+        boltz_ts_std = float(np.std(_all_les))
+        _disk_cache_put(db_path, _final_smiles, protein,
+                        boltz_ts_std=boltz_ts_std, ...)
+        # Reliability-adjusted final LE
+        _ts_adjusted_le = _base_le / (1 + 5 * boltz_ts_std)
+        if _ts_adjusted_le < state['epoch_second_best_le']:
+            # Temperature ensemble reveals the top candidate is a fluke
+            # → prefer the #2 molecule instead
+            state['submission_smiles'] = state['epoch_second_best_smiles']
+            bt.logging.warning(
+                f"[§JJJJJJJJJJJJ] Temperature ensemble overrides top-1 submission "
+                f"(ts_std={boltz_ts_std:.3f}, adjusted LE {_ts_adjusted_le:.3f} < "
+                f"#2 LE {state['epoch_second_best_le']:.3f})"
+            )
+```
+
+Add `boltz_ts_std REAL` column to SQLite `boltz_cache` via the existing ALTER TABLE migration block.
+Export/import via GitHub cache alongside `boltz_ww_std` (same gzip JSON key).
+Add `/ (1 + 5 × boltz_ts_std)` factor to the surrogate training weight formula (§DDDDDD chain).
+
+**Design decisions:**
+- `step_scale` values 0.7 and 1.3 are ±30% of the default, spanning a meaningful temperature range
+  without going to extremes (< 0.5 collapses diversity; > 2.0 loses coherent binding modes)
+- Gate `_time_until_epoch_end() > 2 × last_inference_duration` ensures the 2 extra calls finish
+  before epoch cutoff. On A100 (~80 s/call full), this fires only when > 160 s remain — typically
+  triggered after §MM completes on warm-cache epochs
+- Only fires for the top-1 candidate (not all §WW molecules) to minimise GPU cost
+- `1 + 5 × boltz_ts_std` reliability coefficient is slightly looser than the `1 + 10 × ww_std`
+  of §VVVVVVVVVVVV: temperature diversity is a different signal and 5× prevents overly aggressive
+  overrides on naturally temperature-sensitive but genuinely binding molecules
+
+**Regression guards:**
+- `try/except` on all extra Boltz calls; any failure leaves `_submission_smiles` unchanged
+- Gate prevents firing when epoch time is tight, protecting §MM rounds
+- `boltz_ts_std=None` default in SQLite → `COALESCE(boltz_ts_std, 0.0)` → no penalty for legacy rows
+- Override only fires when `_ts_adjusted_le < epoch_second_best_le`, not just when ts_std is high
+
+**Estimated implementation effort:** ~40 lines in `neurons/miner.py` (gate logic + extra Boltz calls + SQLite + surrogate weight extension) + 2 lines in `utils/github.py` (export `boltz_ts_std`).
+
+**Expected gain:**
+
+| Scenario | Before §JJJJJJJJJJJJ | After §JJJJJJJJJJJJ |
+|----------|----------------------|----------------------|
+| Top-1 stable across step_scales (ts_std < 0.01) | Submitted as-is | Submitted as-is + ts_std stored for surrogate |
+| Top-1 is a temperature fluke (ts_std > 0.03) | Potentially submit fluke score | Override to top-2 if more reliable |
+| Time budget too tight (< 2 × inference time) | N/A | Gate prevents firing; zero regression |
+
+Expected gain: **+1–3% Boltz LE** in final submitted score on epochs where the top candidate is
+temperature-sensitive (~10–20% of warm-cache epochs). Orthogonal to §WW (seed variance) and
+§WWWWWWWWWWWWWWW (intra-run sample variance). Stacks with §VVVVVVVVVVVV reliability scoring.
 
 ---
 
