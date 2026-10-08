@@ -26,7 +26,7 @@ from typing import List, Optional, Tuple
 
 import pandas as pd
 from rdkit import Chem
-from rdkit.Chem import AllChem, DataStructs
+from rdkit.Chem import AllChem, DataStructs, rdMolDescriptors
 
 logger = logging.getLogger(__name__)
 
@@ -131,6 +131,20 @@ def get_cached_pool_fps(
 # ---------------------------------------------------------------------------
 # Perturbation operators
 # ---------------------------------------------------------------------------
+
+# §IIIIIIIIIIII: Ring-closure probe patterns — (donor SMARTS, acceptor SMARTS, ring_size).
+# Used to form intramolecular rings between reactive group pairs in the seed molecule.
+# These are probe molecules for Tanimoto lookup only — never submitted directly.
+_RINGCLOSE_PAIRS = [
+    ('[NH2]', '[CX3](=O)[OH]', 5),   # NH2 + COOH → lactam-5
+    ('[OH]',  '[CX3](=O)[OH]', 5),   # OH  + COOH → lactone-5
+    ('[NH2]', '[CX3H1]=O',     5),   # NH2 + CHO  → imine/dihydroisoxazole-5
+]
+_RINGCLOSE_SMARTS = [
+    (Chem.MolFromSmarts(d), Chem.MolFromSmarts(a), rs)
+    for d, a, rs in _RINGCLOSE_PAIRS
+]
+
 def _fg_atoms_for_position(atom_idx: int, atom_contact_type: Optional[dict]) -> list:
     """§CCCCCCCCCCCC: Return the fg_add atom-number list biased by pharmacophore contact type.
 
@@ -244,7 +258,9 @@ def generate_perturbations(
     # §ZZZZZ: Per-operator budget allocation.
     # Default equal-weight split preserves original behaviour when caller
     # passes operator_weights=None.
-    _def_w = {'bioisostere': 1.0, 'fg_add': 1.0, 'terminal_remove': 1.0, 'ring_walk': 1.0}
+    # §IIIIIIIIIIII: ring_close added at 0.5 weight (fires only when reactive
+    # group pairs exist — zero cost when none found).
+    _def_w = {'bioisostere': 1.0, 'fg_add': 1.0, 'terminal_remove': 1.0, 'ring_walk': 1.0, 'ring_close': 0.5}
     if operator_weights:
         _w = {k: max(0.0, float(operator_weights.get(k, _def_w[k]))) for k in _def_w}
     else:
@@ -253,12 +269,14 @@ def generate_perturbations(
     _n_bio = max(2, round(n_max * _w['bioisostere'] / _tw))
     _n_fga = max(2, round(n_max * _w['fg_add'] / _tw))
     _n_ter = max(2, round(n_max * _w['terminal_remove'] / _tw))
-    _n_rng = max(2, n_max - _n_bio - _n_fga - _n_ter)
+    _n_rc  = max(2, round(n_max * _w['ring_close'] / _tw))
+    _n_rng = max(2, n_max - _n_bio - _n_fga - _n_ter - _n_rc)
 
     bio_res: List[str] = []
     fga_res: List[str] = []
     ter_res: List[str] = []
     rng_res: List[str] = []
+    rcl_res: List[str] = []
 
     # --- 1. Bioisosteric substitution ---
     # §ZZZZZZZZZZZZ: when atom_exposure is provided, prefer exposed atoms (higher weight).
@@ -419,6 +437,46 @@ def generate_perturbations(
             except Exception:
                 pass
 
+    # --- 5. Ring closure (intramolecular cyclisation) ---
+    # §IIIIIIIIIIII: Attempt to form a new ring between each pair of matching
+    # (donor, acceptor) atoms when they are 2–(ring_size−1) bonds apart.
+    # Adding the bond directly creates a probe ring system; SanitizeMol drops
+    # valence-invalid closures (e.g. carbonyl C already at 4 bonds).
+    # rdMolDescriptors.CalcNumRings guards against fused-ring explosion.
+    _n_rings_seed = rdMolDescriptors.CalcNumRings(mol)
+    for _donor_pat, _accept_pat, _rs in _RINGCLOSE_SMARTS:
+        if len(rcl_res) >= _n_rc:
+            break
+        if _donor_pat is None or _accept_pat is None:
+            continue
+        _donors    = mol.GetSubstructMatches(_donor_pat)
+        _acceptors = mol.GetSubstructMatches(_accept_pat)
+        for _d_tuple in _donors:
+            for _a_tuple in _acceptors:
+                if len(rcl_res) >= _n_rc:
+                    break
+                _d_atom = _d_tuple[0]
+                _a_atom = _a_tuple[0]
+                if _d_atom == _a_atom:
+                    continue
+                try:
+                    _path = Chem.GetShortestPath(mol, _d_atom, _a_atom)
+                    _path_len = len(_path) - 1
+                    if _path_len < 2 or _path_len > _rs - 1:
+                        continue
+                    rw = Chem.RWMol(mol)
+                    rw.AddBond(_d_atom, _a_atom, Chem.BondType.SINGLE)
+                    Chem.SanitizeMol(rw)
+                    _cand = rw.GetMol()
+                    if rdMolDescriptors.CalcNumRings(_cand) > _n_rings_seed + 1:
+                        continue  # avoid fused-ring explosion
+                    _canonical = Chem.MolToSmiles(_cand)
+                    if _canonical not in seen:
+                        seen.add(_canonical)
+                        rcl_res.append(_canonical)
+                except Exception:
+                    pass
+
     # §OOOO: tagged output for bandit operator tracking in §MM.
     if return_tags:
         return (
@@ -426,8 +484,9 @@ def generate_perturbations(
             + [('fg_add', s) for s in fga_res]
             + [('terminal_remove', s) for s in ter_res]
             + [('ring_walk', s) for s in rng_res]
+            + [('ring_close', s) for s in rcl_res]
         )
-    return bio_res + fga_res + ter_res + rng_res
+    return bio_res + fga_res + ter_res + rng_res + rcl_res
 
 
 # ---------------------------------------------------------------------------

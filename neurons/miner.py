@@ -1850,9 +1850,9 @@ def _salsa_operator_weights(seed_smiles: str, bandit_wins: dict | None = None) -
 
     # §ZZZZZ: HA-adaptive base weights
     if ha is not None and ha > 25:
-        w: dict | None = {'bioisostere': 1.0, 'fg_add': 0.5, 'terminal_remove': 2.5, 'ring_walk': 0.5}
+        w: dict | None = {'bioisostere': 1.0, 'fg_add': 0.5, 'terminal_remove': 2.5, 'ring_walk': 0.5, 'ring_close': 0.5}
     elif ha is not None and ha < 15:
-        w = {'bioisostere': 1.0, 'fg_add': 2.0, 'terminal_remove': 0.5, 'ring_walk': 1.0}
+        w = {'bioisostere': 1.0, 'fg_add': 2.0, 'terminal_remove': 0.5, 'ring_walk': 1.0, 'ring_close': 0.5}
     else:
         w = None  # 15 ≤ ha ≤ 25: equal weights (generate_perturbations default)
 
@@ -1861,7 +1861,7 @@ def _salsa_operator_weights(seed_smiles: str, bandit_wins: dict | None = None) -
         _total = sum(bandit_wins.values())
         if _total > 0:
             if w is None:
-                w = {'bioisostere': 1.0, 'fg_add': 1.0, 'terminal_remove': 1.0, 'ring_walk': 1.0}
+                w = {'bioisostere': 1.0, 'fg_add': 1.0, 'terminal_remove': 1.0, 'ring_walk': 1.0, 'ring_close': 0.5}
             for _op in w:
                 _frac = bandit_wins.get(_op, 0) / _total
                 w[_op] *= 1.0 + _frac  # range: 1× (0 wins) → 2× (all wins)
@@ -4578,7 +4578,7 @@ async def run_miner(config: argparse.Namespace) -> None:
         'bbb_run_this_epoch': False,           # §BBB: prevent duplicate post-GA SALSA runs per epoch
         'jj_probe_done': False,                # §JJJJJJJJJJ: cold-start probe flag
         'rrrrrrrrrrrr_done_this_epoch': False, # §RRRRRRRRRRRR: surrogate rxn-class weighting
-        'salsa_operator_wins': {'bioisostere': 0, 'fg_add': 0, 'terminal_remove': 0, 'ring_walk': 0},  # §OOOO
+        'salsa_operator_wins': {'bioisostere': 0, 'fg_add': 0, 'terminal_remove': 0, 'ring_walk': 0, 'ring_close': 0},  # §OOOO §IIIIIIIIIIII
         'best_ga_smiles': None,          # §BBB: best SMILES found by GradientGA this epoch
         'chembl_seeds': [],              # §SS: ChEMBL known actives, fetched at startup
         'startup_dual_surrogate': None,  # §YYYYYY: dual RF surrogate fitted at startup from GitHub cache
@@ -4839,7 +4839,7 @@ async def run_miner(config: argparse.Namespace) -> None:
     if _s12_raw:
         try:
             _s12_loaded = json.loads(_s12_raw)
-            _s12_keys = ('bioisostere', 'fg_add', 'terminal_remove', 'ring_walk')
+            _s12_keys = ('bioisostere', 'fg_add', 'terminal_remove', 'ring_walk', 'ring_close')
             _s12_wins = {k: max(0, int(_s12_loaded.get(k, 0))) for k in _s12_keys}
             _s12_total = sum(_s12_wins.values())
             if _s12_total > 0:
@@ -5099,7 +5099,7 @@ async def run_miner(config: argparse.Namespace) -> None:
                 # still allowing new evidence to dominate within a few §MM rounds.
                 _s12_prev_wins = state.get(
                     'salsa_operator_wins',
-                    {'bioisostere': 0, 'fg_add': 0, 'terminal_remove': 0, 'ring_walk': 0}
+                    {'bioisostere': 0, 'fg_add': 0, 'terminal_remove': 0, 'ring_walk': 0, 'ring_close': 0}
                 )
                 state['salsa_operator_wins'] = {
                     k: max(0, v // 2)
