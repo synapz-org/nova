@@ -139,6 +139,11 @@ def _init_boltz_cache_db(db_path: str) -> None:
             # correction so the §MM acceptance gate compares fast scores in fast-score space
             # rather than against the full-quality best (which has a systematic positive bias).
             "ALTER TABLE boltz_cache ADD COLUMN fast_le REAL",
+            # §JJJJJJJJJJJJ: store std of LE across step_scale temperature variants 0.7/1.3.
+            # High ts_std → temperature-sensitive diffusion artefact → down-weight in surrogate
+            # training and potentially override submission to the more reliable #2 candidate.
+            # NULL for legacy rows → COALESCE 0.0 → no penalty.
+            "ALTER TABLE boltz_cache ADD COLUMN boltz_ts_std REAL",
         ):
             try:
                 conn.execute(_col_ddl)
@@ -215,6 +220,7 @@ def _disk_cache_put(
     complex_ipde: Optional[float] = None,
     iptm: Optional[float] = None,
     fast_le: Optional[float] = None,
+    boltz_ts_std: Optional[float] = None,
 ) -> None:
     """Upsert a Boltz score into the persistent cache (silently ignores errors).
 
@@ -243,6 +249,9 @@ def _disk_cache_put(
     §DDDDDDDDDDDD: fast_le is the fast-mode ligand-efficiency score recorded when a §MM
     fast-screened candidate advances to full-quality scoring.  Enables OLS calibration
     of the acceptance gate so fast scores are compared in fast-score space.
+    §JJJJJJJJJJJJ: boltz_ts_std is the std of LE across step_scale temperature variants
+    [0.7, 1.3]; high ts_std → temperature-sensitive artefact → surrogate down-weight
+    via / (1 + 5 × ts_std).  NULL → 0.0 → no penalty for legacy rows.
     """
     try:
         with sqlite3.connect(db_path) as conn:
@@ -251,11 +260,11 @@ def _disk_cache_put(
                 "(smiles, protein, score, product_name, affinity_prob_binary, "
                 "affinity_pred_val, ligand_iptm, boltz_le_std, confidence_score, "
                 "boltz_embedding, boltz_z_embedding, psichic_le, complex_iplddt, "
-                "complex_ipde, iptm, fast_le) "
-                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                "complex_ipde, iptm, fast_le, boltz_ts_std) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (smiles, protein, score, product_name, apb, apv, ligand_iptm,
                  boltz_le_std, confidence_score, boltz_embedding, boltz_z_embedding,
-                 psichic_le, complex_iplddt, complex_ipde, iptm, fast_le),
+                 psichic_le, complex_iplddt, complex_ipde, iptm, fast_le, boltz_ts_std),
             )
     except Exception:
         pass
@@ -4386,6 +4395,151 @@ async def run_boltz_prescoring(state: Dict[str, Any], max_candidates: int = 5) -
         except Exception as _uuuu_err:
             bt.logging.warning(
                 f"§UUUU antitarget selectivity check failed (non-fatal): {_uuuu_err}"
+            )
+
+    # §JJJJJJJJJJJJ — Step-Scale Temperature Ensemble for Final Submission Validation.
+    # Runs 2 extra full-quality Boltz-2 calls at step_scale=0.7 and step_scale=1.3 on
+    # the current top-1 submission candidate.  A high std across temperatures signals a
+    # diffusion artefact → prefer the #2 candidate when reliability-adjusted LE falls
+    # below the #2 raw LE.  Gate: only fires when > 2 × last_inference_duration remains.
+    _jjjj_valid = {s: v for s, v in all_scores.items() if math.isfinite(v)}
+    if len(_jjjj_valid) >= 2:
+        try:
+            _jjjj_blk = await state['subtensor'].get_current_block()
+            _jjjj_ep = ((_jjjj_blk // state['epoch_length']) + 1) * state['epoch_length']
+            _jjjj_remaining = (_jjjj_ep - _jjjj_blk) * 12
+            _jjjj_t_mol = state.get('boltz_time_per_mol', 150.0)
+            if _jjjj_remaining > 2 * _jjjj_t_mol + 60:
+                _jjjj_top = sorted(_jjjj_valid.items(), key=lambda kv: kv[1], reverse=True)
+                _jjjj_best_sm, _jjjj_base_le = _jjjj_top[0]
+                _jjjj_second_le = _jjjj_top[1][1] if len(_jjjj_top) >= 2 else -math.inf
+                # Build SMILES→product_name lookup (same pattern as §WW)
+                _jjjj_name_lookup: Dict[str, str] = {}
+                for _jf in (candidates, state.get('global_candidate_pool'), state.get('savi_stream_pool')):
+                    if _jf is None or getattr(_jf, 'empty', True):
+                        continue
+                    if 'product_smiles' not in _jf.columns or 'product_name' not in _jf.columns:
+                        continue
+                    for _, _jr in _jf.iterrows():
+                        _jp = str(_jr.get('product_smiles', ''))
+                        _jn = str(_jr.get('product_name', ''))
+                        if _jp and _jn:
+                            _jjjj_name_lookup.setdefault(_jp, _jn)
+                            _jc = get_canonical_smiles(_jp)
+                            if _jc:
+                                _jjjj_name_lookup.setdefault(_jc, _jn)
+                _jjjj_pname = (
+                    _jjjj_name_lookup.get(_jjjj_best_sm)
+                    or _jjjj_name_lookup.get(get_canonical_smiles(_jjjj_best_sm) or '', '')
+                )
+                bt.logging.info(
+                    f"[§JJJJJJJJJJJJ] Temperature ensemble for top-1 "
+                    f"{_jjjj_pname!r} (base_LE={_jjjj_base_le:.4f}, "
+                    f"{_jjjj_remaining:.0f}s remaining)..."
+                )
+                _jjjj_ts_scores = [_jjjj_base_le]
+                _jjjj_orig_ss = wrapper.config.get('step_scale')
+                for _jjjj_ts in [0.7, 1.3]:
+                    try:
+                        _jjjj_blk2 = await state['subtensor'].get_current_block()
+                        _jjjj_ep2 = (
+                            (_jjjj_blk2 // state['epoch_length']) + 1
+                        ) * state['epoch_length']
+                        if (_jjjj_ep2 - _jjjj_blk2) * 12 < _jjjj_t_mol + 30:
+                            bt.logging.info(
+                                f"[§JJJJJJJJJJJJ] Time guard fired at step_scale={_jjjj_ts:.1f}."
+                            )
+                            break
+                        _jjjj_uid = 0
+                        _jjjj_vmbu = {
+                            _jjjj_uid: {"smiles": [_jjjj_best_sm], "names": [_jjjj_pname or '']}
+                        }
+                        _jjjj_sd: Dict[str, Any] = {_jjjj_uid: {}}
+                        wrapper.config['step_scale'] = _jjjj_ts
+                        try:
+                            await asyncio.to_thread(
+                                wrapper.score_molecules_target,
+                                _jjjj_vmbu, _jjjj_sd, subnet_config,
+                                '0x' + '0' * 64, False, 68,
+                            )
+                        finally:
+                            if _jjjj_orig_ss is None:
+                                wrapper.config.pop('step_scale', None)
+                            else:
+                                wrapper.config['step_scale'] = _jjjj_orig_ss
+                        _jjjj_s = wrapper.per_molecule_metric.get(
+                            _jjjj_uid, {}
+                        ).get(_jjjj_best_sm, -math.inf)
+                        if math.isfinite(_jjjj_s):
+                            _jjjj_ts_scores.append(_jjjj_s)
+                        bt.logging.info(
+                            f"[§JJJJJJJJJJJJ] step_scale={_jjjj_ts:.1f} → LE={_jjjj_s:.4f}"
+                        )
+                    except Exception as _jjjj_se:
+                        bt.logging.error(
+                            f"[§JJJJJJJJJJJJ] step_scale={_jjjj_ts:.1f} error: {_jjjj_se}"
+                        )
+                        wrapper.config.pop('step_scale', None)
+                        if _jjjj_orig_ss is not None:
+                            wrapper.config['step_scale'] = _jjjj_orig_ss
+
+                if len(_jjjj_ts_scores) >= 2:
+                    _jjjj_ts_std = float(np.std(_jjjj_ts_scores, ddof=0))
+                    bt.logging.info(
+                        f"[§JJJJJJJJJJJJ] ts_std={_jjjj_ts_std:.4f} "
+                        f"({len(_jjjj_ts_scores)} temperature sample(s))"
+                    )
+                    _jjjj_can = get_canonical_smiles(_jjjj_best_sm) or _jjjj_best_sm
+                    try:
+                        with sqlite3.connect(db_path) as _jjjj_conn:
+                            _jjjj_conn.execute(
+                                "UPDATE boltz_cache SET boltz_ts_std=? "
+                                "WHERE smiles=? AND protein=?",
+                                (_jjjj_ts_std, _jjjj_can, protein),
+                            )
+                    except Exception as _jjjj_db_err:
+                        bt.logging.debug(
+                            f"[§JJJJJJJJJJJJ] ts_std persist failed (non-fatal): {_jjjj_db_err}"
+                        )
+                    # Reliability-adjusted final LE: 1 + 5 × ts_std coefficient is
+                    # looser than the 1 + 10 × of §VVVVVVVVVV: temperature diversity
+                    # is a different signal and 5× avoids overly aggressive overrides.
+                    _jjjj_adj_le = _jjjj_base_le / (1 + 5 * _jjjj_ts_std)
+                    if _jjjj_adj_le < _jjjj_second_le and _jjjj_pname:
+                        _jjjj_orig_sub = (state.get('candidate_product') or '').split(',')
+                        _jjjj_second_sm = _jjjj_top[1][0]
+                        _jjjj_second_pname = (
+                            _jjjj_name_lookup.get(_jjjj_second_sm)
+                            or _jjjj_name_lookup.get(
+                                get_canonical_smiles(_jjjj_second_sm) or '', ''
+                            )
+                        )
+                        if _jjjj_second_pname and _jjjj_second_pname in _jjjj_orig_sub:
+                            state['candidate_product'] = ','.join(
+                                [_jjjj_second_pname]
+                                + [n for n in _jjjj_orig_sub if n != _jjjj_second_pname]
+                            )
+                            bt.logging.warning(
+                                f"[§JJJJJJJJJJJJ] Temperature ensemble overrides top-1 "
+                                f"submission (ts_std={_jjjj_ts_std:.3f}, "
+                                f"adj_LE={_jjjj_adj_le:.3f} < #2={_jjjj_second_le:.3f}) "
+                                f"→ {_jjjj_second_pname}"
+                            )
+                        else:
+                            bt.logging.info(
+                                f"[§JJJJJJJJJJJJ] top-1 temperature-sensitive "
+                                f"(adj_LE={_jjjj_adj_le:.3f} < #2={_jjjj_second_le:.3f}) "
+                                "but #2 product_name unknown — keeping top-1."
+                            )
+                    else:
+                        bt.logging.info(
+                            f"[§JJJJJJJJJJJJ] top-1 temperature-stable "
+                            f"(adj_LE={_jjjj_adj_le:.3f} ≥ #2={_jjjj_second_le:.3f}); "
+                            "submission unchanged."
+                        )
+        except Exception as _jjjj_err:
+            bt.logging.warning(
+                f"[§JJJJJJJJJJJJ] temperature ensemble failed (non-fatal): {_jjjj_err}"
             )
 
     # Merge §FF / §MM scores into all_scores before the §CC guard.

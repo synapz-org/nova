@@ -1,10 +1,10 @@
 # Boltz-2 Miner Integration
 
-## Current Status (as of 2026-10-08)
+## Current Status (as of 2026-10-09)
 
-**79 roadmap items implemented; 1 proposed.** §IIIIIIIIIIII (ring-closure SALSA operator) implemented 2026-10-08. §HHHHHHHHHHHH (Boltz-2 z-matrix interface embedding for surrogate) implemented 2026-10-04. §GGGGGGGGGGGG (freed-round reallocation from §EEEEEEEEEEEE to next §YYYYYYYYYYYY seed) implemented 2026-10-03. §EEEEEEEEEEEE (§MM diminishing-returns early exit) and §FFFFFFFFFFFFFFFF (GradientBoosting surrogate 3rd tier) implemented 2026-10-02.
+**80 roadmap items implemented; 0 proposed.** §JJJJJJJJJJJJ (step-scale temperature ensemble) implemented 2026-10-09. §IIIIIIIIIIII (ring-closure SALSA operator) implemented 2026-10-08. §HHHHHHHHHHHH (Boltz-2 z-matrix interface embedding for surrogate) implemented 2026-10-04. §GGGGGGGGGGGG (freed-round reallocation from §EEEEEEEEEEEE to next §YYYYYYYYYYYY seed) implemented 2026-10-03. §EEEEEEEEEEEE (§MM diminishing-returns early exit) and §FFFFFFFFFFFFFFFF (GradientBoosting surrogate 3rd tier) implemented 2026-10-02.
 
-**Open proposals: §JJJJJJJJJJJJ (step-scale temperature ensemble for final submission).**
+**Open proposals: none.**
 
 ---
 
@@ -111,7 +111,7 @@ Overall: **+2–4% Boltz LE** on epochs where the top seed molecule has cyclisab
 
 ## Proposed Next Optimisations (2026-10-08)
 
-### §JJJJJJJJJJJJ — Step-Scale Temperature Ensemble for Final Submission Validation
+### §JJJJJJJJJJJJ — Step-Scale Temperature Ensemble for Final Submission Validation — implemented 2026-10-09
 
 **Problem:**
 
