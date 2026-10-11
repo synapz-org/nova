@@ -156,6 +156,12 @@ class BoltzWrapper:
         # Exposed to run_salsa_search() via atom_exposure to bias fg_add/ring_walk toward
         # solvent-exposed atoms and away from buried (sterically constrained) positions.
         self._pose_exposure: dict = {}
+        # §KKKKKKKKKKKK: per-molecule contact residue sets extracted from output PDB.
+        # Keyed by canonical SMILES → frozenset of protein residue sequence numbers within
+        # 5 Å of any ligand atom.  Accumulated across scoring calls; used by
+        # get_consensus_pocket() to derive a progressive soft binding-pocket constraint
+        # for subsequent Boltz-2 calls when no binding_pocket is set in the config.
+        self._pose_contacts: dict = {}
         
         self.base_seed = 68
         random.seed(self.base_seed)
@@ -236,6 +242,83 @@ class BoltzWrapper:
             return result
         except Exception:
             return {}
+
+    @staticmethod
+    def _extract_contact_residues(pdb_path: str, d_contact: float = 5.0) -> frozenset:
+        """§KKKKKKKKKKKK: Return frozenset of protein residue seq-numbers within d_contact Å of any ligand atom.
+
+        Reads HETATM (ligand) and ATOM (protein) lines from the Boltz-2 output PDB.
+        Returns an empty frozenset on any parse failure so callers degrade gracefully.
+        Used by get_consensus_pocket() to identify structurally essential binding-site
+        residues contacted consistently across multiple scaffolds.
+        """
+        try:
+            ligand_coords = []
+            protein_atoms = []   # (seq_num, x, y, z)
+            with open(pdb_path) as _f:
+                for line in _f:
+                    if line.startswith("HETATM"):
+                        try:
+                            ligand_coords.append([
+                                float(line[30:38]),
+                                float(line[38:46]),
+                                float(line[46:54]),
+                            ])
+                        except ValueError:
+                            pass
+                    elif line.startswith("ATOM"):
+                        try:
+                            seq_num = int(line[22:26].strip())
+                            protein_atoms.append((
+                                seq_num,
+                                float(line[30:38]),
+                                float(line[38:46]),
+                                float(line[46:54]),
+                            ))
+                        except ValueError:
+                            pass
+            if not ligand_coords or not protein_atoms:
+                return frozenset()
+            L = np.array(ligand_coords, dtype=np.float32)
+            P = np.array([[a[1], a[2], a[3]] for a in protein_atoms], dtype=np.float32)
+            dist_matrix = np.linalg.norm(L[:, None, :] - P[None, :, :], axis=2)
+            min_dists_per_prot = dist_matrix.min(axis=0)   # shape (n_prot,)
+            contact_set = frozenset(
+                protein_atoms[i][0]
+                for i in range(len(protein_atoms))
+                if min_dists_per_prot[i] <= d_contact
+            )
+            return contact_set
+        except Exception:
+            return frozenset()
+
+    def get_consensus_pocket(
+        self,
+        min_molecules: int = 3,
+        min_shared_residues: int = 5,
+    ):
+        """§KKKKKKKKKKKK: Return sorted consensus pocket residue numbers or None.
+
+        A residue is counted as part of the consensus pocket when it appears within
+        5 Å of the ligand in ≥ min_molecules independently scored molecules.
+        Returns None when the pose contact cache is too small or the intersection
+        is too sparse to define a reliable pocket.
+
+        Rationale: residues contacted by ≥3 structurally distinct scaffolds are
+        functionally essential to the binding site.  Enabling Boltz-2's soft pocket
+        constraint (`force=False`) for subsequent calls biases diffusion toward those
+        residues without prohibiting discovery of alternative binding modes.
+        """
+        if len(self._pose_contacts) < min_molecules:
+            return None
+        from collections import Counter
+        counter: Counter = Counter()
+        for residues in self._pose_contacts.values():
+            counter.update(residues)
+        consensus = sorted(
+            res for res, cnt in counter.items() if cnt >= min_molecules
+        )
+        return consensus if len(consensus) >= min_shared_residues else None
 
     def preprocess_data_for_boltz(self, valid_molecules_by_uid: dict, score_dict: dict, final_block_hash: str) -> None:
         # Get protein sequence
@@ -512,6 +595,31 @@ properties:
                                 )
             except Exception as _zzz_err:
                 bt.logging.debug(f"[§ZZZZZZZZZZZZ] Exposure extraction skipped: {_zzz_err}")
+
+        # §KKKKKKKKKKKK: extract contact residue sets from PDB outputs for consensus pocket.
+        # Runs after §ZZZZZZZZZZZZ in the same file-removal-guarded block so we read PDBs
+        # before rm -r cleans the output directory.  Accumulates across calls within the
+        # same BoltzWrapper instance (shared wrapper in the main miner prescoring loop).
+        try:
+            from rdkit import Chem as _Chem2
+            for smiles, id_list in self.unique_molecules.items():
+                mol_idx = id_list[0][1]
+                _pdb2 = scores.get(mol_idx, {}).get('_pdb_path')
+                if _pdb2 and os.path.exists(_pdb2):
+                    _canon2 = (
+                        _Chem2.MolToSmiles(_Chem2.MolFromSmiles(smiles))
+                        if _Chem2.MolFromSmiles(smiles) else smiles
+                    )
+                    if _canon2 not in self._pose_contacts:
+                        _contacts = self._extract_contact_residues(_pdb2)
+                        if len(_contacts) >= 3:
+                            self._pose_contacts[_canon2] = _contacts
+                            bt.logging.debug(
+                                f"[§KKKKKKKKKKKK] Contact residues cached for "
+                                f"{_canon2[:40]}… ({len(_contacts)} residues)"
+                            )
+        except Exception as _kkk_err:
+            bt.logging.debug(f"[§KKKKKKKKKKKK] Contact residue extraction skipped: {_kkk_err}")
 
         if self.config['remove_files']:
             bt.logging.info("Removing files")

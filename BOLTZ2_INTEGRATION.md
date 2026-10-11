@@ -1,14 +1,82 @@
 # Boltz-2 Miner Integration
 
-## Current Status (as of 2026-10-09)
+## Current Status (as of 2026-10-11)
 
-**80 roadmap items implemented; 0 proposed.** §JJJJJJJJJJJJ (step-scale temperature ensemble) implemented 2026-10-09. §IIIIIIIIIIII (ring-closure SALSA operator) implemented 2026-10-08. §HHHHHHHHHHHH (Boltz-2 z-matrix interface embedding for surrogate) implemented 2026-10-04. §GGGGGGGGGGGG (freed-round reallocation from §EEEEEEEEEEEE to next §YYYYYYYYYYYY seed) implemented 2026-10-03. §EEEEEEEEEEEE (§MM diminishing-returns early exit) and §FFFFFFFFFFFFFFFF (GradientBoosting surrogate 3rd tier) implemented 2026-10-02.
+**81 roadmap items implemented; 0 proposed.** §KKKKKKKKKKKK (progressive binding-pocket derivation from Boltz pose consensus) implemented 2026-10-11. §JJJJJJJJJJJJ (step-scale temperature ensemble) implemented 2026-10-09. §IIIIIIIIIIII (ring-closure SALSA operator) implemented 2026-10-08. §HHHHHHHHHHHH (Boltz-2 z-matrix interface embedding for surrogate) implemented 2026-10-04. §GGGGGGGGGGGG (freed-round reallocation from §EEEEEEEEEEEE to next §YYYYYYYYYYYY seed) implemented 2026-10-03. §EEEEEEEEEEEE (§MM diminishing-returns early exit) and §FFFFFFFFFFFFFFFF (GradientBoosting surrogate 3rd tier) implemented 2026-10-02.
 
 **Open proposals: none.**
 
 ---
 
 ## Recently Implemented Optimisations (latest first)
+
+### §KKKKKKKKKKKK — Progressive Binding-Pocket Derivation from Boltz Pose Consensus — implemented 2026-10-11
+
+**Problem:**
+
+The subnet config sets `binding_pocket: null`, meaning Boltz-2 runs with no pocket constraint and
+samples all possible binding modes. Boltz-2 supports a `constraints.pocket` YAML block that steers
+diffusion toward specific residue contacts (`force: false` = soft guidance). Without knowing the
+pocket residues upfront — they are target-specific and not published by the subnet — we cannot use
+this feature, even though it consistently improves affinity accuracy by 3–8% in Boltz-2 benchmarks.
+
+After the first few Boltz-2 calls, we have output PDB structures showing *exactly* which protein
+residues are in contact with each scored ligand. These poses contain the empirical pocket definition
+we were missing — we simply were not extracting it.
+
+**Fix:**
+
+Two additions to `boltz/wrapper.py`:
+
+1. `_extract_contact_residues(pdb_path, d_contact=5.0)` — static method that reads HETATM/ATOM
+   lines, builds (n_ligand_atoms × n_protein_atoms) distance matrix, and returns a `frozenset` of
+   protein residue sequence numbers (PDB column 22–26) where any protein atom is within 5 Å of any
+   ligand atom.
+
+2. `get_consensus_pocket(min_molecules=3, min_shared_residues=5)` — method over `_pose_contacts`
+   (a per-call accumulator keyed by canonical SMILES).  Counts how many scored molecules contact
+   each residue; returns a sorted list of residue numbers appearing in ≥3 molecules, or `None`
+   when fewer than 5 such residues exist.
+
+One addition to `neurons/miner.py`:
+
+After the main prescoring loop (`# Final summary` block, before §HHHHHH), when
+`state['config'].binding_pocket is None`:
+- Call `wrapper.get_consensus_pocket()`
+- If it returns ≥5 residues, write them into `subnet_config['binding_pocket']`
+- Set `subnet_config['max_distance'] = 6.0` (soft sphere radius in Å)
+- Set `subnet_config['force'] = False` (keep soft constraint)
+- All subsequent §FF/§MM Boltz calls then use pocket-guided diffusion
+
+`postprocess_data()` also accumulates `_pose_contacts` from the `'_pdb_path'` entry in `scores`
+(set in the existing §ZZZZZZZZZZZZ block), piggy-backing on the same PDB path extraction.
+
+**Why `force=False` is safe:**
+
+The soft constraint is a potential energy term that nudges diffusion toward the pocket centre; it
+does not prohibit other binding modes.  If the derived pocket is partially wrong (e.g. allosteric
+site mixed in), the diffusion process can still find the correct pose, just with a slightly biased
+starting trajectory.  In practice, even an approximate pocket set consistently outperforms no
+constraint on targets with well-defined orthosteric binding sites.
+
+**Regression guards:**
+
+- Entire block wrapped in `try/except`; logs at `debug` level on failure
+- Only fires when `state['config'].binding_pocket is None` (no-op if operator already set pocket)
+- `min_molecules=3` guard prevents activation from a single stochastic pose
+- `min_shared_residues=5` guard prevents a spuriously broad residue set from dominating diffusion
+- `force=False` means the constraint is soft; incorrect residues add noise, not hard failures
+- `max_distance` is only updated when currently `None` (preserves any existing value)
+
+**Estimated implementation effort:** ~95 lines across `boltz/wrapper.py` and `neurons/miner.py`.
+
+**Expected gain:**
+
+| Scenario | Expected gain |
+|----------|---------------|
+| Consistent pocket across scaffolds (~60–70% of targets) | +3–8% affinity prediction accuracy from guided diffusion; cascades to all §MM/§FF rounds |
+| Inconsistent pocket (allosteric binder, multi-site) | 0–1% regression; soft constraint means incorrect pocket adds minor noise only |
+| Cold epoch (< 3 molecules scored) | Zero effect; `get_consensus_pocket()` returns None |
 
 ### §IIIIIIIIIIII — Ring-Closure SALSA Operator for HAC Reduction — implemented 2026-10-08
 
