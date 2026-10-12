@@ -2116,6 +2116,31 @@ async def _run_jj_probe(state: Dict[str, Any], candidate_smiles: str) -> None:
                 f"probe — known-binder calibration for surrogate."
             )
 
+        # §LLLLLLLLLLLL: add up to 1 ChEMBL known active for the EXACT weekly target.
+        # ChEMBL actives (pChEMBL ≥ 7.0, IC50 ≤ 100 nM) are validated binders; scoring
+        # them in the cold-start probe gives the surrogate a high-end anchor from the exact
+        # protein rather than a homolog (§NNNNNNNNNNN).  Only 1 added to limit probe time;
+        # stored with product_name=None (surrogate training only, not submittable).
+        # ChEMBL seeds are fetched async at startup (§SS) and ready by probe time (~10 min
+        # of streaming before pool reaches 1000 molecules).
+        try:
+            _chembl_probe = [
+                s for s in state.get('chembl_seeds', [])
+                if s not in probe_smiles
+                and Chem.MolFromSmiles(s) is not None
+                and is_boltz_safe_smiles(s)[0]
+                and (get_heavy_atom_count(s) or 999) <= 35
+            ][:1]
+            if _chembl_probe:
+                probe_smiles.extend(_chembl_probe)
+                probe_names.extend([None] * len(_chembl_probe))
+                bt.logging.info(
+                    f"[§LLLLLLLLLLLL] {len(_chembl_probe)} ChEMBL active(s) added to "
+                    f"cold-start probe — exact-target known-binder surrogate calibration."
+                )
+        except Exception as _lll_err:
+            bt.logging.debug(f"[§LLLLLLLLLLLL] ChEMBL probe extension skipped: {_lll_err}")
+
         subnet_config = {
             'weekly_target': protein,
             'binding_pocket': state['config'].binding_pocket,

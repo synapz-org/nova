@@ -1,14 +1,83 @@
 # Boltz-2 Miner Integration
 
-## Current Status (as of 2026-10-11)
+## Current Status (as of 2026-10-12)
 
-**81 roadmap items implemented; 0 proposed.** §KKKKKKKKKKKK (progressive binding-pocket derivation from Boltz pose consensus) implemented 2026-10-11. §JJJJJJJJJJJJ (step-scale temperature ensemble) implemented 2026-10-09. §IIIIIIIIIIII (ring-closure SALSA operator) implemented 2026-10-08. §HHHHHHHHHHHH (Boltz-2 z-matrix interface embedding for surrogate) implemented 2026-10-04. §GGGGGGGGGGGG (freed-round reallocation from §EEEEEEEEEEEE to next §YYYYYYYYYYYY seed) implemented 2026-10-03. §EEEEEEEEEEEE (§MM diminishing-returns early exit) and §FFFFFFFFFFFFFFFF (GradientBoosting surrogate 3rd tier) implemented 2026-10-02.
+**82 roadmap items implemented; 0 proposed.** §LLLLLLLLLLLL (ChEMBL known-active calibration in cold-start Boltz probe) implemented 2026-10-12. §KKKKKKKKKKKK (progressive binding-pocket derivation from Boltz pose consensus) implemented 2026-10-11. §JJJJJJJJJJJJ (step-scale temperature ensemble) implemented 2026-10-09. §IIIIIIIIIIII (ring-closure SALSA operator) implemented 2026-10-08. §HHHHHHHHHHHH (Boltz-2 z-matrix interface embedding for surrogate) implemented 2026-10-04. §GGGGGGGGGGGG (freed-round reallocation from §EEEEEEEEEEEE to next §YYYYYYYYYYYY seed) implemented 2026-10-03. §EEEEEEEEEEEE (§MM diminishing-returns early exit) and §FFFFFFFFFFFFFFFF (GradientBoosting surrogate 3rd tier) implemented 2026-10-02.
 
 **Open proposals: none.**
 
 ---
 
 ## Recently Implemented Optimisations (latest first)
+
+### §LLLLLLLLLLLL — ChEMBL Known-Active Calibration in Cold-Start Boltz Probe — implemented 2026-10-12
+
+**Problem:**
+
+The cold-start Boltz probe (§LLLLLLLLLL + §NNNNNNNNNNN) fires one fast-mode Boltz batch at epoch
+start to seed the surrogate with ≥3 data points.  The batch includes:
+- Up to 3 scaffold-diverse PSICHIC-ranked candidates (§LLLLLLLLLL)
+- Up to 2 homolog-protein validated molecules from prior targets (§NNNNNNNNNNN)
+
+The §NNNNNNNNNNN seeds provide high-end anchors but from a *different* protein.  The miner already
+fetches ChEMBL known actives for the **exact** weekly target (pChEMBL ≥ 7.0, IC50 ≤ 100 nM) via
+§SS at startup, but those molecules are only used as SALSA seed points — they are *never* Boltz-2
+scored.  This means the surrogate has no exact-target binder calibration on epoch 1 even when
+strong validated ligands are available.
+
+**Fix:**
+
+In `_run_jj_probe()`, after the §NNNNNNNNNNN cross-target seed block, add up to 1 ChEMBL active
+to the probe batch:
+
+```python
+# §LLLLLLLLLLLL: add up to 1 ChEMBL known active for the EXACT weekly target.
+_chembl_probe = [
+    s for s in state.get('chembl_seeds', [])
+    if s not in probe_smiles
+    and Chem.MolFromSmiles(s) is not None
+    and is_boltz_safe_smiles(s)[0]
+    and (get_heavy_atom_count(s) or 999) <= 35
+][:1]
+if _chembl_probe:
+    probe_smiles.extend(_chembl_probe)
+    probe_names.extend([None] * len(_chembl_probe))
+```
+
+The ChEMBL active is stored with `product_name=None` (surrogate training only, not submittable).
+The §SS async fetch completes well before the pool reaches 1000 molecules (~10 min streaming).
+
+**Why exactly 1 molecule:**
+
+The probe already runs at `fast=True` (~15–50 s/mol).  Adding 1 extra molecule costs ~15–50 s —
+a small fraction of the 10–15 min cold-start window — while providing the highest-value calibration
+point available: a validated binder for the *exact* protein.  2+ ChEMBL molecules would risk
+over-fitting the surrogate toward the ChEMBL chemical class before §MM explores other scaffolds.
+
+**Regression guards:**
+
+- Entire ChEMBL block wrapped in `try/except`; logs at `debug` on failure
+- HAC ≤ 35 guard prevents oversized ChEMBL molecules from slowing the probe
+- `is_boltz_safe_smiles()` filter prevents ChEMBL SMILES with unsupported features
+- `product_name=None` means it can never be submitted; only improves surrogate training
+- Fires only when `state.get('chembl_seeds', [])` is non-empty (no-op if §SS returned nothing)
+
+**Estimated implementation effort:** ~18 lines in `neurons/miner.py`.
+
+**Expected gain:**
+
+| Scenario | Expected gain |
+|----------|---------------|
+| ChEMBL has ≥1 active for weekly target (common) | +2–4% surrogate NDCG on epoch 1 vs. homolog-only calibration; SALSA seeds derived from Boltz-scored exact binder accelerate convergence |
+| ChEMBL active is structurally distinct from PSICHIC candidates | +3–6% NDCG by expanding the coverage of the surrogate score distribution on epoch 1 |
+| ChEMBL returns no results (uncommon target) | Zero regression; block fires 0 molecules |
+| ChEMBL active is already in probe_smiles (deduplication guard) | Zero regression; deduplicated |
+
+**Files changed:**
+- `neurons/miner.py`: added §LLLLLLLLLLLL ChEMBL probe extension in `_run_jj_probe()` (~18 lines)
+- `BOLTZ2_INTEGRATION.md`: this entry
+
+---
 
 ### §KKKKKKKKKKKK — Progressive Binding-Pocket Derivation from Boltz Pose Consensus — implemented 2026-10-11
 
