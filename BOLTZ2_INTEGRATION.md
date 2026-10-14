@@ -2,13 +2,76 @@
 
 ## Current Status (as of 2026-10-14)
 
-**83 roadmap items implemented; 0 proposed.** §MMMMMMMMMMMM (binding-pocket cross-restart persistence via SQLite + GitHub export) implemented 2026-10-14. §LLLLLLLLLLLL (ChEMBL known-active calibration in cold-start Boltz probe) implemented 2026-10-12. §KKKKKKKKKKKK (progressive binding-pocket derivation from Boltz pose consensus) implemented 2026-10-11. §JJJJJJJJJJJJ (step-scale temperature ensemble) implemented 2026-10-09. §IIIIIIIIIIII (ring-closure SALSA operator) implemented 2026-10-08. §HHHHHHHHHHHH (Boltz-2 z-matrix interface embedding for surrogate) implemented 2026-10-04. §GGGGGGGGGGGG (freed-round reallocation from §EEEEEEEEEEEE to next §YYYYYYYYYYYY seed) implemented 2026-10-03. §EEEEEEEEEEEE (§MM diminishing-returns early exit) and §FFFFFFFFFFFFFFFF (GradientBoosting surrogate 3rd tier) implemented 2026-10-02.
+**84 roadmap items implemented; 0 proposed.** §NNNNNNNNNNNN (regioisomeric scaffold hop SALSA operator) implemented 2026-10-14. §MMMMMMMMMMMM (binding-pocket cross-restart persistence via SQLite + GitHub export) implemented 2026-10-14. §LLLLLLLLLLLL (ChEMBL known-active calibration in cold-start Boltz probe) implemented 2026-10-12. §KKKKKKKKKKKK (progressive binding-pocket derivation from Boltz pose consensus) implemented 2026-10-11. §JJJJJJJJJJJJ (step-scale temperature ensemble) implemented 2026-10-09. §IIIIIIIIIIII (ring-closure SALSA operator) implemented 2026-10-08. §HHHHHHHHHHHH (Boltz-2 z-matrix interface embedding for surrogate) implemented 2026-10-04. §GGGGGGGGGGGG (freed-round reallocation from §EEEEEEEEEEEE to next §YYYYYYYYYYYY seed) implemented 2026-10-03. §EEEEEEEEEEEE (§MM diminishing-returns early exit) and §FFFFFFFFFFFFFFFF (GradientBoosting surrogate 3rd tier) implemented 2026-10-02.
 
 **Open proposals: none.**
 
 ---
 
 ## Recently Implemented Optimisations (latest first)
+
+### §NNNNNNNNNNNN — Regioisomeric Scaffold Hop SALSA Operator — implemented 2026-10-14
+
+**Problem:**
+
+SALSA's five existing perturbation operators (bioisostere, fg_add, terminal_remove,
+ring_walk, ring_close) can all be applied to a single atom at a time.  The bioisostere
+operator changes one atom's element (C→N, O→S, …), but it cannot generate regioisomers —
+molecules with the same atomic formula and ring size but heteroatoms at different ring
+positions.  These regioisomers are common medicinal-chemistry scaffold hops:
+
+- 2-pyridyl vs 3-pyridyl vs 4-pyridyl (same C₅NH₄ ring, N at positions 2/3/4)
+- Pyrimidine vs pyrazine vs pyridazine (same C₄N₂H₄ ring, N at 1,3/1,4/1,2)
+- Imidazole vs pyrazole (same C₃N₂H₄ ring, N positions adjacent vs non-adjacent)
+- Oxazole vs isoxazole, thiazole vs isothiazole (N+O or N+S position swap)
+
+To generate a regioisomer, **two** ring atoms must change simultaneously: the current
+heteroatom position reverts to C while a new position changes to heteroatom.  Bioisostere
+cannot do this because it processes one atom per call.  The result is a systematic blind
+spot: SALSA can never move from 2-pyridyl to 4-pyridyl space without the scaffold hop
+operator.
+
+**Fix:**
+
+Add `_scaffold_hop_probes(mol, n_max)` in `utils/salsa.py` and wire it as a 6th
+perturbation operator (`scaffold_hop`, default weight 0.3) in `generate_perturbations()`.
+
+For each aromatic ring (size 5 or 6):
+- **6-ring, 1 N (pyridine)**: set current N position to C and each other ring position to
+  N in turn — generates up to 5 pyridine regioisomers per ring.
+- **6-ring, 2 N (pyrimidine/pyrazine/pyridazine)**: move the second N to each other ring
+  position relative to the first — covers all 3 C₄N₂ isomers.
+- **5-ring, 2 N (imidazole/pyrazole)**: swap the two N positions; additionally move one N
+  to each remaining ring C — covers all 5-ring 2N regioisomers.
+- **5-ring, N+O or N+S (oxazole/isoxazole, thiazole/isothiazole)**: swap the N and O/S
+  positions — generates the iso- isomer.
+
+All results are probe SMILES for Tanimoto nearest-neighbor search in the SAVI-2020 pool —
+never submitted directly.  `SanitizeMol` filters valence-invalid probes silently.
+
+Integration changes (all in `neurons/miner.py`):
+- `_salsa_operator_weights()`: add `'scaffold_hop': 0.3` to all three weight dicts (large
+  HA, small HA, bandit-fallback).
+- `salsa_operator_wins` state init: add `'scaffold_hop': 0`.
+- `§SSSSSSSSSSSS` restore `_s12_keys` tuple: add `'scaffold_hop'`.
+- `§SSSSSSSSSSSS` epoch-decay default dict: add `'scaffold_hop': 0`.
+
+**Regression guards:**
+- When the seed has no aromatic rings, `_scaffold_hop_probes` returns `[]` — zero overhead.
+- The 0.3 default weight takes ~6% of the n_max budget; `_n_rng` shrinks correspondingly
+  so total probe count is unchanged.
+- `operator_weights` callers that omit `scaffold_hop` fall through to `_def_w[k]` default
+  (0.3) via the `get` fallback in `generate_perturbations`.
+- All four `neurons/miner.py` dict literals were updated; the `§SSSSSSSSSSSS` key tuple
+  update ensures old SQLite JSON without `scaffold_hop` defaults to 0 on load.
+
+**Estimated effort:** ~130 lines across `utils/salsa.py` + `neurons/miner.py`.
+
+**Expected gain:** +2–5% Boltz LE on epochs where the target protein prefers a ring
+isomer not present in the original SAVI-2020 streaming pool sample; zero regression
+on acyclic seeds or targets insensitive to ring regioisomery.
+
+---
 
 ### §MMMMMMMMMMMM — Binding-Pocket Cross-Restart Persistence via SQLite + GitHub Export — implemented 2026-10-14
 

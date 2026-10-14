@@ -145,6 +145,139 @@ _RINGCLOSE_SMARTS = [
     for d, a, rs in _RINGCLOSE_PAIRS
 ]
 
+
+def _scaffold_hop_probes(mol: Chem.Mol, n_max: int = 20) -> List[str]:
+    """
+    §NNNNNNNNNNNN: Generate regioisomeric scaffold-hop probe SMILES.
+
+    Performs SIMULTANEOUS two-atom ring swaps: one ring position loses its
+    heteroatom (→C) while another gains one (C→heteroatom), keeping the
+    molecular formula identical.  Bioisostere cannot produce these probes
+    because it changes only one atom per call.
+
+    Covered cases:
+    - 6-ring, 1 N (pyridine): move N to each other ring position → up to 5
+      pyridine regioisomers per ring (2-py / 3-py / 4-py and variants).
+    - 6-ring, 2 N (pyrimidine/pyrazine/pyridazine): try all 3 C4N2 isomers
+      (1,3 / 1,4 / 1,2 nitrogen arrangements).
+    - 5-ring, 2 N at non-adjacent positions (imidazole): rearrange to
+      pyrazole (N at adjacent positions) and vice-versa.
+    - 5-ring, mixed N+O or N+S (oxazole, thiazole and their iso- forms):
+      swap the two heteroatom positions.
+
+    Returns at most *n_max* distinct canonical SMILES, excluding the input.
+    All results are probe vectors for Tanimoto pool lookup — never submitted.
+    """
+    results: List[str] = []
+    seen = {Chem.MolToSmiles(mol)}
+    ring_info = mol.GetRingInfo()
+
+    for ring_atoms in ring_info.AtomRings():
+        if len(results) >= n_max:
+            break
+        ring_size = len(ring_atoms)
+        if ring_size not in (5, 6):
+            continue
+        ring_atom_objs = [mol.GetAtomWithIdx(i) for i in ring_atoms]
+        if not all(a.GetIsAromatic() for a in ring_atom_objs):
+            continue
+
+        ring_an = [mol.GetAtomWithIdx(i).GetAtomicNum() for i in ring_atoms]
+        het_positions = [pos for pos, an in enumerate(ring_an) if an != 6]
+
+        if ring_size == 6 and len(het_positions) == 1:
+            # Pyridine: move single N to every other ring position
+            het_pos = het_positions[0]
+            if ring_an[het_pos] != 7:
+                continue
+            for new_pos in range(6):
+                if new_pos == het_pos or len(results) >= n_max:
+                    continue
+                rw = Chem.RWMol(mol)
+                rw.GetAtomWithIdx(ring_atoms[het_pos]).SetAtomicNum(6)
+                rw.GetAtomWithIdx(ring_atoms[new_pos]).SetAtomicNum(7)
+                try:
+                    Chem.SanitizeMol(rw)
+                    canonical = Chem.MolToSmiles(rw.GetMol())
+                    if canonical not in seen:
+                        seen.add(canonical)
+                        results.append(canonical)
+                except Exception:
+                    pass
+
+        elif ring_size == 6 and len(het_positions) == 2:
+            # Pyrimidine / pyrazine / pyridazine: try other C4N2 isomers
+            if any(ring_an[p] != 7 for p in het_positions):
+                continue
+            ref = het_positions[0]
+            current_other = het_positions[1]
+            for delta in (1, 2, 3):
+                new_other = (ref + delta) % 6
+                if new_other == ref or new_other == current_other:
+                    continue
+                if len(results) >= n_max:
+                    break
+                rw = Chem.RWMol(mol)
+                rw.GetAtomWithIdx(ring_atoms[current_other]).SetAtomicNum(6)
+                rw.GetAtomWithIdx(ring_atoms[new_other]).SetAtomicNum(7)
+                try:
+                    Chem.SanitizeMol(rw)
+                    canonical = Chem.MolToSmiles(rw.GetMol())
+                    if canonical not in seen:
+                        seen.add(canonical)
+                        results.append(canonical)
+                except Exception:
+                    pass
+
+        elif ring_size == 5 and len(het_positions) == 2:
+            # 5-membered rings with 2 heteroatoms
+            het_pos_a, het_pos_b = het_positions[0], het_positions[1]
+            an_a = ring_an[het_pos_a]
+            an_b = ring_an[het_pos_b]
+
+            # Swap heteroatom positions (oxazole↔isoxazole, thiazole↔isothiazole,
+            # imidazole→pyrazole positional rearrangement)
+            if len(results) < n_max:
+                rw = Chem.RWMol(mol)
+                rw.GetAtomWithIdx(ring_atoms[het_pos_a]).SetAtomicNum(an_b)
+                rw.GetAtomWithIdx(ring_atoms[het_pos_b]).SetAtomicNum(an_a)
+                # Clear explicit H counts; SanitizeMol sets them correctly
+                rw.GetAtomWithIdx(ring_atoms[het_pos_a]).SetNumExplicitHs(0)
+                rw.GetAtomWithIdx(ring_atoms[het_pos_b]).SetNumExplicitHs(0)
+                try:
+                    Chem.SanitizeMol(rw)
+                    canonical = Chem.MolToSmiles(rw.GetMol())
+                    if canonical not in seen:
+                        seen.add(canonical)
+                        results.append(canonical)
+                except Exception:
+                    pass
+
+            # For two identical N (imidazole / pyrazole): move one N to each
+            # remaining ring C to cover all 5-ring 2N regioisomers
+            if an_a == 7 and an_b == 7:
+                for new_pos in range(5):
+                    if new_pos in (het_pos_a, het_pos_b) or ring_an[new_pos] != 6:
+                        continue
+                    if len(results) >= n_max:
+                        break
+                    rw = Chem.RWMol(mol)
+                    rw.GetAtomWithIdx(ring_atoms[het_pos_b]).SetAtomicNum(6)
+                    rw.GetAtomWithIdx(ring_atoms[new_pos]).SetAtomicNum(7)
+                    rw.GetAtomWithIdx(ring_atoms[het_pos_b]).SetNumExplicitHs(0)
+                    rw.GetAtomWithIdx(ring_atoms[new_pos]).SetNumExplicitHs(0)
+                    try:
+                        Chem.SanitizeMol(rw)
+                        canonical = Chem.MolToSmiles(rw.GetMol())
+                        if canonical not in seen:
+                            seen.add(canonical)
+                            results.append(canonical)
+                    except Exception:
+                        pass
+
+    return results
+
+
 def _fg_atoms_for_position(atom_idx: int, atom_contact_type: Optional[dict]) -> list:
     """§CCCCCCCCCCCC: Return the fg_add atom-number list biased by pharmacophore contact type.
 
@@ -260,7 +393,9 @@ def generate_perturbations(
     # passes operator_weights=None.
     # §IIIIIIIIIIII: ring_close added at 0.5 weight (fires only when reactive
     # group pairs exist — zero cost when none found).
-    _def_w = {'bioisostere': 1.0, 'fg_add': 1.0, 'terminal_remove': 1.0, 'ring_walk': 1.0, 'ring_close': 0.5}
+    # §NNNNNNNNNNNN: scaffold_hop added at 0.3 weight (fires only on ring-
+    # containing molecules; zero cost on acyclic seeds).
+    _def_w = {'bioisostere': 1.0, 'fg_add': 1.0, 'terminal_remove': 1.0, 'ring_walk': 1.0, 'ring_close': 0.5, 'scaffold_hop': 0.3}
     if operator_weights:
         _w = {k: max(0.0, float(operator_weights.get(k, _def_w[k]))) for k in _def_w}
     else:
@@ -270,13 +405,15 @@ def generate_perturbations(
     _n_fga = max(2, round(n_max * _w['fg_add'] / _tw))
     _n_ter = max(2, round(n_max * _w['terminal_remove'] / _tw))
     _n_rc  = max(2, round(n_max * _w['ring_close'] / _tw))
-    _n_rng = max(2, n_max - _n_bio - _n_fga - _n_ter - _n_rc)
+    _n_sch = max(2, round(n_max * _w['scaffold_hop'] / _tw))
+    _n_rng = max(2, n_max - _n_bio - _n_fga - _n_ter - _n_rc - _n_sch)
 
     bio_res: List[str] = []
     fga_res: List[str] = []
     ter_res: List[str] = []
     rng_res: List[str] = []
     rcl_res: List[str] = []
+    sch_res: List[str] = []
 
     # --- 1. Bioisosteric substitution ---
     # §ZZZZZZZZZZZZ: when atom_exposure is provided, prefer exposed atoms (higher weight).
@@ -477,6 +614,20 @@ def generate_perturbations(
                 except Exception:
                     pass
 
+    # --- 6. Scaffold hop (regioisomeric ring heteroatom rearrangement) ---
+    # §NNNNNNNNNNNN: Generate probes by simultaneously moving a ring heteroatom
+    # to a new ring position.  Unlike bioisostere (single-atom type change),
+    # scaffold_hop swaps TWO ring atoms in one step, producing regioisomers
+    # that bioisostere cannot reach (e.g. 2-pyridyl→3-pyridyl→4-pyridyl,
+    # pyrimidine→pyrazine→pyridazine, imidazole→pyrazole).
+    _sch_raw = _scaffold_hop_probes(mol, n_max=_n_sch * 3)  # over-generate, then cap
+    for _sch_smi in _sch_raw:
+        if len(sch_res) >= _n_sch:
+            break
+        if _sch_smi not in seen:
+            seen.add(_sch_smi)
+            sch_res.append(_sch_smi)
+
     # §OOOO: tagged output for bandit operator tracking in §MM.
     if return_tags:
         return (
@@ -485,8 +636,9 @@ def generate_perturbations(
             + [('terminal_remove', s) for s in ter_res]
             + [('ring_walk', s) for s in rng_res]
             + [('ring_close', s) for s in rcl_res]
+            + [('scaffold_hop', s) for s in sch_res]
         )
-    return bio_res + fga_res + ter_res + rng_res + rcl_res
+    return bio_res + fga_res + ter_res + rng_res + rcl_res + sch_res
 
 
 # ---------------------------------------------------------------------------
