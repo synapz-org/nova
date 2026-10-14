@@ -2151,6 +2151,15 @@ async def _run_jj_probe(state: Dict[str, Any], candidate_smiles: str) -> None:
             'boltz_metric': state['config'].boltz_metric,
             'combination_strategy': state['config'].combination_strategy,
         }
+        # §MMMMMMMMMMMM: Apply restored pocket to cold-start probe as well.
+        _mmm_probe_restored = state.get('_mmm_restored_pocket')
+        if (subnet_config['binding_pocket'] is None
+                and _mmm_probe_restored is not None
+                and _mmm_probe_restored.get('protein') == protein):
+            subnet_config['binding_pocket'] = _mmm_probe_restored['pocket']
+            if subnet_config.get('max_distance') is None:
+                subnet_config['max_distance'] = 6.0
+            subnet_config['force'] = False
         wrapper = BoltzWrapper()
         valid_molecules_by_uid = {
             0: {"smiles": probe_smiles, "names": probe_names}
@@ -2471,6 +2480,24 @@ async def run_boltz_prescoring(state: Dict[str, Any], max_candidates: int = 5) -
         'boltz_metric': state['config'].boltz_metric,
         'combination_strategy': state['config'].combination_strategy,
     }
+    # §MMMMMMMMMMMM: Apply consensus pocket restored from SQLite/GitHub at startup.
+    # When config has no explicit binding_pocket and a cached pocket for this protein
+    # was restored at startup, pre-populate subnet_config so every Boltz call in the
+    # first prescoring pass runs with pocket-guided diffusion from the start.
+    # §KKKKKKKKKKKK will still run after the loop and may refine the pocket with fresh
+    # PDB contacts — it overwrites subnet_config['binding_pocket'] when it fires.
+    _mmm_restored = state.get('_mmm_restored_pocket')
+    if (subnet_config['binding_pocket'] is None
+            and _mmm_restored is not None
+            and _mmm_restored.get('protein') == protein):
+        subnet_config['binding_pocket'] = _mmm_restored['pocket']
+        if subnet_config.get('max_distance') is None:
+            subnet_config['max_distance'] = 6.0
+        subnet_config['force'] = False
+        bt.logging.info(
+            f"[§MMMMMMMMMMMM] Applying {len(_mmm_restored['pocket'])}-residue "
+            f"restored pocket to main prescoring subnet_config."
+        )
 
     # One wrapper instance shared across all molecules to avoid repeated
     # directory setup; remove_files=true in boltz_config.yaml ensures each
@@ -2735,6 +2762,27 @@ async def run_boltz_prescoring(state: Dict[str, Any], max_candidates: int = 5) -
                     f"enabling soft pocket guidance for §FF/§MM rounds "
                     f"(residues: {_kkk_pocket[:10]}{'...' if len(_kkk_pocket) > 10 else ''})"
                 )
+                # §MMMMMMMMMMMM: persist derived pocket to SQLite so it survives restarts.
+                # On the next container start the pocket is restored before the first Boltz
+                # call, giving pocket-guided diffusion from epoch 1 without waiting for
+                # ≥3 PDB structures to be generated in the current session.
+                try:
+                    _save_miner_state_text(
+                        state['boltz_cache_db'], 'consensus_pocket_json',
+                        json.dumps(_kkk_pocket),
+                    )
+                    _save_miner_state_text(
+                        state['boltz_cache_db'], 'consensus_pocket_protein',
+                        config.weekly_target,
+                    )
+                    bt.logging.debug(
+                        f"[§MMMMMMMMMMMM] Pocket saved to SQLite "
+                        f"({len(_kkk_pocket)} residues)."
+                    )
+                except Exception as _mmm_s:
+                    bt.logging.debug(
+                        f"[§MMMMMMMMMMMM] Pocket SQLite save failed (non-fatal): {_mmm_s}"
+                    )
         except Exception as _kkk_err:
             bt.logging.debug(f"[§KKKKKKKKKKKK] Pocket derivation skipped: {_kkk_err}")
 
@@ -4884,6 +4932,34 @@ async def run_miner(config: argparse.Namespace) -> None:
                             'salsa_operator_wins_json'):  # §SSSSSSSSSSSS
                     if _pk in _pppppp_state and _load_miner_state_text(state['boltz_cache_db'], _pk) is None:
                         _save_miner_state_text(state['boltz_cache_db'], _pk, str(_pppppp_state[_pk]))
+                # §MMMMMMMMMMMM: Import consensus pocket from GitHub export into SQLite.
+                # Only imports when no local pocket is already saved (avoids overwriting
+                # a freshly-derived pocket from the previous run with the GitHub copy).
+                try:
+                    _mmm_gh_prot = _pppppp_state.get('consensus_pocket_protein', '')
+                    _mmm_gh_json = _pppppp_state.get('consensus_pocket_json', '')
+                    if (_mmm_gh_prot == config.weekly_target
+                            and _mmm_gh_json
+                            and _load_miner_state_text(
+                                state['boltz_cache_db'], 'consensus_pocket_json'
+                            ) is None):
+                        _save_miner_state_text(
+                            state['boltz_cache_db'],
+                            'consensus_pocket_json', _mmm_gh_json,
+                        )
+                        _save_miner_state_text(
+                            state['boltz_cache_db'],
+                            'consensus_pocket_protein', _mmm_gh_prot,
+                        )
+                        bt.logging.info(
+                            f"[§MMMMMMMMMMMM] Imported consensus pocket from GitHub export "
+                            f"({len(json.loads(_mmm_gh_json))} residues) — "
+                            f"will activate after SQLite restore below."
+                        )
+                except Exception as _mmm_gh_err:
+                    bt.logging.debug(
+                        f"[§MMMMMMMMMMMM] Pocket GitHub import skipped (non-fatal): {_mmm_gh_err}"
+                    )
                 bt.logging.info(
                     f"[§PPPPPP] Imported {_pppppp_imported}/{len(_pppppp_entries)} cache entries "
                     f"from GitHub export (protein={config.weekly_target!r})."
@@ -5062,6 +5138,41 @@ async def run_miner(config: argparse.Namespace) -> None:
                 )
         except Exception:
             pass  # fall back to zero-initialised wins; non-fatal
+
+    # §MMMMMMMMMMMM: Restore consensus binding pocket from SQLite into state so
+    # subnet_config construction uses it from the very first Boltz call of this
+    # session.  The pocket is stored as a JSON list of residue numbers keyed by
+    # protein so that a weekly target rotation never applies a stale pocket.
+    # §KKKKKKKKKKKK still runs after the prescoring loop and may update the pocket
+    # with fresh PDB contacts from the current session.
+    try:
+        _mmm_pocket_prot = _load_miner_state_text(
+            state['boltz_cache_db'], 'consensus_pocket_protein'
+        )
+        if _mmm_pocket_prot == config.weekly_target:
+            _mmm_pocket_raw = _load_miner_state_text(
+                state['boltz_cache_db'], 'consensus_pocket_json'
+            )
+            if _mmm_pocket_raw:
+                _mmm_pocket_list = json.loads(_mmm_pocket_raw)
+                if (isinstance(_mmm_pocket_list, list)
+                        and len(_mmm_pocket_list) >= 5
+                        and state['config'].binding_pocket is None):
+                    state['_mmm_restored_pocket'] = {
+                        'pocket': _mmm_pocket_list,
+                        'protein': config.weekly_target,
+                    }
+                    bt.logging.info(
+                        f"[§MMMMMMMMMMMM] Restored {len(_mmm_pocket_list)}-residue "
+                        f"binding pocket from SQLite — pocket-guided diffusion active "
+                        f"from epoch 1 (residues: "
+                        f"{_mmm_pocket_list[:10]}"
+                        f"{'...' if len(_mmm_pocket_list) > 10 else ''})"
+                    )
+    except Exception as _mmm_err:
+        bt.logging.debug(
+            f"[§MMMMMMMMMMMM] Pocket SQLite restore failed (non-fatal): {_mmm_err}"
+        )
 
     # §OOOOOO: Adapt §TTTT fragment-slot quota using Boltz cache evidence.
     # Default: 1000/10000 slots for ≤18-HA molecules (§TTTT).

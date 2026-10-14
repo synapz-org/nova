@@ -115,6 +115,14 @@ def upload_boltz_cache_export(db_path: str, protein: str) -> bool:
             ).fetchone()
             if row and row[0] is not None:
                 state_out[key] = row[0]
+        # §MMMMMMMMMMMM: Export consensus pocket residue list for restart recovery.
+        # Tiny payload (a list of ints, typically <100 bytes JSON).
+        for key in ("consensus_pocket_json", "consensus_pocket_protein"):
+            row = c.execute(
+                "SELECT value_text FROM miner_state WHERE key=?", (key,)
+            ).fetchone()
+            if row and row[0] is not None:
+                state_out[key] = row[0]
 
         # §RRRRRR: Include top-20 entries for up to 2 prior proteins so that when
         # the weekly target rotates, a fresh container can still seed §WWWWW

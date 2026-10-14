@@ -1,14 +1,123 @@
 # Boltz-2 Miner Integration
 
-## Current Status (as of 2026-10-12)
+## Current Status (as of 2026-10-14)
 
-**82 roadmap items implemented; 0 proposed.** §LLLLLLLLLLLL (ChEMBL known-active calibration in cold-start Boltz probe) implemented 2026-10-12. §KKKKKKKKKKKK (progressive binding-pocket derivation from Boltz pose consensus) implemented 2026-10-11. §JJJJJJJJJJJJ (step-scale temperature ensemble) implemented 2026-10-09. §IIIIIIIIIIII (ring-closure SALSA operator) implemented 2026-10-08. §HHHHHHHHHHHH (Boltz-2 z-matrix interface embedding for surrogate) implemented 2026-10-04. §GGGGGGGGGGGG (freed-round reallocation from §EEEEEEEEEEEE to next §YYYYYYYYYYYY seed) implemented 2026-10-03. §EEEEEEEEEEEE (§MM diminishing-returns early exit) and §FFFFFFFFFFFFFFFF (GradientBoosting surrogate 3rd tier) implemented 2026-10-02.
+**83 roadmap items implemented; 0 proposed.** §MMMMMMMMMMMM (binding-pocket cross-restart persistence via SQLite + GitHub export) implemented 2026-10-14. §LLLLLLLLLLLL (ChEMBL known-active calibration in cold-start Boltz probe) implemented 2026-10-12. §KKKKKKKKKKKK (progressive binding-pocket derivation from Boltz pose consensus) implemented 2026-10-11. §JJJJJJJJJJJJ (step-scale temperature ensemble) implemented 2026-10-09. §IIIIIIIIIIII (ring-closure SALSA operator) implemented 2026-10-08. §HHHHHHHHHHHH (Boltz-2 z-matrix interface embedding for surrogate) implemented 2026-10-04. §GGGGGGGGGGGG (freed-round reallocation from §EEEEEEEEEEEE to next §YYYYYYYYYYYY seed) implemented 2026-10-03. §EEEEEEEEEEEE (§MM diminishing-returns early exit) and §FFFFFFFFFFFFFFFF (GradientBoosting surrogate 3rd tier) implemented 2026-10-02.
 
 **Open proposals: none.**
 
 ---
 
 ## Recently Implemented Optimisations (latest first)
+
+### §MMMMMMMMMMMM — Binding-Pocket Cross-Restart Persistence via SQLite + GitHub Export — implemented 2026-10-14
+
+**Problem:**
+
+§KKKKKKKKKKKK derives the consensus binding pocket empirically from Boltz-2 output PDB structures,
+accumulating per-molecule contact residue sets in `BoltzWrapper._pose_contacts` and calling
+`get_consensus_pocket(min_molecules=3, min_shared_residues=5)` after the main prescoring loop.
+When ≥5 consensus residues are found, the pocket is written into `subnet_config['binding_pocket']`
+for all subsequent §FF/§MM Boltz calls within that session.
+
+The pocket is stored **only in memory** (`subnet_config`, a local dict).  On container restart
+(which happens frequently in cloud-hosted setups) the pocket is lost:
+
+- `state['config'].binding_pocket` is always `None` (from `config.yaml`)
+- `wrapper._pose_contacts` is empty on every new `BoltzWrapper()` instance
+- §KKKKKKKKKKKK requires ≥3 freshly scored PDB structures before it can fire
+
+A typical restart epoch on a warm-cache protein therefore runs its first 3 Boltz calls without
+pocket guidance, then derives the pocket from those structures.  On an A100 (~80 s/call), this
+is a 4–6 min window of un-guided diffusion that could have had +3–8% affinity accuracy.
+
+**Fix:**
+
+Four additions spread across two files:
+
+**1. `neurons/miner.py` — persist pocket to SQLite immediately after §KKKKKKKKKKKK derives it**
+
+After `subnet_config['binding_pocket'] = _kkk_pocket` (line ~2726), call:
+```python
+_save_miner_state_text(state['boltz_cache_db'], 'consensus_pocket_json', json.dumps(_kkk_pocket))
+_save_miner_state_text(state['boltz_cache_db'], 'consensus_pocket_protein', config.weekly_target)
+```
+Uses the existing `miner_state` text store (§CCCCCC).  The pocket is a list of integers; a 20-residue
+pocket serialises to ~70 bytes JSON.
+
+**2. `utils/github.py` — include pocket in §PPPPPP GitHub export**
+
+Inside `upload_boltz_cache_export()`, after the `salsa_operator_wins_json` export block:
+```python
+for key in ("consensus_pocket_json", "consensus_pocket_protein"):
+    row = c.execute("SELECT value_text FROM miner_state WHERE key=?", (key,)).fetchone()
+    if row and row[0] is not None:
+        state_out[key] = row[0]
+```
+Adds ~200 bytes to the compressed export — negligible against the 40–60 KB gzip payload.
+
+**3. `neurons/miner.py` — import pocket from GitHub into SQLite during §PPPPPP startup restore**
+
+Inside the `_pppppp_matched` block (alongside §PPPPPPPPPP / §HHHHHHHHHHHH imports):
+```python
+if (_mmm_gh_prot == config.weekly_target and _mmm_gh_json
+        and _load_miner_state_text(db, 'consensus_pocket_json') is None):
+    _save_miner_state_text(db, 'consensus_pocket_json', _mmm_gh_json)
+    _save_miner_state_text(db, 'consensus_pocket_protein', _mmm_gh_prot)
+```
+Idempotent: only fires when the local SQLite is empty (fresh container).
+
+**4. `neurons/miner.py` — restore pocket from SQLite into `state['_mmm_restored_pocket']` at startup**
+
+After §SSSSSSSSSSSS restore (~line 5140), before §OOOOOO:
+```python
+_mmm_pocket_list = json.loads(_load_miner_state_text(db, 'consensus_pocket_json'))
+if isinstance(_mmm_pocket_list, list) and len(_mmm_pocket_list) >= 5:
+    state['_mmm_restored_pocket'] = {'pocket': _mmm_pocket_list, 'protein': config.weekly_target}
+```
+
+Then at both `subnet_config` construction sites (main prescoring, line ~2464; cold-start probe, line ~2144):
+```python
+_mmm_restored = state.get('_mmm_restored_pocket')
+if subnet_config['binding_pocket'] is None and _mmm_restored and _mmm_restored.get('protein') == protein:
+    subnet_config['binding_pocket'] = _mmm_restored['pocket']
+    subnet_config['max_distance'] = 6.0
+    subnet_config['force'] = False
+```
+
+§KKKKKKKKKKKK still runs after the prescoring loop and will update the pocket if fresh PDB contacts
+produce a different consensus — it writes to both `subnet_config` and SQLite, overwriting the
+restored value with the current session's empirical pocket.
+
+**Regression guards:**
+
+- Protein-key check (`consensus_pocket_protein == config.weekly_target`) prevents applying a
+  pocket from a prior weekly target after protein rotation
+- `len(pocket) >= 5` guard (same as §KKKKKKKKKKKK) prevents sparse/empty pocket lists activating
+- `state['config'].binding_pocket is None` guard: operator-specified pockets are never overridden
+- `INSERT OR IGNORE` not needed (text store uses `INSERT OR REPLACE` semantics via `_save_miner_state_text`)
+- All SQLite reads/writes wrapped in `try/except`; any failure logs at `debug` level — zero regression
+- GitHub import uses the `is None` check: if a local pocket exists (same-machine restart without fresh container), the GitHub copy is skipped
+- The `_mmm_restored_pocket` is only set once at startup; subsequent epoch changes update `subnet_config` directly via §KKKKKKKKKKKK
+
+**Estimated implementation effort:** ~119 lines across `neurons/miner.py` (111 lines) and `utils/github.py` (8 lines).
+
+**Expected gain:**
+
+| Scenario | Expected gain |
+|----------|---------------|
+| Container restart, same weekly target (~daily on cloud) | Pocket active from Boltz call 1 instead of after 3+ calls → +3–8% affinity accuracy on those 3 calls (+1–3% aggregate) |
+| Week-2+ same target, no restart | Zero regression; pocket freshly re-derived after prescoring loop (§KKKKKKKKKKKK overwrites with same result) |
+| Protein rotation (new weekly target) | Zero regression; protein-key mismatch prevents application of old pocket |
+| Config has explicit `binding_pocket` | Zero regression; `state['config'].binding_pocket is None` check skips restore |
+| Cold start (no prior GitHub cache, no SQLite) | Zero regression; `_mmm_restored_pocket` stays None, subnet_config uses config value |
+
+**Files changed:**
+- `neurons/miner.py`: §KKKKKKKKKKKK save, §PPPPPP GitHub import, startup SQLite restore, subnet_config application (2 sites) (~111 lines)
+- `utils/github.py`: export `consensus_pocket_json` / `consensus_pocket_protein` (~8 lines)
+- `BOLTZ2_INTEGRATION.md`: this entry
+
+---
 
 ### §LLLLLLLLLLLL — ChEMBL Known-Active Calibration in Cold-Start Boltz Probe — implemented 2026-10-12
 
